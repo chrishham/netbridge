@@ -61,20 +61,12 @@ def get_log_path() -> Path:
 
 
 @dataclass
-class ProxyConfig:
-    """Proxy configuration."""
-    http: Optional[str] = None
-    https: Optional[str] = None
-
-
-@dataclass
 class Config:
     """NetBridge configuration."""
     relay_url: str = DEFAULT_RELAY_URL
     auto_connect: bool = True
     show_notifications: bool = True
     log_level: str = "INFO"
-    proxy: ProxyConfig = field(default_factory=ProxyConfig)
     allow_private_destinations: bool = True
     allowed_destinations: list[str] = field(default_factory=list)
     denied_destinations: list[str] = field(default_factory=list)
@@ -86,12 +78,8 @@ class Config:
             "auto_connect": self.auto_connect,
             "show_notifications": self.show_notifications,
             "log_level": self.log_level,
-            "proxy": {
-                "http": self.proxy.http,
-                "https": self.proxy.https,
-            },
+            "allow_private_destinations": self.allow_private_destinations,
         }
-        d["allow_private_destinations"] = self.allow_private_destinations
         if self.allowed_destinations:
             d["allowed_destinations"] = self.allowed_destinations
         if self.denied_destinations:
@@ -101,17 +89,11 @@ class Config:
     @classmethod
     def from_dict(cls, data: dict) -> "Config":
         """Create config from dictionary."""
-        proxy_data = data.get("proxy", {})
-        proxy = ProxyConfig(
-            http=proxy_data.get("http"),
-            https=proxy_data.get("https"),
-        )
         return cls(
             relay_url=data.get("relay_url", DEFAULT_RELAY_URL),
             auto_connect=data.get("auto_connect", True),
             show_notifications=data.get("show_notifications", True),
             log_level=data.get("log_level", "INFO"),
-            proxy=proxy,
             allow_private_destinations=data.get("allow_private_destinations", True),
             allowed_destinations=data.get("allowed_destinations", []),
             denied_destinations=data.get("denied_destinations", []),
