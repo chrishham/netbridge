@@ -104,10 +104,11 @@ The agent loads configuration from `%LOCALAPPDATA%\NetBridge\config.json`:
 | `auto_connect` | Connect to relay on startup | `true` |
 | `show_notifications` | Show desktop notifications | `true` |
 | `log_level` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `"INFO"` |
-| `proxy.http` | HTTP proxy URL (auto-detected if `null`) | `null` |
-| `proxy.https` | HTTPS proxy URL (auto-detected if `null`) | `null` |
+| `allow_private_destinations` | Allow connections to RFC 1918 private ranges (`10/8`, `172.16/12`, `192.168/16`) | `true` |
+| `allowed_destinations` | List of allowed CIDRs or hostnames (allowlist mode) | `[]` |
+| `denied_destinations` | List of denied CIDRs or hostnames | `[]` |
 
-Proxy settings are auto-detected from the system (PAC file / WinHTTP) per target URL.
+Proxy settings are auto-detected from the system (PAC file / WinHTTP) per target URL. Loopback and link-local addresses are always blocked regardless of configuration. When `allowed_destinations` is set, only matching destinations are reachable. The deny list is checked first. These are agent-side filters, complementing the relay-side `RELAY_ALLOWED_DESTINATIONS` / `RELAY_DENIED_DESTINATIONS`.
 
 ### Relay
 
@@ -159,13 +160,33 @@ When `RELAY_ALLOWED_DESTINATIONS` is set only matching destinations are reachabl
 |----------|-------------|---------|
 | `RELAY_LOG_FORMAT` | `json` for structured JSON output, `text` for human-readable | `text` |
 
+### Proxy
+
+Run `netbridge-socks --help` for all CLI options. The following environment variables tune proxy behavior:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `NETBRIDGE_TOKEN` | ARM access token (alternative to `--token` CLI flag) | — |
+| `NETBRIDGE_HTTP_MAX_BODY_BYTES` | Maximum HTTP proxy request body size in bytes | `67108864` (64 MB) |
+
+### Shared (Agent & Proxy)
+
+These environment variables are shared between the agent and proxy for connection tuning:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `NETBRIDGE_HEARTBEAT_INTERVAL` | WebSocket ping interval in seconds | `30` |
+| `NETBRIDGE_WS_CONNECT_TIMEOUT` | WebSocket connection timeout in seconds | `30` |
+| `NETBRIDGE_IDLE_STREAM_TIMEOUT` | Idle stream timeout in seconds | `120` |
+| `NETBRIDGE_MAX_CONCURRENT_STREAMS` | Max concurrent TCP streams (proxy) | `200` |
+| `NETBRIDGE_MAX_ACTIVE_STREAMS` | Max active TCP streams (agent) | `500` |
+| `NETBRIDGE_CLEANUP_INTERVAL` | Stale-stream cleanup interval in seconds | `30` |
+
 ### Changing the Relay URL
 
 **Agent:** right-click the tray icon → **Change Relay URL**. The agent restarts automatically.
 
 **Proxy:** see the [homebrew-tap README](https://github.com/chrishham/homebrew-tap#netbridge-socks) for config file location.
-
-Run `netbridge-socks --help` for all proxy CLI options.
 
 ## Security Notes
 
