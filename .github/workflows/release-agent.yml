@@ -1,0 +1,69 @@
+name: Release Agent
+
+on:
+  push:
+    tags: ["agent-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#agent-v}
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version format: $VERSION"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject version from tag
+        shell: bash
+        run: sed -i "s|__version__ = .*|__version__ = \"${{ steps.version.outputs.version }}\"|" netbridge-agent/src/netbridge_agent/__init__.py
+
+      - name: Build agent exe
+        run: |
+          cd netbridge-agent
+          uv sync
+          uv run pyinstaller netbridge-agent.spec --clean --noconfirm
+
+      - name: Test agent exe
+        shell: pwsh
+        run: |
+          # Smoke test: verify exe starts and --version works
+          $output = & netbridge-agent/dist/netbridge.exe --version 2>&1
+          Write-Host "Smoke test output: $output"
+          if ($LASTEXITCODE -ne 0) { throw "Smoke test failed (exit code $LASTEXITCODE)" }
+
+          # Import test: verify all bundled modules can load without errors
+          $output = & netbridge-agent/dist/netbridge.exe --import-check 2>&1
+          Write-Host "Import test output: $output"
+          if ($LASTEXITCODE -ne 0) { throw "Import test failed (exit code $LASTEXITCODE): $output" }
+
+          # Install test: copy to real install path and verify it runs from there
+          $installDir = "$env:LOCALAPPDATA\NetBridge"
+          New-Item -Path $installDir -ItemType Directory -Force | Out-Null
+          Copy-Item netbridge-agent/dist/netbridge.exe "$installDir\netbridge.exe"
+          $output = & "$installDir\netbridge.exe" --version 2>&1
+          Write-Host "Install test output: $output"
+          if ($LASTEXITCODE -ne 0) { throw "Install test failed (exit code $LASTEXITCODE)" }
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: netbridge-agent/dist/netbridge.exe
+          generate_release_notes: true
+          name: Agent v${{ steps.version.outputs.version }}

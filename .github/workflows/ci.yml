@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      NETBRIDGE_ALLOWED_TENANTS: "11111111-1111-1111-1111-111111111111"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Test shared
+        run: |
+          cd shared
+          uv sync
+          uv run pytest
+
+      - name: Test relay
+        run: |
+          cd relay
+          uv sync
+          uv run pytest
+
+      - name: Test socks-proxy
+        run: |
+          cd socks-proxy
+          uv sync
+          uv run pytest
+
+  security-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install scanners
+        run: |
+          uv tool install bandit
+          uv tool install pip-audit
+
+      - name: Bandit security scan
+        # Suppressed Bandit codes:
+        #   B101 (assert_used)          - defensive assertions in non-test code
+        #   B104 (hardcoded_bind_all)   - relay intentionally binds 0.0.0.0
+        #   B110 (try_except_pass)      - cleanup/shutdown exception swallowing
+        #   B404 (import_subprocess)    - needed for az CLI invocation
+        #   B603 (subprocess_no_shell)  - safe subprocess with shutil.which paths
+        #   B606 (start_process_no_shell) - safe az CLI / OS command spawning
+        #   B607 (start_partial_path)   - az CLI resolved via shutil.which()
+        run: >
+          bandit -r shared/src relay/src socks-proxy/src netbridge-agent/src
+          -s B101,B104,B110,B404,B603,B606,B607
+
+      - name: pip-audit shared
+        run: |
+          cd shared
+          uv sync
+          uv run pip-audit
+
+      - name: pip-audit relay
+        run: |
+          cd relay
+          uv sync
+          uv run pip-audit
+
+      - name: pip-audit socks-proxy
+        run: |
+          cd socks-proxy
+          uv sync
+          uv run pip-audit
+
+      - name: pip-audit netbridge-agent
+        run: |
+          cd netbridge-agent
+          uv sync
+          uv run pip-audit

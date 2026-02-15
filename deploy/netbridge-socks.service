@@ -1,0 +1,19 @@
+[Unit]
+Description=NetBridge SOCKS5 and HTTP Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__NETBRIDGE_DIR__/socks-proxy
+ExecStart=%h/.local/bin/uv run --native-tls netbridge-socks --relay __RELAY_URL__
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

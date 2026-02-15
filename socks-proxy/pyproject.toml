@@ -1,0 +1,25 @@
+[project]
+name = "netbridge-socks"
+version = "0.0.0"  # placeholder — actual version is set by Homebrew formula at install time
+description = "SOCKS5 proxy client for NetBridge - runs on laptop to provide browser/kubectl access"
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "orjson>=3.11.6",
+    "shared-auth",
+]
+
+[tool.uv.sources]
+shared-auth = { path = "../shared" }
+
+[project.scripts]
+netbridge-socks = "socks_proxy.__main__:main"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
