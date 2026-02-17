@@ -6,6 +6,7 @@ Uses the user's existing `az login` session - no app registration needed.
 
 import base64
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -30,12 +31,27 @@ def _az_command() -> list[str]:
     ``shell=True`` when passed as a bare string.  Instead, we resolve the
     full path via ``shutil.which`` so we can call it directly without a
     shell, avoiding command-injection risks (CWE-78).
+
+    On macOS, when running as a launchd service (e.g. ``brew services``),
+    the PATH is minimal and won't include Homebrew's bin directory, so we
+    also check common Homebrew install locations as a fallback.
     """
     if sys.platform == "win32":
-        for name in ("az.cmd", "az"):
-            path = shutil.which(name)
-            if path:
-                return [path]
+        candidates = ("az.cmd", "az")
+    else:
+        candidates = ("az",)
+
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return [path]
+
+    # Fallback: check common Homebrew locations on macOS
+    if sys.platform == "darwin":
+        for candidate in ("/opt/homebrew/bin/az", "/usr/local/bin/az"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return [candidate]
+
     return ["az"]
 
 
