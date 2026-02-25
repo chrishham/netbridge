@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 import sys
+from typing import Callable
 
 from . import __version__
 from .socks5 import handle_socks5_client
@@ -50,6 +51,8 @@ async def run_server(
     verify_ssl: bool | None = None,
     proxy_credentials: tuple[str, str] | None = None,
     ca_bundle: str | None = None,
+    stop_event: asyncio.Event | None = None,
+    on_status_change: Callable | None = None,
 ) -> None:
     """Run the SOCKS5 and HTTP proxy servers."""
     # Create and start tunnel manager with auth token
@@ -66,7 +69,12 @@ async def run_server(
     except ConnectionError as e:
         logger.error(f"Failed to connect to relay: {e}")
         logger.info("Make sure the relay is running and your bridge agent is connected")
+        if on_status_change:
+            on_status_change(connected=False)
         return
+
+    if on_status_change:
+        on_status_change(connected=True)
 
     # Create SOCKS5 client handler
     async def socks5_handler(
@@ -127,20 +135,24 @@ async def run_server(
     logger.info("")
 
     # Handle shutdown gracefully
-    stop_event = asyncio.Event()
+    owns_stop_event = stop_event is None
+    if owns_stop_event:
+        stop_event = asyncio.Event()
 
-    def signal_handler():
-        logger.info("Shutting down...")
-        stop_event.set()
+    # Only register signal handlers in console mode (owns its own stop_event)
+    if owns_stop_event:
+        def signal_handler():
+            logger.info("Shutting down...")
+            stop_event.set()
 
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            # Windows doesn't support add_signal_handler
-            # KeyboardInterrupt will be caught below instead
-            pass
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, signal_handler)
+            except NotImplementedError:
+                # Windows doesn't support add_signal_handler
+                # KeyboardInterrupt will be caught below instead
+                pass
 
     try:
         await stop_event.wait()
@@ -153,6 +165,8 @@ async def run_server(
         if http_server:
             http_server.close()
         await tunnel.stop()
+        if on_status_change:
+            on_status_change(connected=False)
 
 
 def main():
