@@ -35,6 +35,12 @@ jobs:
         shell: bash
         run: sed -i "s|__version__ = .*|__version__ = \"${{ steps.version.outputs.version }}\"|" netbridge-agent/src/netbridge_agent/__init__.py
 
+      - name: Run tests
+        run: |
+          cd netbridge-agent
+          uv sync --group dev
+          uv run pytest
+
       - name: Build agent exe
         run: |
           cd netbridge-agent

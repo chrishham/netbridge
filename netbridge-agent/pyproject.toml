@@ -29,4 +29,9 @@ path = "src/netbridge_agent/__init__.py"
 dev = [
     "pyinstaller>=6.18.0",
     "pytest>=8.0.0",
+    "pytest-asyncio>=1.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

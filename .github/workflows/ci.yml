@@ -39,6 +39,12 @@ jobs:
           uv sync
           uv run pytest
 
+      - name: Test agent
+        run: |
+          cd netbridge-agent
+          uv sync --group dev
+          uv run pytest
+
   security-scan:
     runs-on: ubuntu-latest
 
