@@ -117,6 +117,41 @@ class NetBridgeSocksApp:
             if self.tray:
                 self.tray.show_notification("Error", f"Could not open terminal: {e}")
 
+    def request_change_relay_url(self) -> None:
+        """Prompt for a new relay URL, save config, and restart (from tray menu)."""
+        from .dialogs import prompt_relay_url
+        from .installer import get_exe_path
+
+        logger.info("Change relay URL requested")
+
+        url = prompt_relay_url(self.config.relay_url)
+        if url is None or url == self.config.relay_url:
+            logger.info("Relay URL change cancelled or unchanged")
+            return
+
+        self.config.relay_url = url
+        self.config.save()
+        logger.info(f"Relay URL changed to: {url}")
+
+        # Relaunch and exit cleanly so file handles are released
+        target_exe = get_exe_path()
+        logger.info(f"Relaunching: {target_exe} --no-install")
+        try:
+            subprocess.Popen(
+                [str(target_exe), "--no-install"],
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+            )
+        except OSError:
+            logger.exception("Failed to launch new process")
+            return
+
+        self._pending_exit.set()
+        if self._async_loop and self._stop_event:
+            self._async_loop.call_soon_threadsafe(self._stop_event.set)
+
+        if self.tray:
+            self.tray.stop()
+
     def request_install(self) -> None:
         """Request install (from tray menu)."""
         from .installer import Installer

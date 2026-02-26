@@ -14,6 +14,13 @@ Access internal corporate resources from your laptop by tunneling TCP connection
 └────────────────────────────┘    └───────────────────────┘    └───────────────────────────┘
 ```
 
+## Prerequisites
+
+- **A deployed relay** — you need a running relay instance and its URL. See [Deploying the Relay](#deploying-the-relay).
+- **Azure CLI** — install the [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) and run `az login` before starting the agent or proxy. Tokens are acquired automatically at runtime.
+- **Azure AD account** — your account must belong to a tenant allowed by the relay (`NETBRIDGE_ALLOWED_TENANTS`).
+- **A Windows machine (VDI)** — with access to the internal resources you want to reach. The agent will be installed on this machine.
+
 ## Quick Start
 
 ### 1. Agent (Windows)
@@ -38,6 +45,19 @@ brew install netbridge-socks
 ```
 
 Continue with these instructions: [homebrew-tap README](https://github.com/chrishham/homebrew-tap#netbridge-socks).
+
+### 3. Proxy (Windows)
+
+Download [`netbridge-socks.exe`](https://github.com/chrishham/netbridge/releases/latest) and run it. On first launch a dialog will prompt for your relay hostname. The executable installs itself to `%LOCALAPPDATA%\NetBridgeSocks\`, registers for Windows Startup, and launches automatically.
+
+The tray icon shows proxy status: green (connected), yellow (connecting), red (disconnected), orange (login required). Right-click the tray icon for options:
+
+- **Change Relay URL** — switch to a different relay and restart
+- **Login (az login)** — re-authenticate with Azure
+- **View Logs** — open the current log file
+- **Uninstall** — remove the app from your system
+
+Configuration is stored in `%LOCALAPPDATA%\NetBridgeSocks\config.json` and logs in `%LOCALAPPDATA%\NetBridgeSocks\logs\`.
 
 ## Proxy Usage
 
@@ -186,7 +206,9 @@ These environment variables are shared between the agent and proxy for connectio
 
 **Agent:** right-click the tray icon → **Change Relay URL**. The agent restarts automatically.
 
-**Proxy:** see the [homebrew-tap README](https://github.com/chrishham/homebrew-tap#netbridge-socks) for config file location.
+**Proxy (macOS/Linux):** see the [homebrew-tap README](https://github.com/chrishham/homebrew-tap#netbridge-socks) for config file location.
+
+**Proxy (Windows):** right-click the tray icon → **Change Relay URL**. The proxy restarts automatically.
 
 ## Security Notes
 
@@ -197,6 +219,31 @@ These environment variables are shared between the agent and proxy for connectio
 - Authentication uses Azure AD ARM tokens (`az login`)
 - When behind a TLS-intercepting proxy, prefer `--ca-bundle <file>` (or `NETBRIDGE_CA_BUNDLE` env var) to supply your corporate CA certificate instead of disabling verification entirely
 - SSL verification can be disabled (`--no-verify-ssl`) as a **last resort** — this requires setting `NETBRIDGE_ALLOW_INSECURE=1` and weakens security
+
+## Deploying the Relay
+
+The relay runs as a Docker container and needs an HTTPS endpoint that supports WebSockets. Two common options:
+
+**Azure App Service (Container):**
+
+1. Create a Web App for Containers in the Azure Portal
+2. Point it at the GHCR image: `ghcr.io/chrishham/netbridge-relay:latest`
+3. Under Settings → Configuration, add the required environment variables (at minimum `NETBRIDGE_ALLOWED_TENANTS`)
+4. Ensure WebSockets are enabled under Settings → Configuration → General settings
+5. The relay listens on port 8080 — set this as the container port
+
+**Self-hosted (k3s / Docker Compose / any container host):**
+
+1. Pull the image: `docker pull ghcr.io/chrishham/netbridge-relay:latest`
+2. Run with the required environment variables:
+   ```bash
+   docker run -d -p 8080:8080 \
+     -e NETBRIDGE_ALLOWED_TENANTS=<your-tenant-id> \
+     ghcr.io/chrishham/netbridge-relay:latest
+   ```
+3. Place a reverse proxy (e.g. Traefik, Caddy, nginx) in front to terminate TLS and provide an HTTPS URL with WebSocket support
+
+The relay exposes a `/status` endpoint you can use as a health check.
 
 ## Development
 
@@ -225,4 +272,7 @@ git tag relay-v1.0.0 && git push --tags
 
 # Release the socks proxy (runs tests and updates Homebrew formula)
 git tag socks-v0.2.0 && git push --tags
+
+# Release the socks proxy Windows exe (builds .exe and creates a GitHub Release)
+git tag socks-exe-v1.0.0 && git push --tags
 ```

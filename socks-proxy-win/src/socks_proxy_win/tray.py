@@ -111,6 +111,9 @@ class TrayIcon:
         def get_http_text(item):
             return f"HTTP: 127.0.0.1:{self.app.config.http_port}"
 
+        def on_change_relay_url(icon, item):
+            self.app.request_change_relay_url()
+
         def on_login(icon, item):
             self.app.request_login()
 
@@ -154,6 +157,11 @@ class TrayIcon:
                 enabled=False,
             ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Change Relay URL",
+                on_change_relay_url,
+                visible=is_installed,
+            ),
             pystray.MenuItem(
                 "Login (az login)",
                 on_login,

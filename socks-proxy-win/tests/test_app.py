@@ -137,3 +137,60 @@ class TestNetBridgeSocksApp:
         app._stop_event = stop_event
         app.request_exit()
         loop.call_soon_threadsafe.assert_called_once_with(stop_event.set)
+
+    # --- Change Relay URL ---
+
+    @patch("socks_proxy_win.app.subprocess.Popen")
+    def test_request_change_relay_url_saves_and_restarts(self, mock_popen, tmp_path, monkeypatch):
+        import subprocess as _subprocess
+        if not hasattr(_subprocess, "DETACHED_PROCESS"):
+            _subprocess.DETACHED_PROCESS = 0x00000008
+        if not hasattr(_subprocess, "CREATE_NO_WINDOW"):
+            _subprocess.CREATE_NO_WINDOW = 0x08000000
+
+        app = self._make_app(tmp_path, monkeypatch)
+        app.config.relay_url = "old-relay.example.com"
+        exe_path = tmp_path / "NetBridgeSocks" / "netbridge-socks.exe"
+        exe_path.parent.mkdir(parents=True, exist_ok=True)
+        exe_path.touch()
+
+        mock_dialogs = MagicMock()
+        mock_dialogs.prompt_relay_url.return_value = "new-relay.example.com"
+        mock_installer = MagicMock()
+        mock_installer.get_exe_path.return_value = exe_path
+
+        with patch.dict("sys.modules", {"socks_proxy_win.dialogs": mock_dialogs,
+                                         "socks_proxy_win.installer": mock_installer}):
+            app.request_change_relay_url()
+
+        assert app.config.relay_url == "new-relay.example.com"
+        mock_popen.assert_called_once()
+        assert app._pending_exit.is_set()
+        app.tray.stop.assert_called_once()
+
+    def test_request_change_relay_url_cancelled(self, tmp_path, monkeypatch):
+        app = self._make_app(tmp_path, monkeypatch)
+        app.config.relay_url = "old-relay.example.com"
+
+        mock_dialogs = MagicMock()
+        mock_dialogs.prompt_relay_url.return_value = None
+
+        with patch.dict("sys.modules", {"socks_proxy_win.dialogs": mock_dialogs}):
+            app.request_change_relay_url()
+
+        assert app.config.relay_url == "old-relay.example.com"
+        assert not app._pending_exit.is_set()
+        app.tray.stop.assert_not_called()
+
+    def test_request_change_relay_url_unchanged(self, tmp_path, monkeypatch):
+        app = self._make_app(tmp_path, monkeypatch)
+        app.config.relay_url = "same-relay.example.com"
+
+        mock_dialogs = MagicMock()
+        mock_dialogs.prompt_relay_url.return_value = "same-relay.example.com"
+
+        with patch.dict("sys.modules", {"socks_proxy_win.dialogs": mock_dialogs}):
+            app.request_change_relay_url()
+
+        assert not app._pending_exit.is_set()
+        app.tray.stop.assert_not_called()
