@@ -1,0 +1,72 @@
+name: Release Socks Exe
+
+on:
+  push:
+    tags: ["socks-exe-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#socks-exe-v}
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version format: $VERSION"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Inject version from tag
+        shell: bash
+        run: |
+          # Inject into both packages so the exe reports the correct version
+          sed -i "s|__version__ = .*|__version__ = \"${{ steps.version.outputs.version }}\"|" socks-proxy/src/socks_proxy/__init__.py
+          sed -i "s|__version__ = .*|__version__ = \"${{ steps.version.outputs.version }}\"|" socks-proxy-win/src/socks_proxy_win/__init__.py
+
+      - name: Build socks exe
+        run: |
+          cd socks-proxy-win
+          uv sync
+          uv run pyinstaller netbridge-socks.spec --clean --noconfirm
+
+      - name: Test socks exe
+        shell: pwsh
+        run: |
+          # Smoke test: verify exe starts and --version works
+          $output = & socks-proxy-win/dist/netbridge-socks.exe --version 2>&1
+          Write-Host "Smoke test output: $output"
+          if ($LASTEXITCODE -ne 0) { throw "Smoke test failed (exit code $LASTEXITCODE)" }
+
+          # Import test: verify all bundled modules can load without errors
+          $output = & socks-proxy-win/dist/netbridge-socks.exe --import-check 2>&1
+          Write-Host "Import test output: $output"
+          if ($LASTEXITCODE -ne 0) { throw "Import test failed (exit code $LASTEXITCODE): $output" }
+
+          # Install test: copy to real install path and verify it runs from there
+          $installDir = "$env:LOCALAPPDATA\NetBridgeSocks"
+          New-Item -Path $installDir -ItemType Directory -Force | Out-Null
+          Copy-Item socks-proxy-win/dist/netbridge-socks.exe "$installDir\netbridge-socks.exe"
+          $output = & "$installDir\netbridge-socks.exe" --version 2>&1
+          Write-Host "Install test output: $output"
+          if ($LASTEXITCODE -ne 0) { throw "Install test failed (exit code $LASTEXITCODE)" }
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: socks-proxy-win/dist/netbridge-socks.exe
+          generate_release_notes: true
+          name: Socks Proxy v${{ steps.version.outputs.version }}

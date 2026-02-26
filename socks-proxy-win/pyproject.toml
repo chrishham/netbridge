@@ -1,0 +1,25 @@
+[project]
+name = "netbridge-socks-win"
+version = "0.0.0"  # placeholder — CI injects from git tag
+description = "Windows tray application for NetBridge SOCKS proxy"
+requires-python = ">=3.14"
+dependencies = [
+    "netbridge-socks",
+    "packaging>=24.0",
+    "Pillow>=10.0.0",
+    "pystray>=0.19.0",
+]
+
+[tool.uv.sources]
+netbridge-socks = { path = "../socks-proxy" }
+
+[project.scripts]
+netbridge-socks-win = "socks_proxy_win.__main__:main"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.18.0",
+]
