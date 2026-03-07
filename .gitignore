@@ -39,6 +39,7 @@ ENV/
 Thumbs.db
 
 # Project specific
+deploy/k8s-relay.yaml
 *.pem
 *.crt
 *.key
