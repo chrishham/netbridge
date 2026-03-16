@@ -109,7 +109,7 @@ user32.IsDialogMessageW.argtypes = [ctypes.wintypes.HWND, ctypes.c_void_p]
 user32.TranslateMessage.argtypes = [ctypes.c_void_p]
 user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
 
-user32.DefWindowProcW.restype = ctypes.c_void_p
+user32.DefWindowProcW.restype = ctypes.c_long
 user32.DefWindowProcW.argtypes = [
     ctypes.wintypes.HWND, ctypes.c_uint, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
 ]
@@ -239,7 +239,7 @@ def prompt_relay_url(default: str = "") -> Optional[str]:
             done[0] = True
             return 0
 
-        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam) or 0
 
     # prevent garbage collection of the callback
     wndproc_cb = WNDPROC(wndproc)
