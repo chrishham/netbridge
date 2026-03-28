@@ -100,6 +100,9 @@ class NetBridgeApp:
         self._pending_disconnect = threading.Event()
         self._pending_exit = threading.Event()
 
+        # Session keep-alive
+        self._keepalive_task: Optional[asyncio.Task] = None
+
         logger.info(f"{APP_NAME} v{APP_VERSION} starting")
 
     @property
@@ -277,6 +280,45 @@ class NetBridgeApp:
         # Then exit the app
         self.request_exit()
 
+    def request_toggle_keepalive(self) -> None:
+        """Toggle session keep-alive (from tray menu)."""
+        self.config.keep_session_alive = not self.config.keep_session_alive
+        self.config.save()
+        logger.info(f"Session keep-alive: {'enabled' if self.config.keep_session_alive else 'disabled'}")
+
+        if self._async_loop:
+            self._async_loop.call_soon_threadsafe(self._apply_keepalive)
+
+        if self.tray:
+            self.tray.update_menu()
+
+    def _apply_keepalive(self) -> None:
+        """Start or stop the keep-alive task based on config (called in async loop)."""
+        if self.config.keep_session_alive:
+            self._start_keepalive()
+        else:
+            self._stop_keepalive()
+
+    def _start_keepalive(self) -> None:
+        """Start the session keep-alive task."""
+        if self._keepalive_task and not self._keepalive_task.done():
+            return  # Already running
+
+        if self._stop_event:
+            from .keepalive import session_keepalive_loop
+
+            # Use a separate stop event so we can stop keepalive independently
+            self._keepalive_stop = asyncio.Event()
+            self._keepalive_task = asyncio.create_task(
+                session_keepalive_loop(self._keepalive_stop)
+            )
+
+    def _stop_keepalive(self) -> None:
+        """Stop the session keep-alive task."""
+        if hasattr(self, '_keepalive_stop'):
+            self._keepalive_stop.set()
+        self._keepalive_task = None
+
     def request_exit(self) -> None:
         """Request application exit (from tray menu)."""
         logger.info("Exit requested")
@@ -348,8 +390,15 @@ class NetBridgeApp:
         if self.config.auto_connect:
             self._agent_task = asyncio.create_task(self._run_agent())
 
+        # Start session keep-alive if configured
+        if self.config.keep_session_alive:
+            self._start_keepalive()
+
         # Wait for exit request
         await self._stop_event.wait()
+
+        # Stop keep-alive
+        self._stop_keepalive()
 
         # Cancel agent task if running
         if self._agent_task and not self._agent_task.done():

@@ -137,6 +137,11 @@ class TrayIcon:
         if self._icon:
             self._icon.update_menu()
 
+    def update_menu(self) -> None:
+        """Force menu refresh (e.g., after toggling a checked item)."""
+        if self._icon:
+            self._icon.update_menu()
+
     def show_notification(self, title: str, message: str) -> None:
         """Show a Windows notification.
 
@@ -187,6 +192,12 @@ class TrayIcon:
 
         def on_change_relay_url(icon, item):
             self.app.request_change_relay_url()
+
+        def on_toggle_keepalive(icon, item):
+            self.app.request_toggle_keepalive()
+
+        def is_keepalive_enabled(item):
+            return self.app.config.keep_session_alive
 
         def on_view_logs(icon, item):
             self._open_logs()
@@ -241,6 +252,11 @@ class TrayIcon:
             pystray.MenuItem(
                 "Change Relay URL",
                 on_change_relay_url,
+            ),
+            pystray.MenuItem(
+                "Keep Session Alive",
+                on_toggle_keepalive,
+                checked=is_keepalive_enabled,
             ),
             pystray.MenuItem(
                 "View Logs",

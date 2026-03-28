@@ -70,6 +70,7 @@ class Config:
     allow_private_destinations: bool = True
     allowed_destinations: list[str] = field(default_factory=list)
     denied_destinations: list[str] = field(default_factory=list)
+    keep_session_alive: bool = False
 
     def to_dict(self) -> dict:
         """Convert config to dictionary."""
@@ -84,6 +85,8 @@ class Config:
             d["allowed_destinations"] = self.allowed_destinations
         if self.denied_destinations:
             d["denied_destinations"] = self.denied_destinations
+        if self.keep_session_alive:
+            d["keep_session_alive"] = self.keep_session_alive
         return d
 
     @classmethod
@@ -97,6 +100,7 @@ class Config:
             allow_private_destinations=data.get("allow_private_destinations", True),
             allowed_destinations=data.get("allowed_destinations", []),
             denied_destinations=data.get("denied_destinations", []),
+            keep_session_alive=data.get("keep_session_alive", False),
         )
 
     def save(self, path: Optional[Path] = None) -> None:
