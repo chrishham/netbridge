@@ -79,22 +79,22 @@ jobs:
         run: |
           cd shared
           uv sync
-          uv run pip-audit
+          uv run pip-audit --ignore-vuln CVE-2026-4539  # pygments: no fix released yet
 
       - name: pip-audit relay
         run: |
           cd relay
           uv sync
-          uv run pip-audit
+          uv run pip-audit --ignore-vuln CVE-2026-4539
 
       - name: pip-audit socks-proxy
         run: |
           cd socks-proxy
           uv sync
-          uv run pip-audit
+          uv run pip-audit --ignore-vuln CVE-2026-4539
 
       - name: pip-audit netbridge-agent
         run: |
           cd netbridge-agent
           uv sync
-          uv run pip-audit
+          uv run pip-audit --ignore-vuln CVE-2026-4539
