@@ -73,3 +73,14 @@ jobs:
           files: netbridge-agent/dist/netbridge.exe
           generate_release_notes: true
           name: Agent v${{ steps.version.outputs.version }}
+
+      - name: Update latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the 'latest' release if it doesn't exist
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --title "Latest Installers" --notes "Always-updated release with the latest Windows installers." --latest
+          # Replace the exe in the latest release
+          gh release upload latest netbridge-agent/dist/netbridge.exe --clobber

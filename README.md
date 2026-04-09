@@ -25,7 +25,7 @@ Access internal corporate resources from your laptop by tunneling TCP connection
 
 ### 1. Agent (Windows)
 
-Download [`netbridge.exe`](https://github.com/chrishham/netbridge/releases/latest) and run it on the Windows machine. A dialog will prompt for your relay URL. The agent installs itself, registers for Windows Startup, and connects automatically.
+Download [`netbridge.exe`](https://github.com/chrishham/netbridge/releases/latest/download/netbridge.exe) and run it on the Windows machine. A dialog will prompt for your relay URL. The agent installs itself, registers for Windows Startup, and connects automatically.
 
 The tray icon shows connection status: green (connected), yellow (connecting), red (disconnected), orange (login required).
 
@@ -48,7 +48,7 @@ Continue with these instructions: [homebrew-tap README](https://github.com/chris
 
 ### 3. Proxy (Windows)
 
-Download [`netbridge-socks.exe`](https://github.com/chrishham/netbridge/releases/latest) and run it. On first launch a dialog will prompt for your relay hostname. The executable installs itself to `%LOCALAPPDATA%\NetBridgeSocks\`, registers for Windows Startup, and launches automatically.
+Download [`netbridge-socks.exe`](https://github.com/chrishham/netbridge/releases/latest/download/netbridge-socks.exe) and run it. On first launch a dialog will prompt for your relay hostname. The executable installs itself to `%LOCALAPPDATA%\NetBridgeSocks\`, registers for Windows Startup, and launches automatically.
 
 The tray icon shows proxy status: green (connected), yellow (connecting), red (disconnected), orange (login required). Right-click the tray icon for options:
 
