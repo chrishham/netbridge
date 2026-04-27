@@ -418,7 +418,10 @@ del "%~f0"
                 # Use current exe if not installed yet
                 exe_path = get_exe_path()
 
-            key = winreg.OpenKey(
+            # Use CreateKeyEx so we don't fail if the Run key doesn't exist
+            # yet (rare on stripped-down profiles / CI runners). It opens the
+            # key if it exists, otherwise creates it.
+            key = winreg.CreateKeyEx(
                 winreg.HKEY_CURRENT_USER,
                 STARTUP_REG_KEY,
                 0,
