@@ -8,7 +8,7 @@ a = Analysis(
     datas=[],
     hiddenimports=['netbridge_agent', 'netbridge_agent.config', 'netbridge_agent.app', 'netbridge_agent.tray',
                    'netbridge_agent.agent', 'netbridge_agent.auth', 'netbridge_agent.installer',
-                   'netbridge_agent.legacy', 'pystray', 'PIL'],
+                   'netbridge_agent.legacy', 'netbridge_agent.credstore', 'pystray', 'PIL'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

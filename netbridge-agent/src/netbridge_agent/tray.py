@@ -199,6 +199,9 @@ class TrayIcon:
         def is_keepalive_enabled(item):
             return self.app.config.keep_session_alive
 
+        def on_set_proxy_creds(icon, item):
+            self.app.request_set_proxy_credentials()
+
         def on_view_logs(icon, item):
             self._open_logs()
 
@@ -257,6 +260,10 @@ class TrayIcon:
                 "Keep Session Alive",
                 on_toggle_keepalive,
                 checked=is_keepalive_enabled,
+            ),
+            pystray.MenuItem(
+                "Set Proxy Credentials",
+                on_set_proxy_creds,
             ),
             pystray.MenuItem(
                 "View Logs",

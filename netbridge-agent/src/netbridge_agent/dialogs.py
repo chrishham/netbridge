@@ -23,6 +23,7 @@ WS_EX_DLGMODALFRAME = 0x00000001
 WS_EX_CLIENTEDGE = 0x00000200
 
 ES_AUTOHSCROLL = 0x0080
+ES_PASSWORD = 0x0020
 
 SS_LEFT = 0x00000000
 
@@ -58,6 +59,9 @@ ID_OK = 1002
 ID_CANCEL = 1003
 ID_LABEL = 1004
 ID_ERROR_LABEL = 1005
+ID_USER_EDIT = 1006
+ID_PASS_EDIT = 1007
+ID_CLEAR = 1008
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -359,6 +363,222 @@ def prompt_relay_url(default: str = "") -> Optional[str]:
             user32.DispatchMessageW(byref(msg))
 
     # Unregister class
+    user32.UnregisterClassW(CLASS_NAME, wc.hInstance)
+
+    return result[0]
+
+
+def prompt_proxy_credentials(
+    default_user: str = "",
+    has_password: bool = False,
+) -> Optional[tuple[Optional[str], Optional[str]]]:
+    """Show a modal dialog prompting for passthrough proxy credentials.
+
+    Args:
+        default_user: Pre-filled username (e.g. previously stored)
+        has_password: If True, show "(password set, leave blank to keep)" hint
+
+    Returns:
+        None if cancelled.
+        (user, pass) to save new credentials.
+        (None, None) if user clicked Clear to delete stored creds.
+    """
+    result: list = [None]
+    hwnd_user = [None]
+    hwnd_pass = [None]
+    hwnd_error = [None]
+    font = [None]
+    done = [False]
+
+    CLASS_NAME = "NetBridgeProxyCredsDialog"
+
+    def wndproc(hwnd, msg, wparam, lparam):
+        if msg == WM_COMMAND:
+            control_id = wparam & 0xFFFF
+            notification = (wparam >> 16) & 0xFFFF
+
+            if control_id == ID_OK and notification == BN_CLICKED:
+                # Read username
+                length = user32.SendMessageW(hwnd_user[0], WM_GETTEXTLENGTH, 0, 0)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.SendMessageW(hwnd_user[0], WM_GETTEXT, length + 1, buf)
+                username = buf.value.strip()
+
+                # Read password
+                length = user32.SendMessageW(hwnd_pass[0], WM_GETTEXTLENGTH, 0, 0)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.SendMessageW(hwnd_pass[0], WM_GETTEXT, length + 1, buf)
+                password = buf.value
+
+                if not username:
+                    user32.SendMessageW(
+                        hwnd_error[0], WM_SETTEXT, 0,
+                        c_wchar_p("Username is required"),
+                    )
+                    user32.ShowWindow(hwnd_error[0], SW_SHOW)
+                    return 0
+
+                if not password and not has_password:
+                    user32.SendMessageW(
+                        hwnd_error[0], WM_SETTEXT, 0,
+                        c_wchar_p("Password is required"),
+                    )
+                    user32.ShowWindow(hwnd_error[0], SW_SHOW)
+                    return 0
+
+                # If has_password and blank, signal "keep existing" by passing None
+                result[0] = (username, password if password else None)
+                user32.DestroyWindow(hwnd)
+                return 0
+
+            elif control_id == ID_CLEAR and notification == BN_CLICKED:
+                result[0] = (None, None)
+                user32.DestroyWindow(hwnd)
+                return 0
+
+            elif control_id == ID_CANCEL and notification == BN_CLICKED:
+                user32.DestroyWindow(hwnd)
+                return 0
+
+        elif msg == WM_CLOSE:
+            user32.DestroyWindow(hwnd)
+            return 0
+
+        elif msg == WM_DESTROY:
+            if font[0]:
+                gdi32.DeleteObject(font[0])
+            done[0] = True
+            return 0
+
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    wndproc_cb = WNDPROC(wndproc)
+
+    wc = WNDCLASSW()
+    wc.lpfnWndProc = wndproc_cb
+    wc.hInstance = kernel32.GetModuleHandleW(None)
+    wc.hCursor = user32.LoadCursorW(None, IDC_ARROW)
+    wc.hbrBackground = ctypes.c_void_p(6)
+    wc.lpszClassName = CLASS_NAME
+
+    user32.RegisterClassW(byref(wc))
+
+    win_w, win_h = 480, 280
+    screen_w = user32.GetSystemMetrics(0)
+    screen_h = user32.GetSystemMetrics(1)
+    x = (screen_w - win_w) // 2
+    y = (screen_h - win_h) // 2
+
+    hwnd = user32.CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        CLASS_NAME,
+        "NetBridge - Passthrough Proxy Credentials",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x, y, win_w, win_h,
+        None, None, wc.hInstance, None,
+    )
+
+    try:
+        border_color = ctypes.wintypes.DWORD(0x00707070)
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_BORDER_COLOR,
+            byref(border_color), ctypes.sizeof(border_color),
+        )
+    except Exception:
+        pass
+
+    font[0] = _get_default_font()
+
+    # Username label
+    h_user_label = user32.CreateWindowExW(
+        0, "STATIC",
+        "Username (e.g. user@nbg.gr or DOMAIN\\user):",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        20, 20, 430, 20,
+        hwnd, ID_LABEL, wc.hInstance, None,
+    )
+    user32.SendMessageW(h_user_label, WM_SETFONT, font[0], 1)
+
+    # Username edit
+    hwnd_user[0] = user32.CreateWindowExW(
+        WS_EX_CLIENTEDGE, "EDIT",
+        default_user,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        20, 44, 430, 24,
+        hwnd, ID_USER_EDIT, wc.hInstance, None,
+    )
+    user32.SendMessageW(hwnd_user[0], WM_SETFONT, font[0], 1)
+
+    # Password label
+    pass_label_text = "Password:"
+    if has_password:
+        pass_label_text = "Password (leave blank to keep existing):"
+    h_pass_label = user32.CreateWindowExW(
+        0, "STATIC",
+        pass_label_text,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        20, 80, 430, 20,
+        hwnd, ID_LABEL, wc.hInstance, None,
+    )
+    user32.SendMessageW(h_pass_label, WM_SETFONT, font[0], 1)
+
+    # Password edit (masked)
+    hwnd_pass[0] = user32.CreateWindowExW(
+        WS_EX_CLIENTEDGE, "EDIT",
+        "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
+        20, 104, 430, 24,
+        hwnd, ID_PASS_EDIT, wc.hInstance, None,
+    )
+    user32.SendMessageW(hwnd_pass[0], WM_SETFONT, font[0], 1)
+
+    # Error label
+    hwnd_error[0] = user32.CreateWindowExW(
+        0, "STATIC", "",
+        WS_CHILD | SS_LEFT,
+        20, 140, 430, 40,
+        hwnd, ID_ERROR_LABEL, wc.hInstance, None,
+    )
+    user32.SendMessageW(hwnd_error[0], WM_SETFONT, font[0], 1)
+
+    # Buttons
+    h_ok = user32.CreateWindowExW(
+        0, "BUTTON", "Save",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        140, 195, 90, 30,
+        hwnd, ID_OK, wc.hInstance, None,
+    )
+    user32.SendMessageW(h_ok, WM_SETFONT, font[0], 1)
+
+    h_clear = user32.CreateWindowExW(
+        0, "BUTTON", "Clear",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        240, 195, 90, 30,
+        hwnd, ID_CLEAR, wc.hInstance, None,
+    )
+    user32.SendMessageW(h_clear, WM_SETFONT, font[0], 1)
+
+    h_cancel = user32.CreateWindowExW(
+        0, "BUTTON", "Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        340, 195, 90, 30,
+        hwnd, ID_CANCEL, wc.hInstance, None,
+    )
+    user32.SendMessageW(h_cancel, WM_SETFONT, font[0], 1)
+
+    user32.ShowWindow(hwnd, SW_SHOW)
+    user32.UpdateWindow(hwnd)
+    user32.SetFocus(hwnd_user[0])
+
+    msg = ctypes.wintypes.MSG()
+    while not done[0]:
+        ret = user32.GetMessageW(byref(msg), None, 0, 0)
+        if ret <= 0:
+            break
+        if not user32.IsDialogMessageW(hwnd, byref(msg)):
+            user32.TranslateMessage(byref(msg))
+            user32.DispatchMessageW(byref(msg))
+
     user32.UnregisterClassW(CLASS_NAME, wc.hInstance)
 
     return result[0]

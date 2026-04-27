@@ -348,16 +348,10 @@ async def connect_via_proxy(
         raise ProxyConnectionError(f"Cannot connect to proxy {proxy_host}:{proxy_port}: {e}")
 
     try:
-        # Step 1: Send initial CONNECT (with Basic auth if credentials provided)
-        basic_header = None
-        if proxy_auth:
-            username, password = proxy_auth
-            credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-            basic_header = f"Basic {credentials}"
-
+        # Step 1: Send unauthenticated CONNECT
         await _send_connect_request(
             writer, target_host, target_port,
-            auth_header=basic_header,
+            auth_header=None,
             timeout=timeout,
         )
         status, headers = await _read_proxy_response(reader, timeout=timeout)
@@ -366,7 +360,7 @@ async def connect_via_proxy(
         if status == 200:
             return reader, writer
 
-        # Step 3: If 407, try SSPI auth on Windows (Negotiate/NTLM)
+        # Step 3: If 407 on Windows, try SSPI first (uses logged-in user)
         if status == 407 and sys.platform == "win32":
             scheme = _select_auth_scheme(headers)
             if scheme:
@@ -375,25 +369,64 @@ async def connect_via_proxy(
                         "Proxy requires auth, attempting SSPI %s for %s:%d",
                         scheme, target_host, target_port,
                     )
-                    status, headers = await _sspi_handshake(
+                    sspi_status, sspi_headers = await _sspi_handshake(
                         reader, writer,
                         target_host, target_port,
                         proxy_host, scheme,
                         challenge_headers=headers,
                         timeout=timeout,
                     )
-                    if status == 200:
+                    if sspi_status == 200:
                         logger.info("SSPI %s auth successful", scheme)
                         return reader, writer
-                    # Fall through to error handling below
                     logger.warning(
-                        "SSPI %s auth failed with status %d", scheme, status
+                        "SSPI %s auth failed with status %d", scheme, sspi_status
                     )
+                    status, headers = sspi_status, sspi_headers
                 except Exception as e:
                     logger.warning("SSPI %s auth error: %s", scheme, e)
-                    # Fall through to raise the 407 error
+                    # Fall through to Basic fallback / error
 
-        # Step 4: Raise appropriate error
+        # Step 4: If still 407 and we have stored creds, retry with Basic on a
+        # fresh connection (NTLM/Negotiate may have left this one in a half-
+        # authenticated state that the proxy will not accept Basic on).
+        if status == 407 and proxy_auth:
+            logger.info(
+                "Falling back to Basic auth with stored credentials for %s:%d",
+                target_host, target_port,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy_host, proxy_port),
+                    timeout=timeout,
+                )
+            except OSError as e:
+                raise ProxyConnectionError(
+                    f"Cannot reconnect to proxy {proxy_host}:{proxy_port}: {e}"
+                )
+
+            username, password = proxy_auth
+            credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+            basic_header = f"Basic {credentials}"
+
+            await _send_connect_request(
+                writer, target_host, target_port,
+                auth_header=basic_header,
+                timeout=timeout,
+            )
+            status, headers = await _read_proxy_response(reader, timeout=timeout)
+            if status == 200:
+                logger.info("Basic auth fallback successful")
+                return reader, writer
+            logger.warning("Basic auth fallback failed with status %d", status)
+
+        # Step 5: Raise appropriate error
         _raise_for_status(status, target_host, target_port)
 
         # _raise_for_status always raises for non-200, but just in case:

@@ -266,29 +266,46 @@ class TestConnectViaProxySuccess:
         assert writer is mock_writer
 
     @pytest.mark.asyncio
-    async def test_basic_auth_header_sent(self):
-        """When proxy_auth is provided, Basic auth header is sent."""
-        mock_reader = AsyncMock(spec=asyncio.StreamReader)
-        mock_writer = MagicMock(spec=asyncio.StreamWriter)
-        mock_writer.write = MagicMock()
-        mock_writer.drain = AsyncMock()
-        mock_writer.close = MagicMock()
-        mock_writer.wait_closed = AsyncMock()
+    async def test_basic_auth_fallback_after_407(self):
+        """When unauthenticated CONNECT returns 407, retry with Basic auth on a fresh connection."""
+        # First connection: returns 407 with no Proxy-Authenticate scheme so SSPI is skipped
+        reader1 = AsyncMock(spec=asyncio.StreamReader)
+        writer1 = MagicMock(spec=asyncio.StreamWriter)
+        writer1.write = MagicMock()
+        writer1.drain = AsyncMock()
+        writer1.close = MagicMock()
+        writer1.wait_closed = AsyncMock()
+        reader1.readline = AsyncMock(side_effect=make_http_response(407, "Proxy Auth Required"))
 
-        lines = make_http_response(200, "Connection Established")
-        mock_reader.readline = AsyncMock(side_effect=lines)
+        # Second connection: 200 OK after Basic auth
+        reader2 = AsyncMock(spec=asyncio.StreamReader)
+        writer2 = MagicMock(spec=asyncio.StreamWriter)
+        writer2.write = MagicMock()
+        writer2.drain = AsyncMock()
+        writer2.close = MagicMock()
+        writer2.wait_closed = AsyncMock()
+        reader2.readline = AsyncMock(side_effect=make_http_response(200, "Connection Established"))
 
         with patch("asyncio.open_connection", new_callable=AsyncMock) as mock_open:
-            mock_open.return_value = (mock_reader, mock_writer)
+            mock_open.side_effect = [(reader1, writer1), (reader2, writer2)]
 
-            await connect_via_proxy(
+            reader, writer = await connect_via_proxy(
                 "proxy", 8080, "target", 443,
                 proxy_auth=("user", "pass"),
             )
 
-        written = mock_writer.write.call_args[0][0].decode()
+        # First CONNECT must NOT have Basic auth
+        first_written = writer1.write.call_args[0][0].decode()
+        assert "Proxy-Authorization" not in first_written
+
+        # Second CONNECT must have Basic auth
+        second_written = writer2.write.call_args[0][0].decode()
         expected_creds = base64.b64encode(b"user:pass").decode()
-        assert f"Proxy-Authorization: Basic {expected_creds}" in written
+        assert f"Proxy-Authorization: Basic {expected_creds}" in second_written
+
+        # Returned reader/writer come from second (authenticated) connection
+        assert reader is reader2
+        assert writer is writer2
 
 
 # ---------------------------------------------------------------------------

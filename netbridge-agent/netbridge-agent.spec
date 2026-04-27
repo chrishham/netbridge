@@ -26,6 +26,7 @@ a = Analysis(
         "netbridge_agent.auth",
         "netbridge_agent.tunnel",
         "netbridge_agent.winproxy",
+        "netbridge_agent.credstore",
 
         "shared_auth",
         "shared_auth.token",

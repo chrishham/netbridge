@@ -169,7 +169,7 @@ The tray icon shows connection status:
 
     # Handle import check (CI smoke test for bundled modules)
     if args.import_check:
-        from . import agent, app, auth, config, dialogs, installer, legacy, tray, tunnel, winauth, winproxy  # noqa: F401
+        from . import agent, app, auth, config, credstore, dialogs, installer, legacy, tray, tunnel, winauth, winproxy  # noqa: F401
         print(f"{APP_NAME} v{APP_VERSION}: all modules imported OK")
         # Verify ctypes bindings (catches runtime type mismatches)
         if sys.platform == "win32":

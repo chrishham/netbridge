@@ -222,6 +222,63 @@ class NetBridgeApp:
         if self.tray:
             self.tray.stop()
 
+    def request_set_proxy_credentials(self) -> None:
+        """Prompt for passthrough proxy credentials and store them.
+
+        Triggers reconnect so the new credentials take effect immediately.
+        """
+        if sys.platform != "win32":
+            return
+
+        from .credstore import (
+            load_proxy_credentials,
+            save_proxy_credentials,
+            clear_proxy_credentials,
+        )
+        from .dialogs import prompt_proxy_credentials
+
+        existing = load_proxy_credentials()
+        default_user = existing[0] if existing else ""
+        has_password = existing is not None
+
+        result = prompt_proxy_credentials(default_user, has_password)
+        if result is None:
+            logger.info("Proxy credentials dialog cancelled")
+            return
+
+        username, password = result
+
+        if username is None and password is None:
+            clear_proxy_credentials()
+            logger.info("Proxy credentials cleared")
+            if self.tray:
+                self.tray.show_notification(
+                    "Proxy Credentials", "Stored credentials removed"
+                )
+        else:
+            # Keep existing password if user left blank
+            if password is None and existing:
+                password = existing[1]
+            try:
+                save_proxy_credentials(username, password or "")
+                logger.info(f"Proxy credentials saved for user: {username}")
+                if self.tray:
+                    self.tray.show_notification(
+                        "Proxy Credentials", f"Saved for {username}"
+                    )
+            except OSError as e:
+                logger.error(f"Failed to save proxy credentials: {e}")
+                if self.tray:
+                    self.tray.show_notification("Error", f"Save failed: {e}")
+                return
+
+        # Trigger reconnect so creds take effect
+        if self._async_loop and self._stop_event:
+            self._async_loop.call_soon_threadsafe(self._stop_event.set)
+        self._pending_connect.set()
+        if self._async_loop:
+            self._async_loop.call_soon_threadsafe(self._check_pending_requests)
+
     def request_install(self) -> None:
         """Request install (from tray menu)."""
         from .installer import Installer

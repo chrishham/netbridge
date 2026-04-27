@@ -727,6 +727,17 @@ async def run_agent(
     state.allowed_destinations = config.allowed_destinations
     state.denied_destinations = config.denied_destinations
 
+    # Load passthrough proxy credentials (used as fallback when SSPI fails or
+    # the corporate proxy demands Basic auth)
+    try:
+        from .credstore import load_proxy_credentials
+        creds = load_proxy_credentials()
+        if creds:
+            state.passthrough_proxy_auth = creds
+            logger.info(f"Passthrough proxy auth loaded for user: {creds[0]}")
+    except Exception as e:
+        logger.warning(f"Failed to load passthrough proxy creds: {e}")
+
     # Get authentication
     auth_token = None
     token_refresh = None
