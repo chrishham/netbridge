@@ -26,6 +26,14 @@ class ProxyConnectionError(Exception):
         self.status_code = status_code
 
 
+class ProxyAuthRejected(ProxyConnectionError):
+    """Raised when stored Basic credentials are rejected by the proxy.
+
+    Distinct from generic 407 so callers can disable the cached credentials
+    after a single failure to avoid AD account lockout from repeated retries.
+    """
+
+
 def parse_proxy_address(proxy: str) -> tuple[str, int]:
     """
     Parse a proxy address string into host and port.
@@ -425,6 +433,16 @@ async def connect_via_proxy(
                 logger.info("Basic auth fallback successful")
                 return reader, writer
             logger.warning("Basic auth fallback failed with status %d", status)
+
+            # 407 with stored creds = creds wrong/expired. Surface a distinct
+            # error so the agent can disable the cached creds and avoid
+            # repeated retries that would lock the AD account.
+            if status == 407:
+                raise ProxyAuthRejected(
+                    "Stored proxy credentials rejected — open NetBridge tray "
+                    "on VDI and update credentials",
+                    status_code=407,
+                )
 
         # Step 5: Raise appropriate error
         _raise_for_status(status, target_host, target_port)

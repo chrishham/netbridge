@@ -419,11 +419,24 @@ class NetBridgeApp:
                 stop_event=self._stop_event,
                 on_status_change=self._on_agent_status,
                 on_session_info=self.set_session_info,
+                on_proxy_auth_rejected=self._on_proxy_auth_rejected,
             )
         except Exception as e:
             logger.error(f"Agent error: {e}")
         finally:
             self.set_status(Status.DISCONNECTED)
+
+    def _on_proxy_auth_rejected(self) -> None:
+        """Callback from agent when stored Basic creds rejected by proxy.
+
+        Shown as a tray toast so user knows to update credentials via tray.
+        Logging and in-memory disable handled in agent.
+        """
+        if self.tray:
+            self.tray.show_notification(
+                "Proxy Authentication Failed",
+                "Stored proxy credentials rejected. Right-click tray → Set Proxy Credentials.",
+            )
 
     def _on_agent_status(self, connected: bool, auth_required: bool = False) -> None:
         """Callback from agent when status changes.

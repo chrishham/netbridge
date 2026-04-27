@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from .config import Config, normalize_relay_url, redact_proxy_url
+from .tunnel import ProxyAuthRejected
 from .auth import (
     get_arm_token,
     check_az_login,
@@ -201,6 +202,8 @@ class AgentState:
         self.pending_connections: dict[str, asyncio.Task] = {}
         self._lock: Optional[asyncio.Lock] = None
         self.passthrough_proxy_auth: Optional[tuple[str, str]] = None
+        self.passthrough_auth_rejected: bool = False
+        self.on_proxy_auth_rejected: Optional[Callable[[], None]] = None
         self.allow_private_destinations: bool = True
         self.allowed_destinations: list[str] = []
         self.denied_destinations: list[str] = []
@@ -433,8 +436,14 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
 
     async def do_connect():
         try:
+            # Skip Basic auth if creds were already rejected this run, to
+            # avoid AD account lockout from repeated bad-password attempts.
+            proxy_auth = (
+                None if state.passthrough_auth_rejected
+                else state.passthrough_proxy_auth
+            )
             reader, writer = await open_tcp_connection(
-                host, port, timeout=30.0, proxy_auth=state.passthrough_proxy_auth
+                host, port, timeout=30.0, proxy_auth=proxy_auth
             )
 
             forward_task = asyncio.create_task(
@@ -457,6 +466,29 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             })
             logger.info(f"Connected: {stream_id[:8]} -> {host}:{port}")
 
+        except ProxyAuthRejected as e:
+            # Disable cached creds in-memory after a single failure so the
+            # next request does not retry and risk an AD lockout. The user
+            # must update credentials via the tray to re-enable Basic auth.
+            if not state.passthrough_auth_rejected:
+                state.passthrough_auth_rejected = True
+                logger.error(
+                    "Stored proxy credentials rejected by the corporate "
+                    "proxy. Basic auth disabled for this session — update "
+                    "credentials via the NetBridge tray to re-enable."
+                )
+                if state.on_proxy_auth_rejected:
+                    try:
+                        state.on_proxy_auth_rejected()
+                    except Exception:
+                        logger.exception("on_proxy_auth_rejected callback failed")
+            await send_to_relay(ws, {
+                "type": "tcp_connect_result",
+                "stream_id": stream_id,
+                "success": False,
+                "error": str(e),
+            }, silent=True)
+            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {e}")
         except Exception as e:
             await send_to_relay(ws, {
                 "type": "tcp_connect_result",
@@ -709,6 +741,7 @@ async def run_agent(
     stop_event: asyncio.Event,
     on_status_change: Optional[StatusCallback] = None,
     on_session_info: Optional[SessionInfoCallback] = None,
+    on_proxy_auth_rejected: Optional[Callable[[], None]] = None,
 ) -> None:
     """Main agent loop with reconnection logic.
 
@@ -717,9 +750,13 @@ async def run_agent(
         stop_event: Event to signal shutdown
         on_status_change: Callback for status changes (connected, auth_required)
         on_session_info: Callback for session info updates
+        on_proxy_auth_rejected: Called once when stored proxy creds are
+            rejected by the corporate proxy (so the UI can prompt the user
+            to update them).
     """
     relay_url = normalize_relay_url(relay_url)
     state = AgentState()
+    state.on_proxy_auth_rejected = on_proxy_auth_rejected
 
     # Apply destination filtering config
     config = Config.load()
