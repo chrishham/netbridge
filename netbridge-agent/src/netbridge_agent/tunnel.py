@@ -83,11 +83,73 @@ async def _send_connect_request(
     await asyncio.wait_for(writer.drain(), timeout=timeout)
 
 
+async def _drain_body(
+    reader: asyncio.StreamReader,
+    headers: dict[str, list[str]],
+    timeout: float = 30.0,
+) -> None:
+    """Consume any response body left in the socket buffer.
+
+    Why: corporate proxies often return a 407 with an HTML block page body.
+    If the body is not drained, leftover bytes corrupt the next response
+    parse on the same connection (breaks NTLM/Negotiate which is connection-
+    bound).
+    """
+    transfer_encoding = ""
+    for value in headers.get("transfer-encoding", []):
+        transfer_encoding = value.lower()
+        break
+
+    if "chunked" in transfer_encoding:
+        while True:
+            size_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if not size_line:
+                return
+            size_token = size_line.strip().split(b";", 1)[0]
+            try:
+                size = int(size_token, 16)
+            except ValueError:
+                return
+            if size == 0:
+                while True:
+                    trailer = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                    if not trailer or trailer == b"\r\n":
+                        return
+            try:
+                await asyncio.wait_for(reader.readexactly(size + 2), timeout=timeout)
+            except asyncio.IncompleteReadError:
+                return
+        return
+
+    for value in headers.get("content-length", []):
+        try:
+            length = int(value)
+        except ValueError:
+            return
+        if length > 0:
+            try:
+                await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+            except asyncio.IncompleteReadError:
+                pass
+        return
+
+
+def _connection_will_close(headers: dict[str, list[str]]) -> bool:
+    """True if the proxy signaled it will close after this response."""
+    for value in headers.get("connection", []):
+        if "close" in value.lower():
+            return True
+    return False
+
+
 async def _read_proxy_response(
     reader: asyncio.StreamReader,
     timeout: float = 30.0,
 ) -> tuple[int, dict[str, list[str]]]:
     """Read and parse an HTTP response from the proxy.
+
+    Drains any response body so subsequent requests on the same connection
+    parse cleanly.
 
     Returns:
         Tuple of (status_code, headers) where headers is a dict mapping
@@ -126,6 +188,8 @@ async def _read_proxy_response(
             name = name.strip().lower()
             value = value.strip()
             headers.setdefault(name, []).append(value)
+
+    await _drain_body(reader, headers, timeout=timeout)
 
     return status_code, headers
 
@@ -368,8 +432,18 @@ async def connect_via_proxy(
         if status == 200:
             return reader, writer
 
-        # Step 3: If 407 on Windows, try SSPI first (uses logged-in user)
-        if status == 407 and sys.platform == "win32":
+        # Step 3: If 407 on Windows, try SSPI first (uses logged-in user).
+        # Skip SSPI if the proxy will close the connection — NTLM/Negotiate
+        # requires the same TCP connection across handshake messages.
+        sspi_blocked_by_close = (
+            status == 407 and sys.platform == "win32" and _connection_will_close(headers)
+        )
+        if sspi_blocked_by_close:
+            logger.info(
+                "Proxy sent Connection: close with 407 — skipping SSPI for %s:%d",
+                target_host, target_port,
+            )
+        if status == 407 and sys.platform == "win32" and not sspi_blocked_by_close:
             scheme = _select_auth_scheme(headers)
             if scheme:
                 try:

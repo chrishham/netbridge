@@ -141,6 +141,52 @@ class TestReadProxyResponse:
         assert headers["proxy-authenticate"] == ["Negotiate", "NTLM"]
         assert headers["content-length"] == ["0"]
 
+    @pytest.mark.asyncio
+    async def test_content_length_body_drained(self, mock_reader):
+        """407 with Content-Length body must drain bytes so next response parses."""
+        body = b"<!DOCTYPE HTML PUBLIC blocked-by-proxy-page</html>"
+        lines = [
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n",
+            b"Proxy-Authenticate: Negotiate\r\n",
+            f"Content-Length: {len(body)}\r\n".encode(),
+            b"\r\n",
+        ]
+        mock_reader.readline = AsyncMock(side_effect=lines)
+        mock_reader.readexactly = AsyncMock(return_value=body)
+
+        status, _ = await _read_proxy_response(mock_reader)
+        assert status == 407
+        mock_reader.readexactly.assert_awaited_once_with(len(body))
+
+    @pytest.mark.asyncio
+    async def test_chunked_body_drained(self, mock_reader):
+        """Chunked bodies are drained chunk by chunk until 0-size terminator."""
+        lines = [
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\n",   # chunk size 5
+            b"0\r\n",   # terminator chunk
+            b"\r\n",    # trailers end
+        ]
+        mock_reader.readline = AsyncMock(side_effect=lines)
+        mock_reader.readexactly = AsyncMock(return_value=b"hello\r\n")
+
+        status, _ = await _read_proxy_response(mock_reader)
+        assert status == 407
+        mock_reader.readexactly.assert_awaited_once_with(7)  # 5 + CRLF
+
+    @pytest.mark.asyncio
+    async def test_no_body_no_readexactly(self, mock_reader):
+        """No Content-Length / chunked → no body read attempted."""
+        lines = make_http_response(200, "Connection Established")
+        mock_reader.readline = AsyncMock(side_effect=lines)
+        mock_reader.readexactly = AsyncMock()
+
+        status, _ = await _read_proxy_response(mock_reader)
+        assert status == 200
+        mock_reader.readexactly.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # _select_auth_scheme
@@ -460,6 +506,48 @@ class TestConnectViaProxySSPI:
 
             with pytest.raises(ProxyConnectionError, match="authentication required"):
                 await connect_via_proxy("proxy", 8080, "target", 443)
+
+    @pytest.mark.asyncio
+    async def test_sspi_skipped_when_proxy_closes(self):
+        """If 407 includes Connection: close, SSPI must be skipped (NTLM is conn-bound).
+        Falls through to Basic auth on a fresh connection.
+        """
+        reader1 = AsyncMock(spec=asyncio.StreamReader)
+        writer1 = MagicMock(spec=asyncio.StreamWriter)
+        writer1.write = MagicMock()
+        writer1.drain = AsyncMock()
+        writer1.close = MagicMock()
+        writer1.wait_closed = AsyncMock()
+        reader1.readline = AsyncMock(side_effect=make_http_response(
+            407, "Proxy Authentication Required",
+            headers={
+                "Proxy-Authenticate": ["Negotiate", "NTLM"],
+                "Connection": "close",
+            },
+        ))
+
+        reader2 = AsyncMock(spec=asyncio.StreamReader)
+        writer2 = MagicMock(spec=asyncio.StreamWriter)
+        writer2.write = MagicMock()
+        writer2.drain = AsyncMock()
+        writer2.close = MagicMock()
+        writer2.wait_closed = AsyncMock()
+        reader2.readline = AsyncMock(side_effect=make_http_response(200, "Connection Established"))
+
+        with patch("asyncio.open_connection", new_callable=AsyncMock) as mock_open, \
+             patch("netbridge_agent.tunnel.sys") as mock_sys, \
+             patch("netbridge_agent.tunnel._sspi_handshake", new_callable=AsyncMock) as mock_sspi:
+
+            mock_open.side_effect = [(reader1, writer1), (reader2, writer2)]
+            mock_sys.platform = "win32"
+
+            reader, writer = await connect_via_proxy(
+                "proxy", 8080, "target", 443,
+                proxy_auth=("user", "pass"),
+            )
+
+        mock_sspi.assert_not_called()
+        assert reader is reader2
 
     @pytest.mark.asyncio
     async def test_sspi_returns_non_200_raises(self):
