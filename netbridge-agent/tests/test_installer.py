@@ -181,9 +181,19 @@ class TestInstallerCreateConfig:
 class TestWindowsStartup:
     """Windows registry startup tests (skipped on non-Windows)."""
 
-    def test_add_to_startup(self):
-        """add_to_startup writes to the registry."""
-        assert Installer.add_to_startup() is True
+    def test_add_to_startup(self, tmp_path):
+        """add_to_startup writes to the registry.
+
+        Mocks the exe path to a real file so the test does not depend on
+        whether the agent is actually installed on the CI runner.
+        """
+        fake_exe = tmp_path / "netbridge.exe"
+        fake_exe.write_bytes(b"")
+        with patch(
+            "netbridge_agent.installer.get_installed_exe_path",
+            return_value=fake_exe,
+        ):
+            assert Installer.add_to_startup() is True
 
     def test_is_in_startup(self):
         """is_in_startup checks the registry."""
