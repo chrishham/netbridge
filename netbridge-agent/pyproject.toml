@@ -28,7 +28,7 @@ path = "src/netbridge_agent/__init__.py"
 [dependency-groups]
 dev = [
     "pyinstaller>=6.18.0",
-    "pytest>=8.0.0",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.0.0",
 ]
 
