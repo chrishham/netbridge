@@ -510,9 +510,9 @@ def prompt_proxy_credentials(
     user32.SendMessageW(hwnd_user[0], WM_SETFONT, font[0], 1)
 
     # Password label
-    pass_label_text = "Password:"
+    pass_label_text = "Password:"  # nosec B105 - UI label, not a credential
     if has_password:
-        pass_label_text = "Password (leave blank to keep existing):"
+        pass_label_text = "Password (leave blank to keep existing):"  # nosec B105 - UI label, not a credential
     h_pass_label = user32.CreateWindowExW(
         0, "STATIC",
         pass_label_text,
