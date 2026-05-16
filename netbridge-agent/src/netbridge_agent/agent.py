@@ -67,10 +67,14 @@ MAX_TCP_DATA_SIZE = 1 * 1024 * 1024
 _MAX_TCP_DATA_B64_LEN = MAX_TCP_DATA_SIZE * 4 // 3 + 4
 
 
-# Loopback and link-local ranges are always blocked (agent-local SSRF protection)
-_ALWAYS_BLOCKED_RANGES = [
+# Loopback ranges — blocked by default, can be allowed via allow_loopback config
+_LOOPBACK_RANGES = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("::1/128"),
+]
+
+# Link-local ranges are always blocked (agent-local SSRF protection)
+_LINK_LOCAL_RANGES = [
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("fe80::/10"),
 ]
@@ -89,11 +93,14 @@ async def validate_destination(
     allowed_destinations: list[str] | None = None,
     denied_destinations: list[str] | None = None,
     allow_private: bool = True,
+    allow_loopback: bool = False,
 ) -> tuple[bool, str]:
     """Validate a destination against blocked ranges and optional lists.
 
-    Loopback (127/8, ::1) and link-local (169.254/16, fe80::/10) are always
-    blocked to prevent SSRF against the agent machine itself.
+    Loopback (127/8, ::1) and link-local (169.254/16, fe80::/10) are blocked
+    by default to prevent SSRF against the agent machine itself. Set
+    allow_loopback=True to permit loopback destinations (e.g. for local
+    services reachable only through the tunnel).
 
     RFC 1918 private ranges (10/8, 172.16/12, 192.168/16) are only blocked
     when allow_private is False. When True (default), private ranges are
@@ -126,11 +133,18 @@ async def validate_destination(
         except (OSError, UnicodeError):
             pass  # DNS failure — fall through to hostname pattern checks
 
-    # Always block loopback and link-local (agent-local SSRF protection)
+    # Block link-local (always)
     for ip in resolved_ips:
-        for net in _ALWAYS_BLOCKED_RANGES:
+        for net in _LINK_LOCAL_RANGES:
             if ip in net:
                 return False, f"Destination {host} is in a blocked range ({net})"
+
+    # Block loopback (unless allow_loopback is True)
+    if not allow_loopback:
+        for ip in resolved_ips:
+            for net in _LOOPBACK_RANGES:
+                if ip in net:
+                    return False, f"Destination {host} is in a blocked range ({net})"
 
     # Check RFC 1918 private ranges (only when allow_private is False)
     if not allow_private:
@@ -205,6 +219,7 @@ class AgentState:
         self.passthrough_auth_rejected: bool = False
         self.on_proxy_auth_rejected: Optional[Callable[[], None]] = None
         self.allow_private_destinations: bool = True
+        self.allow_loopback: bool = False
         self.allowed_destinations: list[str] = []
         self.denied_destinations: list[str] = []
 
@@ -420,7 +435,8 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
     # Validate destination against private ranges and config lists
     dest_allowed, dest_reason = await validate_destination(
         host, port, state.allowed_destinations, state.denied_destinations,
-        allow_private=state.allow_private_destinations
+        allow_private=state.allow_private_destinations,
+        allow_loopback=state.allow_loopback,
     )
     if not dest_allowed:
         logger.warning(f"Destination denied: {stream_id[:8]} -> {host}:{port}: {dest_reason}")
@@ -761,6 +777,7 @@ async def run_agent(
     # Apply destination filtering config
     config = Config.load()
     state.allow_private_destinations = config.allow_private_destinations
+    state.allow_loopback = config.allow_loopback
     state.allowed_destinations = config.allowed_destinations
     state.denied_destinations = config.denied_destinations
 

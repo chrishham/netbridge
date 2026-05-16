@@ -128,11 +128,32 @@ class TestValidateDestination:
         assert allowed is False
 
     @pytest.mark.asyncio
-    async def test_loopback_always_blocked_even_if_in_allowed(self):
-        """Loopback is always blocked, even if explicitly in allowed list."""
+    async def test_loopback_blocked_even_if_in_allowed(self):
+        """Loopback is blocked by default, even if explicitly in allowed list."""
         allowed, reason = await validate_destination(
             "127.0.0.1", 80,
             allowed_destinations=["127.0.0.0/8"],
+        )
+        assert allowed is False
+
+    @pytest.mark.asyncio
+    async def test_loopback_allowed_when_enabled(self):
+        allowed, reason = await validate_destination(
+            "127.0.0.1", 80, allow_loopback=True,
+        )
+        assert allowed is True
+
+    @pytest.mark.asyncio
+    async def test_loopback_ipv6_allowed_when_enabled(self):
+        allowed, reason = await validate_destination(
+            "::1", 80, allow_loopback=True,
+        )
+        assert allowed is True
+
+    @pytest.mark.asyncio
+    async def test_link_local_still_blocked_with_allow_loopback(self):
+        allowed, reason = await validate_destination(
+            "169.254.1.1", 80, allow_loopback=True,
         )
         assert allowed is False
 

@@ -68,6 +68,7 @@ class Config:
     show_notifications: bool = True
     log_level: str = "INFO"
     allow_private_destinations: bool = True
+    allow_loopback: bool = False
     allowed_destinations: list[str] = field(default_factory=list)
     denied_destinations: list[str] = field(default_factory=list)
     keep_session_alive: bool = False
@@ -80,6 +81,7 @@ class Config:
             "show_notifications": self.show_notifications,
             "log_level": self.log_level,
             "allow_private_destinations": self.allow_private_destinations,
+            "allow_loopback": self.allow_loopback,
         }
         if self.allowed_destinations:
             d["allowed_destinations"] = self.allowed_destinations
@@ -98,6 +100,7 @@ class Config:
             show_notifications=data.get("show_notifications", True),
             log_level=data.get("log_level", "INFO"),
             allow_private_destinations=data.get("allow_private_destinations", True),
+            allow_loopback=data.get("allow_loopback", False),
             allowed_destinations=data.get("allowed_destinations", []),
             denied_destinations=data.get("denied_destinations", []),
             keep_session_alive=data.get("keep_session_alive", False),
