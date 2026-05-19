@@ -176,6 +176,30 @@ class NetBridgeApp:
             if self.tray:
                 self.tray.show_notification("Error", f"Could not open terminal: {e}")
 
+    def request_restart(self) -> None:
+        """Restart the application by launching a new instance and exiting."""
+        if sys.platform != "win32":
+            return
+
+        from .installer import get_exe_path
+
+        target_exe = get_exe_path()
+        logger.info(f"Restart requested, relaunching: {target_exe}")
+        try:
+            subprocess.Popen(
+                [str(target_exe), "--no-install"],
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+            )
+        except OSError:
+            logger.exception("Failed to launch new process")
+            return
+
+        self._pending_exit.set()
+        if self._async_loop and self._stop_event:
+            self._async_loop.call_soon_threadsafe(self._stop_event.set)
+        if self.tray:
+            self.tray.stop()
+
     def request_change_relay_url(self) -> None:
         """Prompt for a new relay URL, save config, and restart (from tray menu)."""
         if sys.platform != "win32":
@@ -190,37 +214,11 @@ class NetBridgeApp:
             logger.info("Relay URL change cancelled or unchanged")
             return
 
-        # Save new URL
         self.config.relay_url = url
         self.config.save()
         logger.info(f"Relay URL changed to: {url}")
 
-        # Restart: launch new instance with --no-install, then exit cleanly.
-        # We avoid os._exit() because it skips Python cleanup — file handles
-        # (including the log file) may not be released before the child opens
-        # them, causing the child to crash in setup_logging() with no visible
-        # error.  Instead we let pystray's stop() unwind the message loop so
-        # _run_tray() returns normally and the process exits via sys.exit().
-        from .installer import get_exe_path
-
-        target_exe = get_exe_path()
-        logger.info(f"Relaunching: {target_exe} --no-install")
-        try:
-            subprocess.Popen(
-                [str(target_exe), "--no-install"],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-            )
-        except OSError:
-            logger.exception("Failed to launch new process")
-            return
-
-        # Signal async loop to stop, then let pystray unwind cleanly
-        self._pending_exit.set()
-        if self._async_loop and self._stop_event:
-            self._async_loop.call_soon_threadsafe(self._stop_event.set)
-
-        if self.tray:
-            self.tray.stop()
+        self.request_restart()
 
     def request_set_proxy_credentials(self) -> None:
         """Prompt for passthrough proxy credentials and store them.

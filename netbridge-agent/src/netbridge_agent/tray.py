@@ -205,6 +205,9 @@ class TrayIcon:
         def on_view_logs(icon, item):
             self._open_logs()
 
+        def on_restart(icon, item):
+            self.app.request_restart()
+
         def on_install(icon, item):
             self.app.request_install()
 
@@ -268,6 +271,10 @@ class TrayIcon:
             pystray.MenuItem(
                 "View Logs",
                 on_view_logs,
+            ),
+            pystray.MenuItem(
+                "Restart",
+                on_restart,
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
