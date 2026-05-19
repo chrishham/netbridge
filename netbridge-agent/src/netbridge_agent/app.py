@@ -64,6 +64,20 @@ def setup_logging(config: Config, console: bool = False) -> None:
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
+
+    # Remote exec gets its own log file
+    remote_exec_logger = logging.getLogger("netbridge_agent.remote_exec")
+    remote_exec_logger.propagate = False
+    remote_exec_logger.setLevel(level)
+    remote_exec_handler = TimedRotatingFileHandler(
+        get_log_dir() / "remote-exec.log",
+        when="D",
+        interval=1,
+        backupCount=2,
+        encoding="utf-8",
+    )
+    remote_exec_handler.setFormatter(formatter)
+    remote_exec_logger.addHandler(remote_exec_handler)
     root_logger.addHandler(file_handler)
 
     if console:
