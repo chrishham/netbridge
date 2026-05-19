@@ -142,6 +142,7 @@ class TrayIcon:
                 self._icon.icon = self._remote_exec_icon
             else:
                 self._icon.icon = self._icon_cache[self._status]
+            self._icon.title = STATUS_TOOLTIPS[self._status]
             self._icon.update_menu()
 
     def set_session_info(self, info: str) -> None:
