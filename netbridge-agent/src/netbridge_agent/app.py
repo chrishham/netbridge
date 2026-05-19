@@ -21,6 +21,8 @@ from typing import Optional
 from .config import Config, ensure_app_dirs, get_log_path, APP_NAME, APP_VERSION
 from .tray import TrayIcon, Status, TRAY_AVAILABLE
 
+REMOTE_EXEC_TIMEOUT = 3600  # 1 hour auto-disable
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,11 @@ class NetBridgeApp:
 
         # Session keep-alive
         self._keepalive_task: Optional[asyncio.Task] = None
+
+        # Remote exec state
+        self._remote_exec_enabled: bool = False
+        self._remote_exec_timer: Optional[asyncio.TimerHandle] = None
+        self._intercept_server = None
 
         logger.info(f"{APP_NAME} v{APP_VERSION} starting")
 
@@ -374,6 +381,74 @@ class NetBridgeApp:
             self._keepalive_stop.set()
         self._keepalive_task = None
 
+    def request_toggle_remote_exec(self) -> None:
+        """Toggle remote exec mode (from tray menu)."""
+        self._remote_exec_enabled = not self._remote_exec_enabled
+        logger.info(f"Remote exec: {'ENABLED' if self._remote_exec_enabled else 'disabled'}")
+
+        if self._async_loop:
+            self._async_loop.call_soon_threadsafe(self._apply_remote_exec)
+
+        if self.tray:
+            self.tray.set_remote_exec(self._remote_exec_enabled)
+            if self._remote_exec_enabled:
+                self.tray.show_notification(
+                    "Remote Exec ENABLED",
+                    f"Remote execution active. Auto-disables in {REMOTE_EXEC_TIMEOUT // 60} min.",
+                )
+            else:
+                self.tray.show_notification(
+                    "Remote Exec Disabled",
+                    "Remote execution is now off.",
+                )
+
+    def _apply_remote_exec(self) -> None:
+        """Start or stop intercept server and auto-disable timer (async loop)."""
+        if self._remote_exec_enabled:
+            asyncio.create_task(self._start_remote_exec())
+        else:
+            asyncio.create_task(self._stop_remote_exec())
+
+    async def _start_remote_exec(self) -> None:
+        """Start the intercept server and schedule auto-disable."""
+        from .intercept import InterceptServer
+        if self._intercept_server is None:
+            self._intercept_server = InterceptServer()
+        await self._intercept_server.start()
+
+        if self._remote_exec_timer:
+            self._remote_exec_timer.cancel()
+        loop = asyncio.get_event_loop()
+        self._remote_exec_timer = loop.call_later(
+            REMOTE_EXEC_TIMEOUT,
+            lambda: asyncio.create_task(self._remote_exec_auto_disable()),
+        )
+
+    async def _stop_remote_exec(self) -> None:
+        """Stop the intercept server and cancel timer."""
+        if self._remote_exec_timer:
+            self._remote_exec_timer.cancel()
+            self._remote_exec_timer = None
+        if self._intercept_server:
+            await self._intercept_server.stop()
+
+    async def _remote_exec_auto_disable(self) -> None:
+        """Auto-disable remote exec after timeout."""
+        if self._remote_exec_enabled:
+            self._remote_exec_enabled = False
+            logger.info("Remote exec auto-disabled after timeout")
+            await self._stop_remote_exec()
+            if self.tray:
+                self.tray.set_remote_exec(False)
+                self.tray.show_notification(
+                    "Remote Exec Disabled",
+                    "Remote execution auto-disabled after timeout.",
+                )
+
+    def _get_remote_exec_state(self):
+        """Return (enabled, server) for remote exec — called from agent."""
+        return self._remote_exec_enabled, self._intercept_server
+
     def request_exit(self) -> None:
         """Request application exit (from tray menu)."""
         logger.info("Exit requested")
@@ -418,6 +493,7 @@ class NetBridgeApp:
                 on_status_change=self._on_agent_status,
                 on_session_info=self.set_session_info,
                 on_proxy_auth_rejected=self._on_proxy_auth_rejected,
+                get_remote_exec_state=self._get_remote_exec_state,
             )
         except Exception as e:
             logger.error(f"Agent error: {e}")
@@ -464,6 +540,11 @@ class NetBridgeApp:
 
         # Wait for exit request
         await self._stop_event.wait()
+
+        # Stop remote exec if active
+        if self._remote_exec_enabled:
+            self._remote_exec_enabled = False
+            await self._stop_remote_exec()
 
         # Stop keep-alive
         self._stop_keepalive()

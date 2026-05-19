@@ -222,6 +222,9 @@ class AgentState:
         self.allow_loopback: bool = False
         self.allowed_destinations: list[str] = []
         self.denied_destinations: list[str] = []
+        self.remote_exec_enabled: bool = False
+        self.intercept_server: Optional[object] = None
+        self.get_remote_exec_state: Optional[Callable] = None
 
     def get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -431,6 +434,34 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             "error": "Too many active streams",
         })
         return
+
+    # Intercept magic hostnames
+    from .intercept import is_magic_hostname
+    if is_magic_hostname(host):
+        if not state.get_remote_exec_state:
+            await send_to_relay(ws, {
+                "type": "tcp_connect_result",
+                "stream_id": stream_id,
+                "success": False,
+                "error": "Remote exec is not configured",
+            })
+            return
+        enabled, server = state.get_remote_exec_state()
+        if not enabled or not server or not server.port:
+            await send_to_relay(ws, {
+                "type": "tcp_connect_result",
+                "stream_id": stream_id,
+                "success": False,
+                "error": "Remote exec is disabled",
+            })
+            return
+        # Redirect to internal intercept server
+        port = server.port
+        host = "127.0.0.1"
+        logger.info(
+            "Intercept: %s -> %s:%s via 127.0.0.1:%d",
+            stream_id[:8], request.get("host"), request.get("port"), port,
+        )
 
     # Validate destination against private ranges and config lists
     dest_allowed, dest_reason = await validate_destination(
@@ -758,6 +789,7 @@ async def run_agent(
     on_status_change: Optional[StatusCallback] = None,
     on_session_info: Optional[SessionInfoCallback] = None,
     on_proxy_auth_rejected: Optional[Callable[[], None]] = None,
+    get_remote_exec_state: Optional[Callable] = None,
 ) -> None:
     """Main agent loop with reconnection logic.
 
@@ -769,10 +801,13 @@ async def run_agent(
         on_proxy_auth_rejected: Called once when stored proxy creds are
             rejected by the corporate proxy (so the UI can prompt the user
             to update them).
+        get_remote_exec_state: Callback returning (enabled, server) for
+            remote exec feature.
     """
     relay_url = normalize_relay_url(relay_url)
     state = AgentState()
     state.on_proxy_auth_rejected = on_proxy_auth_rejected
+    state.get_remote_exec_state = get_remote_exec_state
 
     # Apply destination filtering config
     config = Config.load()

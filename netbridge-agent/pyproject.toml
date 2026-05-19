@@ -29,6 +29,7 @@ path = "src/netbridge_agent/__init__.py"
 dev = [
     "pyinstaller>=6.18.0",
     "pytest>=9.0.3",
+    "pytest-aiohttp>=1.1.0",
     "pytest-asyncio>=1.0.0",
 ]
 

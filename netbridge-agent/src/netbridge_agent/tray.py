@@ -37,6 +37,8 @@ class Status(Enum):
     AUTH_REQUIRED = "auth_required"
 
 
+REMOTE_EXEC_COLOR = "#9B59B6"  # Purple — remote exec active
+
 # Status to color mapping
 STATUS_COLORS = {
     Status.DISCONNECTED: "#E74C3C",    # Red
@@ -105,10 +107,13 @@ class TrayIcon:
         self._icon: Optional[pystray.Icon] = None
         self._session_info: str = ""
 
+        self._remote_exec = False
+
         # Cache generated icons
         self._icon_cache: dict[Status, Image.Image] = {}
         for status in Status:
             self._icon_cache[status] = create_icon_image(STATUS_COLORS[status])
+        self._remote_exec_icon = create_icon_image(REMOTE_EXEC_COLOR)
 
     @property
     def status(self) -> Status:
@@ -123,8 +128,21 @@ class TrayIcon:
         """
         self._status = status
         if self._icon:
-            self._icon.icon = self._icon_cache[status]
+            if self._remote_exec:
+                self._icon.icon = self._remote_exec_icon
+            else:
+                self._icon.icon = self._icon_cache[status]
             self._icon.title = STATUS_TOOLTIPS[status]
+
+    def set_remote_exec(self, enabled: bool) -> None:
+        """Toggle remote exec mode (changes icon to purple when active)."""
+        self._remote_exec = enabled
+        if self._icon:
+            if enabled:
+                self._icon.icon = self._remote_exec_icon
+            else:
+                self._icon.icon = self._icon_cache[self._status]
+            self._icon.update_menu()
 
     def set_session_info(self, info: str) -> None:
         """Set the session info displayed in menu.
@@ -205,6 +223,15 @@ class TrayIcon:
         def on_view_logs(icon, item):
             self._open_logs()
 
+        def on_toggle_remote_exec(icon, item):
+            self.app.request_toggle_remote_exec()
+
+        def is_remote_exec_enabled(item):
+            return self.app._remote_exec_enabled
+
+        def on_open_install_folder(icon, item):
+            self._open_install_folder()
+
         def on_restart(icon, item):
             self.app.request_restart()
 
@@ -273,6 +300,15 @@ class TrayIcon:
                 on_view_logs,
             ),
             pystray.MenuItem(
+                "Remote Exec",
+                on_toggle_remote_exec,
+                checked=is_remote_exec_enabled,
+            ),
+            pystray.MenuItem(
+                "Open Install Folder",
+                on_open_install_folder,
+            ),
+            pystray.MenuItem(
                 "Restart",
                 on_restart,
             ),
@@ -305,6 +341,18 @@ class TrayIcon:
                 subprocess.run(["xdg-open", log_path])
         else:
             self.show_notification("No Logs", "Log file not found")
+
+    def _open_install_folder(self) -> None:
+        """Open the netbridge installation directory."""
+        from .config import get_app_dir
+        app_dir = get_app_dir()
+        app_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(app_dir)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(app_dir)])
+        else:
+            subprocess.run(["xdg-open", str(app_dir)])
 
     def run(self, setup_callback: Optional[Callable] = None) -> None:
         """Start the tray icon (blocks until stopped).
