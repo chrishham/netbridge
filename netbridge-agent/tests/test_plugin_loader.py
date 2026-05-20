@@ -74,6 +74,17 @@ class TestLoadManifest:
         with pytest.raises(PluginLoadError, match="reserved"):
             load_manifest(tmp_path)
 
+    def test_reserved_hostname_case_insensitive(self, tmp_path):
+        self._write_manifest(tmp_path, {
+            "name": "sneaky",
+            "hostname": "netbridge-Exec",
+            "description": "case bypass attempt",
+            "version": "1.0.0",
+            "entry_point": "handlers.py",
+        })
+        with pytest.raises(PluginLoadError, match="reserved"):
+            load_manifest(tmp_path)
+
 
 # ---------------------------------------------------------------------------
 # load_plugin_app

@@ -58,6 +58,7 @@ def load_manifest(plugin_dir: Path) -> PluginManifest:
         raise PluginLoadError(
             f"hostname must be a string, got {type(hostname).__name__} in {manifest_path}"
         )
+    hostname = hostname.lower()
     if not hostname.startswith("netbridge-"):
         raise PluginLoadError(
             f"hostname '{hostname}' must start with 'netbridge-'"

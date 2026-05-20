@@ -472,8 +472,9 @@ class NetBridgeApp:
         current = {m.hostname for m in self._plugin_manifests}
         desired = {m.hostname: m for m in new_manifests}
 
-        added, removed = [], []
+        added, removed, updated = [], [], []
 
+        # Remove plugins no longer on disk
         for m in self._plugin_manifests:
             if m.hostname not in desired:
                 await self._intercept_server.unregister_app(m.hostname)
@@ -483,6 +484,7 @@ class NetBridgeApp:
         loaded = []
         for hostname, m in desired.items():
             if hostname not in current:
+                # New plugin
                 try:
                     app = load_plugin_app(m)
                     await self._intercept_server.register_app(hostname, app)
@@ -491,10 +493,19 @@ class NetBridgeApp:
                     logger.info("Plugin loaded: %s", hostname)
                 except Exception as e:
                     logger.warning("Failed to load plugin %s: %s", m.name, e)
+            else:
+                # Existing plugin — re-register to pick up code changes
+                try:
+                    app = load_plugin_app(m)
+                    await self._intercept_server.register_app(hostname, app)
+                    updated.append(hostname)
+                    loaded.append(m)
+                    logger.info("Plugin reloaded: %s", hostname)
+                except Exception as e:
+                    logger.warning("Failed to reload plugin %s: %s", m.name, e)
 
         self._plugin_manifests = [
-            m for m in new_manifests
-            if m.hostname in current or m in loaded
+            m for m in new_manifests if m in loaded
         ]
         return added, removed
 
