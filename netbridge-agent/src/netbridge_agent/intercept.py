@@ -19,82 +19,76 @@ from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
-MAGIC_HOSTS: set[str] = {"netbridge-exec"}
+_BASE_MAGIC_HOSTS: frozenset[str] = frozenset({"netbridge-exec"})
+_dynamic_hosts: set[str] = set()
+
+MAGIC_HOSTS = _BASE_MAGIC_HOSTS | _dynamic_hosts
 
 
 def is_magic_hostname(host: str) -> bool:
     """Check if *host* is a magic hostname (case-insensitive)."""
-    return host.lower() in MAGIC_HOSTS
+    return host.lower() in _BASE_MAGIC_HOSTS or host.lower() in _dynamic_hosts
 
 
 class InterceptServer:
     """In-process HTTP server with hostname-based routing.
 
-    Each registered hostname maps to its own aiohttp Application.
-    Requests are dispatched by the Host header.  Apps can be added
-    or removed at any time — even after the server is started.
+    Each registered hostname gets its own ``AppRunner`` and ephemeral
+    loopback port.  The agent maps hostnames to ports via
+    :meth:`port_for`.  Apps can be added or removed at any time.
     """
 
     def __init__(self) -> None:
-        self._apps: dict[str, web.Application] = {}
-        self._runner: Optional[web.AppRunner] = None
-        self._site: Optional[web.TCPSite] = None
+        self._runners: dict[str, tuple[web.AppRunner, web.TCPSite, int]] = {}
+        self._started = False
         self.port: Optional[int] = None
 
     @property
     def registered_hostnames(self) -> set[str]:
-        return set(self._apps)
+        return set(self._runners)
 
-    def register_app(self, hostname: str, app: web.Application) -> None:
-        hostname = hostname.lower()
-        self._apps[hostname] = app
-        MAGIC_HOSTS.add(hostname)
-        logger.info("Registered app: %s", hostname)
+    def port_for(self, hostname: str) -> Optional[int]:
+        entry = self._runners.get(hostname.lower())
+        return entry[2] if entry else None
 
-    def unregister_app(self, hostname: str) -> None:
+    async def register_app(self, hostname: str, app: web.Application) -> None:
         hostname = hostname.lower()
-        self._apps.pop(hostname, None)
-        MAGIC_HOSTS.discard(hostname)
+        if hostname in self._runners:
+            await self.unregister_app(hostname)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        sockets = site._server.sockets  # type: ignore[union-attr]
+        port = sockets[0].getsockname()[1]
+        self._runners[hostname] = (runner, site, port)
+        _dynamic_hosts.add(hostname)
+        if self.port is None:
+            self.port = port
+        logger.info("Registered app: %s on 127.0.0.1:%d", hostname, port)
+
+    async def unregister_app(self, hostname: str) -> None:
+        hostname = hostname.lower()
+        entry = self._runners.pop(hostname, None)
+        if entry:
+            runner, _, _ = entry
+            await runner.cleanup()
+        _dynamic_hosts.discard(hostname)
+        if not self._runners:
+            self.port = None
+        else:
+            self.port = next(iter(self._runners.values()))[2]
         logger.info("Unregistered app: %s", hostname)
 
     async def start(self) -> None:
-        server = self
-
-        async def dispatch(request: web.Request) -> web.Response:
-            host = request.host.split(":")[0].lower()
-            sub_app = server._apps.get(host)
-            if sub_app is None:
-                return web.json_response(
-                    {"error": f"unknown service: {host}"}, status=404
-                )
-            try:
-                match = await sub_app.router.resolve(request)
-                if isinstance(match, web.UrlMappingMatchInfo):
-                    return await match.handler(request)
-                return web.json_response({"error": "not found"}, status=404)
-            except web.HTTPNotFound:
-                return web.json_response({"error": "not found"}, status=404)
-            except Exception:
-                logger.exception("Handler error for %s", host)
-                return web.json_response(
-                    {"error": f"plugin error: {host}"}, status=500
-                )
-
-        dispatcher = web.Application()
-        dispatcher.router.add_route("*", "/{path_info:.*}", dispatch)
-
-        self._runner = web.AppRunner(dispatcher)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, "127.0.0.1", 0)
-        await self._site.start()
-        sockets = self._site._server.sockets  # type: ignore[union-attr]
-        self.port = sockets[0].getsockname()[1]
-        logger.info("InterceptServer listening on 127.0.0.1:%d", self.port)
+        self._started = True
+        if self._runners:
+            self.port = next(iter(self._runners.values()))[2]
+        logger.info("InterceptServer started (%d apps)", len(self._runners))
 
     async def stop(self) -> None:
-        if self._runner:
-            await self._runner.cleanup()
-            self._runner = None
-            self._site = None
-            self.port = None
-            logger.info("InterceptServer stopped")
+        for hostname in list(self._runners):
+            await self.unregister_app(hostname)
+        self._started = False
+        self.port = None
+        logger.info("InterceptServer stopped")

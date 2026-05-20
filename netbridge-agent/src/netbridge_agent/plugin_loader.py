@@ -54,6 +54,10 @@ def load_manifest(plugin_dir: Path) -> PluginManifest:
             )
 
     hostname = data["hostname"]
+    if not isinstance(hostname, str):
+        raise PluginLoadError(
+            f"hostname must be a string, got {type(hostname).__name__} in {manifest_path}"
+        )
     if not hostname.startswith("netbridge-"):
         raise PluginLoadError(
             f"hostname '{hostname}' must start with 'netbridge-'"
@@ -72,7 +76,11 @@ def load_manifest(plugin_dir: Path) -> PluginManifest:
 
 
 def load_plugin_app(manifest: PluginManifest) -> web.Application:
-    entry = manifest.path / manifest.entry_point
+    entry = (manifest.path / manifest.entry_point).resolve()
+    if not entry.is_relative_to(manifest.path.resolve()):
+        raise PluginLoadError(
+            f"entry_point escapes plugin directory: {manifest.entry_point}"
+        )
     if not entry.exists():
         raise PluginLoadError(f"entry point {entry} not found")
 
@@ -101,7 +109,7 @@ def discover_plugins(plugins_dir: Path) -> list[PluginManifest]:
         try:
             manifest = load_manifest(child)
             manifests.append(manifest)
-        except PluginLoadError as e:
+        except Exception as e:
             LOG.warning("Skipping plugin %s: %s", child.name, e)
 
     return manifests

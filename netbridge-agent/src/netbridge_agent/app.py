@@ -431,7 +431,7 @@ class NetBridgeApp:
         if self._intercept_server:
             exec_app = create_exec_app()
             exec_app["_plugin_reload_callback"] = self._reload_plugins
-            self._intercept_server.register_app("netbridge-exec", exec_app)
+            await self._intercept_server.register_app("netbridge-exec", exec_app)
 
         if self._remote_exec_timer:
             self._remote_exec_timer.cancel()
@@ -447,7 +447,7 @@ class NetBridgeApp:
             self._remote_exec_timer.cancel()
             self._remote_exec_timer = None
         if self._intercept_server:
-            self._intercept_server.unregister_app("netbridge-exec")
+            await self._intercept_server.unregister_app("netbridge-exec")
 
     async def _remote_exec_auto_disable(self) -> None:
         """Auto-disable remote exec after timeout."""
@@ -476,21 +476,26 @@ class NetBridgeApp:
 
         for m in self._plugin_manifests:
             if m.hostname not in desired:
-                self._intercept_server.unregister_app(m.hostname)
+                await self._intercept_server.unregister_app(m.hostname)
                 removed.append(m.hostname)
                 logger.info("Plugin unloaded: %s", m.hostname)
 
+        loaded = []
         for hostname, m in desired.items():
             if hostname not in current:
                 try:
                     app = load_plugin_app(m)
-                    self._intercept_server.register_app(hostname, app)
+                    await self._intercept_server.register_app(hostname, app)
                     added.append(hostname)
+                    loaded.append(m)
                     logger.info("Plugin loaded: %s", hostname)
                 except Exception as e:
                     logger.warning("Failed to load plugin %s: %s", m.name, e)
 
-        self._plugin_manifests = new_manifests
+        self._plugin_manifests = [
+            m for m in new_manifests
+            if m.hostname in current or m in loaded
+        ]
         return added, removed
 
     def request_exit(self) -> None:
@@ -574,6 +579,23 @@ class NetBridgeApp:
         """Main async loop running in background thread."""
         self._stop_event = asyncio.Event()
 
+        # Start intercept server and load plugins BEFORE agent connects,
+        # so plugin hostnames are registered when relay traffic arrives.
+        from .intercept import InterceptServer
+        self._intercept_server = InterceptServer()
+        await self._intercept_server.start()
+
+        from .plugin_loader import discover_plugins, load_plugin_app
+        plugins_dir = get_app_dir() / "plugins"
+        for manifest in discover_plugins(plugins_dir):
+            try:
+                plugin_app = load_plugin_app(manifest)
+                await self._intercept_server.register_app(manifest.hostname, plugin_app)
+                self._plugin_manifests.append(manifest)
+                logger.info("Plugin loaded: %s (%s)", manifest.name, manifest.hostname)
+            except Exception as e:
+                logger.warning("Failed to load plugin %s: %s", manifest.name, e)
+
         # Auto-connect if configured
         if self.config.auto_connect:
             self._agent_task = asyncio.create_task(self._run_agent())
@@ -581,23 +603,6 @@ class NetBridgeApp:
         # Start session keep-alive if configured
         if self.config.keep_session_alive:
             self._start_keepalive()
-
-        # Start intercept server (always-on for plugins)
-        from .intercept import InterceptServer
-        self._intercept_server = InterceptServer()
-        await self._intercept_server.start()
-
-        # Discover and register plugins
-        from .plugin_loader import discover_plugins, load_plugin_app
-        plugins_dir = get_app_dir() / "plugins"
-        for manifest in discover_plugins(plugins_dir):
-            try:
-                plugin_app = load_plugin_app(manifest)
-                self._intercept_server.register_app(manifest.hostname, plugin_app)
-                self._plugin_manifests.append(manifest)
-                logger.info("Plugin loaded: %s (%s)", manifest.name, manifest.hostname)
-            except Exception as e:
-                logger.warning("Failed to load plugin %s: %s", manifest.name, e)
 
         # Wait for exit request
         await self._stop_event.wait()

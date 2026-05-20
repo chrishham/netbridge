@@ -11,7 +11,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from netbridge_agent.intercept import InterceptServer, is_magic_hostname, MAGIC_HOSTS
+from netbridge_agent.intercept import InterceptServer, is_magic_hostname
 
 
 # ---------------------------------------------------------------------------
@@ -54,55 +54,44 @@ def _make_app(routes: dict[str, str]) -> web.Application:
 
 class TestInterceptServerRouting:
     @pytest.mark.asyncio
-    async def test_register_and_route_by_host_header(self):
+    async def test_register_and_route_to_correct_app(self):
         server = InterceptServer()
-        server.register_app("netbridge-alpha", _make_app({"/hello": "alpha"}))
-        server.register_app("netbridge-beta", _make_app({"/hello": "beta"}))
+        await server.register_app("netbridge-alpha", _make_app({"/hello": "alpha"}))
+        await server.register_app("netbridge-beta", _make_app({"/hello": "beta"}))
         await server.start()
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/hello",
-                    headers={"Host": "netbridge-alpha"},
-                ) as r:
+                alpha_port = server.port_for("netbridge-alpha")
+                async with s.get(f"http://127.0.0.1:{alpha_port}/hello") as r:
                     assert r.status == 200
                     assert (await r.json())["msg"] == "alpha"
 
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/hello",
-                    headers={"Host": "netbridge-beta"},
-                ) as r:
+                beta_port = server.port_for("netbridge-beta")
+                async with s.get(f"http://127.0.0.1:{beta_port}/hello") as r:
                     assert r.status == 200
                     assert (await r.json())["msg"] == "beta"
         finally:
             await server.stop()
 
     @pytest.mark.asyncio
-    async def test_unknown_hostname_returns_404(self):
+    async def test_unknown_hostname_returns_none_port(self):
         server = InterceptServer()
-        server.register_app("netbridge-known", _make_app({"/x": "ok"}))
+        await server.register_app("netbridge-known", _make_app({"/x": "ok"}))
         await server.start()
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/x",
-                    headers={"Host": "netbridge-unknown"},
-                ) as r:
-                    assert r.status == 404
+            assert server.port_for("netbridge-unknown") is None
         finally:
             await server.stop()
 
     @pytest.mark.asyncio
     async def test_unmatched_route_in_registered_app_returns_404(self):
         server = InterceptServer()
-        server.register_app("netbridge-app", _make_app({"/exists": "yes"}))
+        await server.register_app("netbridge-app", _make_app({"/exists": "yes"}))
         await server.start()
         try:
+            port = server.port_for("netbridge-app")
             async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/nope",
-                    headers={"Host": "netbridge-app"},
-                ) as r:
+                async with s.get(f"http://127.0.0.1:{port}/nope") as r:
                     assert r.status == 404
         finally:
             await server.stop()
@@ -110,9 +99,10 @@ class TestInterceptServerRouting:
     @pytest.mark.asyncio
     async def test_registered_hostnames_property(self):
         server = InterceptServer()
-        server.register_app("netbridge-a", _make_app({}))
-        server.register_app("netbridge-b", _make_app({}))
+        await server.register_app("netbridge-a", _make_app({}))
+        await server.register_app("netbridge-b", _make_app({}))
         assert server.registered_hostnames == {"netbridge-a", "netbridge-b"}
+        await server.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -133,28 +123,24 @@ class TestInterceptServerIsolation:
         ok_app = _make_app({"/check": "alive"})
 
         server = InterceptServer()
-        server.register_app("netbridge-crash", crash_app)
-        server.register_app("netbridge-ok", ok_app)
+        await server.register_app("netbridge-crash", crash_app)
+        await server.register_app("netbridge-ok", ok_app)
         await server.start()
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/boom",
-                    headers={"Host": "netbridge-crash"},
-                ) as r:
+                crash_port = server.port_for("netbridge-crash")
+                async with s.get(f"http://127.0.0.1:{crash_port}/boom") as r:
                     assert r.status == 500
 
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/check",
-                    headers={"Host": "netbridge-ok"},
-                ) as r:
+                ok_port = server.port_for("netbridge-ok")
+                async with s.get(f"http://127.0.0.1:{ok_port}/check") as r:
                     assert r.status == 200
                     assert (await r.json())["msg"] == "alive"
         finally:
             await server.stop()
 
     @pytest.mark.asyncio
-    async def test_streaming_response_through_dispatcher(self):
+    async def test_streaming_response_works(self):
         stream_app = web.Application()
 
         async def stream_handler(request):
@@ -170,14 +156,12 @@ class TestInterceptServerIsolation:
         stream_app.router.add_get("/stream", stream_handler)
 
         server = InterceptServer()
-        server.register_app("netbridge-stream", stream_app)
+        await server.register_app("netbridge-stream", stream_app)
         await server.start()
         try:
+            port = server.port_for("netbridge-stream")
             async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/stream",
-                    headers={"Host": "netbridge-stream"},
-                ) as r:
+                async with s.get(f"http://127.0.0.1:{port}/stream") as r:
                     assert r.status == 200
                     body = await r.text()
                     assert body.count("\n") == 3
@@ -196,14 +180,12 @@ class TestInterceptServerHotPlug:
         server = InterceptServer()
         await server.start()
         try:
-            server.register_app("netbridge-late", _make_app({"/ping": "pong"}))
-            assert "netbridge-late" in MAGIC_HOSTS
+            await server.register_app("netbridge-late", _make_app({"/ping": "pong"}))
+            assert is_magic_hostname("netbridge-late")
 
+            port = server.port_for("netbridge-late")
             async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/ping",
-                    headers={"Host": "netbridge-late"},
-                ) as r:
+                async with s.get(f"http://127.0.0.1:{port}/ping") as r:
                     assert r.status == 200
                     assert (await r.json())["msg"] == "pong"
         finally:
@@ -212,32 +194,24 @@ class TestInterceptServerHotPlug:
     @pytest.mark.asyncio
     async def test_hot_remove_after_start(self):
         server = InterceptServer()
-        server.register_app("netbridge-temp", _make_app({"/hi": "there"}))
+        await server.register_app("netbridge-temp", _make_app({"/hi": "there"}))
         await server.start()
         try:
+            port = server.port_for("netbridge-temp")
             async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/hi",
-                    headers={"Host": "netbridge-temp"},
-                ) as r:
+                async with s.get(f"http://127.0.0.1:{port}/hi") as r:
                     assert r.status == 200
 
-            server.unregister_app("netbridge-temp")
-            assert "netbridge-temp" not in MAGIC_HOSTS
-
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/hi",
-                    headers={"Host": "netbridge-temp"},
-                ) as r:
-                    assert r.status == 404
+            await server.unregister_app("netbridge-temp")
+            assert not is_magic_hostname("netbridge-temp")
+            assert server.port_for("netbridge-temp") is None
         finally:
             await server.stop()
 
     @pytest.mark.asyncio
     async def test_unregister_nonexistent_is_noop(self):
         server = InterceptServer()
-        server.unregister_app("netbridge-nope")  # should not raise
+        await server.unregister_app("netbridge-nope")  # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -247,28 +221,23 @@ class TestInterceptServerHotPlug:
 
 class TestInterceptServerLifecycle:
     @pytest.mark.asyncio
-    async def test_start_and_stop(self):
+    async def test_start_register_and_stop(self):
         server = InterceptServer()
         assert server.port is None
         await server.start()
+        await server.register_app("netbridge-test", _make_app({"/x": "y"}))
         assert server.port is not None
         assert server.port > 0
         await server.stop()
         assert server.port is None
 
     @pytest.mark.asyncio
-    async def test_start_with_no_apps_serves_404(self):
+    async def test_start_with_no_apps_has_no_port(self):
         server = InterceptServer()
         await server.start()
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"http://127.0.0.1:{server.port}/anything",
-                    headers={"Host": "netbridge-whatever"},
-                ) as r:
-                    assert r.status == 404
-        finally:
-            await server.stop()
+        assert server.port is None
+        assert server.port_for("netbridge-whatever") is None
+        await server.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +253,7 @@ class TestAgentInterceptRouting:
         from unittest.mock import MagicMock, AsyncMock
 
         server = InterceptServer()
-        server.register_app("netbridge-exec", create_app())
+        await server.register_app("netbridge-exec", create_app())
         await server.start()
         try:
             state = AgentState()

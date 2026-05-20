@@ -445,7 +445,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             })
             return
         server = state.get_intercept_server()
-        if not server or not server.port:
+        if not server:
             await send_to_relay(ws, {
                 "type": "tcp_connect_result",
                 "stream_id": stream_id,
@@ -453,7 +453,8 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "error": "Intercept server is not running",
             })
             return
-        if host.lower() not in server.registered_hostnames:
+        intercept_port = server.port_for(host)
+        if intercept_port is None:
             if host.lower() == "netbridge-exec":
                 err = "Remote exec is disabled — enable it from the VDI system tray"
             else:
@@ -465,7 +466,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "error": err,
             })
             return
-        port = server.port
+        port = intercept_port
         host = "127.0.0.1"
         logger.info(
             "Intercept: %s -> %s:%s via 127.0.0.1:%d",
