@@ -399,11 +399,13 @@ class NetBridgeApp:
 
     def request_toggle_remote_exec(self) -> None:
         """Toggle remote exec mode (from tray menu)."""
+        if not self._async_loop:
+            logger.warning("Remote exec toggled before async loop ready")
+            return
         self._remote_exec_enabled = not self._remote_exec_enabled
         logger.info(f"Remote exec: {'ENABLED' if self._remote_exec_enabled else 'disabled'}")
 
-        if self._async_loop:
-            self._async_loop.call_soon_threadsafe(self._apply_remote_exec)
+        self._async_loop.call_soon_threadsafe(self._apply_remote_exec)
 
         if self.tray:
             self.tray.set_remote_exec(self._remote_exec_enabled)
