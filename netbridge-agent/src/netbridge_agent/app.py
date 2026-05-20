@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config import Config, ensure_app_dirs, get_log_path, APP_NAME, APP_VERSION
+from .config import Config, ensure_app_dirs, get_log_path, get_log_dir, get_app_dir, APP_NAME, APP_VERSION
 from .tray import TrayIcon, Status, TRAY_AVAILABLE
 
 REMOTE_EXEC_TIMEOUT = 3600  # 1 hour auto-disable
@@ -123,6 +123,7 @@ class NetBridgeApp:
         self._remote_exec_enabled: bool = False
         self._remote_exec_timer: Optional[asyncio.TimerHandle] = None
         self._intercept_server = None
+        self._plugin_manifests: list = []
 
         logger.info(f"{APP_NAME} v{APP_VERSION} starting")
 
@@ -424,11 +425,13 @@ class NetBridgeApp:
             asyncio.create_task(self._stop_remote_exec())
 
     async def _start_remote_exec(self) -> None:
-        """Start the intercept server and schedule auto-disable."""
-        from .intercept import InterceptServer
-        if self._intercept_server is None:
-            self._intercept_server = InterceptServer()
-        await self._intercept_server.start()
+        """Register the remote exec app in the intercept server."""
+        from .remote_exec import create_app as create_exec_app
+
+        if self._intercept_server:
+            exec_app = create_exec_app()
+            exec_app["_plugin_reload_callback"] = self._reload_plugins
+            self._intercept_server.register_app("netbridge-exec", exec_app)
 
         if self._remote_exec_timer:
             self._remote_exec_timer.cancel()
@@ -439,12 +442,12 @@ class NetBridgeApp:
         )
 
     async def _stop_remote_exec(self) -> None:
-        """Stop the intercept server and cancel timer."""
+        """Unregister the remote exec app (server keeps running for plugins)."""
         if self._remote_exec_timer:
             self._remote_exec_timer.cancel()
             self._remote_exec_timer = None
         if self._intercept_server:
-            await self._intercept_server.stop()
+            self._intercept_server.unregister_app("netbridge-exec")
 
     async def _remote_exec_auto_disable(self) -> None:
         """Auto-disable remote exec after timeout."""
@@ -462,6 +465,37 @@ class NetBridgeApp:
     def _get_remote_exec_state(self):
         """Return (enabled, server) for remote exec — called from agent."""
         return self._remote_exec_enabled, self._intercept_server
+
+    async def _reload_plugins(self) -> tuple[list[str], list[str]]:
+        """Re-discover plugins and hot-add/remove from intercept server."""
+        from .plugin_loader import discover_plugins, load_plugin_app
+
+        plugins_dir = get_app_dir() / "plugins"
+        new_manifests = discover_plugins(plugins_dir)
+
+        current = {m.hostname for m in self._plugin_manifests}
+        desired = {m.hostname: m for m in new_manifests}
+
+        added, removed = [], []
+
+        for m in self._plugin_manifests:
+            if m.hostname not in desired:
+                self._intercept_server.unregister_app(m.hostname)
+                removed.append(m.hostname)
+                logger.info("Plugin unloaded: %s", m.hostname)
+
+        for hostname, m in desired.items():
+            if hostname not in current:
+                try:
+                    app = load_plugin_app(m)
+                    self._intercept_server.register_app(hostname, app)
+                    added.append(hostname)
+                    logger.info("Plugin loaded: %s", hostname)
+                except Exception as e:
+                    logger.warning("Failed to load plugin %s: %s", m.name, e)
+
+        self._plugin_manifests = new_manifests
+        return added, removed
 
     def request_exit(self) -> None:
         """Request application exit (from tray menu)."""
@@ -552,8 +586,29 @@ class NetBridgeApp:
         if self.config.keep_session_alive:
             self._start_keepalive()
 
+        # Start intercept server (always-on for plugins)
+        from .intercept import InterceptServer
+        self._intercept_server = InterceptServer()
+        await self._intercept_server.start()
+
+        # Discover and register plugins
+        from .plugin_loader import discover_plugins, load_plugin_app
+        plugins_dir = get_app_dir() / "plugins"
+        for manifest in discover_plugins(plugins_dir):
+            try:
+                plugin_app = load_plugin_app(manifest)
+                self._intercept_server.register_app(manifest.hostname, plugin_app)
+                self._plugin_manifests.append(manifest)
+                logger.info("Plugin loaded: %s (%s)", manifest.name, manifest.hostname)
+            except Exception as e:
+                logger.warning("Failed to load plugin %s: %s", manifest.name, e)
+
         # Wait for exit request
         await self._stop_event.wait()
+
+        # Stop intercept server
+        if self._intercept_server:
+            await self._intercept_server.stop()
 
         # Stop remote exec if active
         if self._remote_exec_enabled:
