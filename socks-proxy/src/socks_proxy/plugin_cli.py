@@ -6,7 +6,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+from urllib.parse import quote
 
 
 def _validate_plugin_name(name):
@@ -51,22 +52,14 @@ def _curl(method, path, proxy_port=1080, json_body=None, data=None, timeout=30):
 
 def _get_remote_plugins_dir(proxy_port):
     """Get the actual plugins directory path from the VDI agent."""
-    health = _curl("GET", "/health", proxy_port)
-    cwd = health.get("cwd", "")
-    if "\\" in cwd:
-        # Windows VDI — derive from LOCALAPPDATA pattern
-        # health.cwd is typically C:\Users\<user>\...
-        # LOCALAPPDATA is C:\Users\<user>\AppData\Local
-        parts = cwd.split("\\")
-        if len(parts) >= 3:
-            drive_and_users = "\\".join(parts[:3])
-            return f"{drive_and_users}\\AppData\\Local\\NetBridge\\plugins"
-    # Fallback — ask agent to resolve it
     exec_resp = _curl(
         "POST", "/exec", proxy_port,
-        json_body={"cmd": 'python -c "import os; print(os.path.join(os.environ.get(\'LOCALAPPDATA\', os.path.expanduser(\'~\')), \'NetBridge\', \'plugins\'))"'},
+        json_body={"cmd": 'python -c "from netbridge_agent.config import get_app_dir; print(get_app_dir() / \\"plugins\\")"'},
     )
-    return exec_resp.get("stdout", "").strip()
+    path = exec_resp.get("stdout", "").strip()
+    if not path:
+        raise RuntimeError("Could not determine remote plugins directory")
+    return path
 
 
 def _clone_repo(repo_url):
@@ -166,7 +159,7 @@ def cmd_install(proxy_port, repo_url, plugin_name):
                 with open(file_path, "rb") as f:
                     file_data = f.read()
 
-                _curl("PUT", f"/files/{remote_path}", proxy_port, data=file_data)
+                _curl("PUT", f"/files/{quote(remote_path, safe='')}", proxy_port, data=file_data)
                 print(f"  Uploaded: {rel_path}")
 
         if (plugin_dir / "install.py").exists():
@@ -191,11 +184,13 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         print("  Reloading plugins...")
         reload_response = _curl("POST", "/plugins/reload", proxy_port)
 
-        print(f"\nPlugin '{manifest['name']}' installed successfully!")
-        print(f"Access via: curl --proxy socks5h://localhost:{proxy_port} http://{hostname}/")
-
-        if reload_response.get("added"):
-            print(f"Loaded: {', '.join(reload_response['added'])}")
+        added = reload_response.get("added", [])
+        if hostname in added:
+            print(f"\nPlugin '{manifest['name']}' installed and loaded!")
+            print(f"Access via: curl --proxy socks5h://localhost:{proxy_port} http://{hostname}/")
+        else:
+            print(f"\nPlugin '{manifest['name']}' files uploaded but failed to load.")
+            print("Check agent logs on VDI for details.")
 
     finally:
         shutil.rmtree(repo_dir, ignore_errors=True)
@@ -209,9 +204,9 @@ def cmd_uninstall(proxy_port, plugin_name):
     remote_path = f"{remote_base}\\{plugin_name}"
 
     try:
-        list_response = _curl("GET", f"/files?dir={remote_path}", proxy_port)
-    except (ConnectionError, RuntimeError):
-        print(f"Plugin '{plugin_name}' not found or already uninstalled.")
+        list_response = _curl("GET", f"/files?dir={quote(remote_path, safe='')}", proxy_port)
+    except RuntimeError:
+        print(f"Plugin '{plugin_name}' not found on VDI.")
         return
 
     entries = list_response.get("entries", [])
@@ -235,7 +230,7 @@ def cmd_uninstall(proxy_port, plugin_name):
             print(f"  Warning: uninstall.py failed: {e}")
 
     print("Removing plugin directory...")
-    _curl("DELETE", f"/files/{remote_path}", proxy_port)
+    _curl("DELETE", f"/files/{quote(remote_path, safe='')}", proxy_port)
 
     print("Reloading plugins...")
     reload_response = _curl("POST", "/plugins/reload", proxy_port)

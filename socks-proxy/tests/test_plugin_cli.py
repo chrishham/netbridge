@@ -135,15 +135,15 @@ class TestPluginInstall:
         }))
         (plugin_dir / "handlers.py").write_text("pass")
 
-        health_resp = {"status": "ok", "hostname": "VDI01", "cwd": "C:\\Users\\user\\NetBridge"}
+        exec_resp = {"exit_code": 0, "stdout": "C:\\Users\\user\\AppData\\Local\\NetBridge\\plugins"}
         ok_resp = {"status": "ok"}
         reload_resp = {"status": "ok", "added": ["netbridge-test"], "removed": []}
 
         with patch("socks_proxy.plugin_cli._clone_repo") as mock_clone, \
              patch("socks_proxy.plugin_cli._curl") as mock_curl:
             mock_clone.return_value = tmp_path / "repo"
-            # _get_remote_plugins_dir calls GET /health, then PUT calls, then POST /plugins/reload
-            mock_curl.side_effect = [health_resp, ok_resp, ok_resp, reload_resp]
+            # _get_remote_plugins_dir calls POST /exec, then PUT calls, then POST /plugins/reload
+            mock_curl.side_effect = [exec_resp, ok_resp, ok_resp, reload_resp]
             cmd_install(1080, "https://example.com/repo.git", "test-plugin")
 
         put_calls = [c for c in mock_curl.call_args_list if c[0][0] == "PUT"]
@@ -173,13 +173,13 @@ class TestPluginInstall:
 
 class TestPluginUninstall:
     def test_uninstall_deletes_and_reloads(self, capsys):
-        health_resp = {"status": "ok", "hostname": "VDI01", "cwd": "C:\\Users\\user\\NetBridge"}
+        exec_resp = {"exit_code": 0, "stdout": "C:\\Users\\user\\AppData\\Local\\NetBridge\\plugins"}
         list_resp = {"dir": "...", "entries": [{"name": "manifest.json"}, {"name": "handlers.py"}]}
         delete_resp = {"status": "ok", "deleted": "..."}
         reload_resp = {"status": "ok", "added": [], "removed": ["netbridge-test"]}
 
         with patch("socks_proxy.plugin_cli._curl") as mock_curl:
-            mock_curl.side_effect = [health_resp, list_resp, delete_resp, reload_resp]
+            mock_curl.side_effect = [exec_resp, list_resp, delete_resp, reload_resp]
             cmd_uninstall(1080, "test-plugin")
         out = capsys.readouterr().out
         assert "uninstalled" in out.lower()
