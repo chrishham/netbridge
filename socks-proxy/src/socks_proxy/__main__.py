@@ -417,6 +417,11 @@ Environment variables for HTTP proxy clients:
         """,
     )
     _add_serve_args(serve_parser)
+    serve_parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
 
     from .plugin_cli import add_plugin_subparser
     add_plugin_subparser(subparsers)

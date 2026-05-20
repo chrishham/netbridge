@@ -52,12 +52,14 @@ def _curl(method, path, proxy_port=1080, json_body=None, data=None, timeout=30):
 
 def _get_remote_plugins_dir(proxy_port):
     """Get the actual plugins directory path from the VDI agent."""
+    # Use cmd.exe to expand %LOCALAPPDATA% — works on all Windows VDIs
+    # without requiring Python on PATH
     exec_resp = _curl(
         "POST", "/exec", proxy_port,
-        json_body={"cmd": 'python -c "from netbridge_agent.config import get_app_dir; print(get_app_dir() / \\"plugins\\")"'},
+        json_body={"cmd": 'cmd /c echo %LOCALAPPDATA%\\NetBridge\\plugins'},
     )
     path = exec_resp.get("stdout", "").strip()
-    if not path:
+    if not path or "%" in path:
         raise RuntimeError("Could not determine remote plugins directory")
     return path
 
