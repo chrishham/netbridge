@@ -396,6 +396,6 @@ class TestAgentInterceptRouting:
             sent = json.loads(ws.send_str.call_args_list[0][0][0])
             assert sent["type"] == "tcp_connect_result"
             assert sent["success"] is False
-            assert "not available" in sent["error"].lower()
+            assert "remote exec is disabled" in sent["error"].lower()
         finally:
             await server.stop()
