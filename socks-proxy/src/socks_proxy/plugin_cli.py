@@ -125,7 +125,9 @@ def cmd_install(proxy_port, repo_url, plugin_name):
 
     try:
         plugin_dir = repo_dir / plugin_name
-        if not plugin_dir.exists():
+        if plugin_dir.is_symlink():
+            raise ValueError(f"Plugin directory '{plugin_name}' is a symlink — rejected")
+        if not plugin_dir.is_dir():
             available = [d.name for d in repo_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
             raise FileNotFoundError(
                 f"Plugin directory '{plugin_name}' not found in repository. "
