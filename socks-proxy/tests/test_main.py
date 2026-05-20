@@ -62,6 +62,22 @@ class TestSubcommands:
         )
         assert result.returncode == 0
 
+    def test_plugin_list_subcommand_help(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "socks_proxy", "plugin", "list", "--help"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+
+    def test_plugin_install_subcommand_help(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "socks_proxy", "plugin", "install", "--help"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "repo_url" in result.stdout.lower()
+        assert "plugin_name" in result.stdout.lower()
+
     def test_backward_compat_bare_invocation_with_relay_arg(self):
         """Verify that old-style invocations still work (backward compat)."""
         # This simulates: netbridge-socks --relay wss://... --port 1080
