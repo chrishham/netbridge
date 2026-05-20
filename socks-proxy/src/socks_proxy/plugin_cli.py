@@ -152,6 +152,8 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         remote_plugin_dir = f"{remote_base}\\{plugin_name}"
 
         for file_path in sorted(plugin_dir.rglob("*")):
+            if file_path.is_symlink():
+                continue
             if file_path.is_file() and not file_path.name.startswith("."):
                 rel_path = file_path.relative_to(plugin_dir)
                 remote_path = f"{remote_plugin_dir}\\{str(rel_path).replace('/', chr(92))}"
@@ -205,9 +207,12 @@ def cmd_uninstall(proxy_port, plugin_name):
 
     try:
         list_response = _curl("GET", f"/files?dir={quote(remote_path, safe='')}", proxy_port)
-    except RuntimeError:
-        print(f"Plugin '{plugin_name}' not found on VDI.")
-        return
+    except (ConnectionError, RuntimeError) as e:
+        err = str(e).lower()
+        if "404" in err or "not found" in err or "directory not found" in err:
+            print(f"Plugin '{plugin_name}' not found on VDI.")
+            return
+        raise
 
     entries = list_response.get("entries", [])
 
