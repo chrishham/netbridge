@@ -87,13 +87,19 @@ def load_plugin_app(manifest: PluginManifest) -> web.Application:
         raise PluginLoadError(f"entry point {entry} not found")
 
     plugin_dir = str(manifest.path.resolve())
+    prefix = f"netbridge_plugin_{manifest.name}"
+
+    # Clear cached modules from previous loads so reload picks up changes
+    stale = [k for k in sys.modules if k == prefix or k.startswith(prefix + ".")]
+    for k in stale:
+        del sys.modules[k]
+
     if plugin_dir not in sys.path:
         sys.path.insert(0, plugin_dir)
 
-    spec = importlib.util.spec_from_file_location(
-        f"netbridge_plugin_{manifest.name}", entry
-    )
+    spec = importlib.util.spec_from_file_location(prefix, entry)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[prefix] = module
     spec.loader.exec_module(module)
 
     if not hasattr(module, "create_app"):
