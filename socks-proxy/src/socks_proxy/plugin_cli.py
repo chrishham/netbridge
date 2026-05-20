@@ -1,20 +1,28 @@
 """Plugin management CLI for NetBridge VDI plugins."""
 
 import json
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-REMOTE_PLUGINS_DIR = "%LOCALAPPDATA%\\NetBridge\\plugins"
+
+def _validate_plugin_name(name):
+    """Reject plugin names that could escape the plugins directory."""
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', name):
+        raise ValueError(
+            f"Invalid plugin name '{name}': must be alphanumeric "
+            "(with dots, hyphens, underscores allowed, no path separators)"
+        )
 
 
 def _curl(method, path, proxy_port=1080, json_body=None, data=None, timeout=30):
     """HTTP request to netbridge-exec through the SOCKS proxy via curl."""
     url = f"http://netbridge-exec{path}"
     cmd = [
-        "curl", "-sS", "--max-time", str(timeout),
+        "curl", "-sS", "--fail-with-body", "--max-time", str(timeout),
         "--proxy", f"socks5h://127.0.0.1:{proxy_port}",
         "-X", method,
     ]
@@ -30,10 +38,35 @@ def _curl(method, path, proxy_port=1080, json_body=None, data=None, timeout=30):
     )
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace").strip()
-        raise ConnectionError(f"Failed to connect: {stderr}")
+        stdout = result.stdout.decode(errors="replace").strip()
+        detail = stderr or stdout
+        raise ConnectionError(f"Request failed: {detail}")
     if not result.stdout:
         return {}
-    return json.loads(result.stdout)
+    resp = json.loads(result.stdout)
+    if "error" in resp:
+        raise RuntimeError(f"Agent error: {resp['error']}")
+    return resp
+
+
+def _get_remote_plugins_dir(proxy_port):
+    """Get the actual plugins directory path from the VDI agent."""
+    health = _curl("GET", "/health", proxy_port)
+    cwd = health.get("cwd", "")
+    if "\\" in cwd:
+        # Windows VDI — derive from LOCALAPPDATA pattern
+        # health.cwd is typically C:\Users\<user>\...
+        # LOCALAPPDATA is C:\Users\<user>\AppData\Local
+        parts = cwd.split("\\")
+        if len(parts) >= 3:
+            drive_and_users = "\\".join(parts[:3])
+            return f"{drive_and_users}\\AppData\\Local\\NetBridge\\plugins"
+    # Fallback — ask agent to resolve it
+    exec_resp = _curl(
+        "POST", "/exec", proxy_port,
+        json_body={"cmd": 'python -c "import os; print(os.path.join(os.environ.get(\'LOCALAPPDATA\', os.path.expanduser(\'~\')), \'NetBridge\', \'plugins\'))"'},
+    )
+    return exec_resp.get("stdout", "").strip()
 
 
 def _clone_repo(repo_url):
@@ -86,40 +119,49 @@ def cmd_info(proxy_port, plugin_name):
     print(f"Version:     {plugin.get('version', '?')}")
     print(f"Hostname:    {plugin.get('hostname', '?')}")
     print(f"Description: {plugin.get('description', '')}")
-    print(f"Entry Point: {plugin.get('entry_point', '?')}")
 
 
 def cmd_install(proxy_port, repo_url, plugin_name):
     """Install a plugin from a git repository."""
+    _validate_plugin_name(plugin_name)
+
     print(f"Cloning {repo_url}...")
     repo_dir = _clone_repo(repo_url)
 
     try:
         plugin_dir = repo_dir / plugin_name
         if not plugin_dir.exists():
-            raise FileNotFoundError(f"Plugin directory '{plugin_name}' not found in repository")
+            available = [d.name for d in repo_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+            raise FileNotFoundError(
+                f"Plugin directory '{plugin_name}' not found in repository. "
+                f"Available: {available}"
+            )
 
         manifest_path = plugin_dir / "manifest.json"
         if not manifest_path.exists():
             raise FileNotFoundError(f"manifest.json not found in {plugin_name}/")
 
-        # Validate manifest
         with open(manifest_path) as f:
             manifest = json.load(f)
 
-        required_fields = ["name", "hostname", "version", "entry_point"]
+        required_fields = ["name", "hostname", "description", "version", "entry_point"]
         for field in required_fields:
             if field not in manifest:
                 raise ValueError(f"manifest.json missing required field: {field}")
 
+        hostname = manifest["hostname"]
+        if not hostname.startswith("netbridge-"):
+            raise ValueError(f"hostname must start with 'netbridge-', got '{hostname}'")
+
         print(f"Installing plugin '{manifest['name']}' v{manifest['version']}...")
 
-        # Upload all files in the plugin directory
-        remote_base = f"{REMOTE_PLUGINS_DIR}\\{plugin_name}"
-        for file_path in plugin_dir.rglob("*"):
-            if file_path.is_file():
+        remote_base = _get_remote_plugins_dir(proxy_port)
+        remote_plugin_dir = f"{remote_base}\\{plugin_name}"
+
+        for file_path in sorted(plugin_dir.rglob("*")):
+            if file_path.is_file() and not file_path.name.startswith("."):
                 rel_path = file_path.relative_to(plugin_dir)
-                remote_path = f"{remote_base}\\{str(rel_path).replace('/', chr(92))}"
+                remote_path = f"{remote_plugin_dir}\\{str(rel_path).replace('/', chr(92))}"
 
                 with open(file_path, "rb") as f:
                     file_data = f.read()
@@ -127,26 +169,30 @@ def cmd_install(proxy_port, repo_url, plugin_name):
                 _curl("PUT", f"/files/{remote_path}", proxy_port, data=file_data)
                 print(f"  Uploaded: {rel_path}")
 
-        # Run install.py if it exists
-        install_script = plugin_dir / "install.py"
-        if install_script.exists():
+        if (plugin_dir / "install.py").exists():
             print("  Running install.py (this may take a while for pip installs)...")
-            install_path = f"{remote_base}\\install.py"
+            install_path = f"{remote_plugin_dir}\\install.py"
             exec_response = _curl(
                 "POST", "/exec", proxy_port,
-                json_body={"cmd": f"python {install_path}", "cwd": remote_base},
+                json_body={
+                    "cmd": f'python "{install_path}"',
+                    "cwd": remote_plugin_dir,
+                    "timeout": 300,
+                },
                 timeout=300,
             )
             if exec_response.get("exit_code") != 0:
                 stderr = exec_response.get("stderr", "")
                 raise RuntimeError(f"install.py failed: {stderr}")
+            stdout = exec_response.get("stdout", "").strip()
+            if stdout:
+                print(f"  {stdout}")
 
-        # Reload plugins
         print("  Reloading plugins...")
         reload_response = _curl("POST", "/plugins/reload", proxy_port)
 
         print(f"\nPlugin '{manifest['name']}' installed successfully!")
-        print(f"Access via hostname: {manifest['hostname']}")
+        print(f"Access via: curl --proxy socks5h://localhost:{proxy_port} http://{hostname}/")
 
         if reload_response.get("added"):
             print(f"Loaded: {', '.join(reload_response['added'])}")
@@ -157,24 +203,30 @@ def cmd_install(proxy_port, repo_url, plugin_name):
 
 def cmd_uninstall(proxy_port, plugin_name):
     """Uninstall a plugin from VDI."""
-    remote_path = f"{REMOTE_PLUGINS_DIR}\\{plugin_name}"
+    _validate_plugin_name(plugin_name)
 
-    # Check if plugin directory exists
+    remote_base = _get_remote_plugins_dir(proxy_port)
+    remote_path = f"{remote_base}\\{plugin_name}"
+
     try:
         list_response = _curl("GET", f"/files?dir={remote_path}", proxy_port)
-        entries = list_response.get("entries", [])
-    except Exception:
+    except (ConnectionError, RuntimeError):
         print(f"Plugin '{plugin_name}' not found or already uninstalled.")
         return
 
-    # Run uninstall.py if it exists
+    entries = list_response.get("entries", [])
+
     if any(e.get("name") == "uninstall.py" for e in entries):
         print(f"Running uninstall.py for '{plugin_name}'...")
         uninstall_script = f"{remote_path}\\uninstall.py"
         try:
             exec_response = _curl(
                 "POST", "/exec", proxy_port,
-                json_body={"cmd": f"python {uninstall_script}", "cwd": remote_path},
+                json_body={
+                    "cmd": f'python "{uninstall_script}"',
+                    "cwd": remote_path,
+                    "timeout": 300,
+                },
                 timeout=300,
             )
             if exec_response.get("exit_code") != 0:
@@ -182,21 +234,20 @@ def cmd_uninstall(proxy_port, plugin_name):
         except Exception as e:
             print(f"  Warning: uninstall.py failed: {e}")
 
-    # Delete the plugin directory
-    print(f"Removing plugin directory...")
+    print("Removing plugin directory...")
     _curl("DELETE", f"/files/{remote_path}", proxy_port)
 
-    # Reload plugins
     print("Reloading plugins...")
     reload_response = _curl("POST", "/plugins/reload", proxy_port)
 
-    print(f"\nPlugin '{plugin_name}' uninstalled successfully.")
+    print(f"\nPlugin '{plugin_name}' uninstalled.")
     if reload_response.get("removed"):
         print(f"Removed: {', '.join(reload_response['removed'])}")
 
 
 def cmd_update(proxy_port, repo_url, plugin_name):
     """Update a plugin by reinstalling from repository."""
+    _validate_plugin_name(plugin_name)
     print(f"Updating plugin '{plugin_name}'...")
     cmd_uninstall(proxy_port, plugin_name)
     print()
