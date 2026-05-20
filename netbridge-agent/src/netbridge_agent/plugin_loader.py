@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -84,6 +85,10 @@ def load_plugin_app(manifest: PluginManifest) -> web.Application:
         )
     if not entry.exists():
         raise PluginLoadError(f"entry point {entry} not found")
+
+    plugin_dir = str(manifest.path.resolve())
+    if plugin_dir not in sys.path:
+        sys.path.insert(0, plugin_dir)
 
     spec = importlib.util.spec_from_file_location(
         f"netbridge_plugin_{manifest.name}", entry
