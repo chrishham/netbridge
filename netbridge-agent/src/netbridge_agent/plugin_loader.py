@@ -87,7 +87,7 @@ def load_plugin_app(manifest: PluginManifest) -> web.Application:
         raise PluginLoadError(f"entry point {entry} not found")
 
     plugin_dir = str(manifest.path.resolve())
-    prefix = f"netbridge_plugin_{manifest.name}"
+    prefix = f"netbridge_plugin_{manifest.hostname}"
 
     # Clear cached modules from previous loads so reload picks up changes
     stale = [k for k in sys.modules if k == prefix or k.startswith(prefix + ".")]
@@ -116,7 +116,7 @@ def discover_plugins(plugins_dir: Path) -> list[PluginManifest]:
 
     manifests = []
     for child in sorted(plugins_dir.iterdir()):
-        if not child.is_dir():
+        if not child.is_dir() or child.is_symlink():
             continue
         try:
             manifest = load_manifest(child)
