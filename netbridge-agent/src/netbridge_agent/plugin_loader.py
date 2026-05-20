@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,7 +97,7 @@ def load_plugin_app(manifest: PluginManifest) -> web.Application:
     for k, mod in sys.modules.items():
         if k == prefix or k.startswith(prefix + "."):
             stale.append(k)
-        elif hasattr(mod, "__file__") and mod.__file__ and mod.__file__.startswith(plugin_dir):
+        elif hasattr(mod, "__file__") and mod.__file__ and mod.__file__.startswith(plugin_dir + os.sep):
             stale.append(k)
     for k in stale:
         del sys.modules[k]
