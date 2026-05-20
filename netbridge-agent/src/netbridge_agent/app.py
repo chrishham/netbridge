@@ -470,13 +470,20 @@ class NetBridgeApp:
         new_manifests = discover_plugins(plugins_dir)
 
         current = {m.hostname for m in self._plugin_manifests}
-        desired = {m.hostname: m for m in new_manifests}
+        desired = {}
+        for m in new_manifests:
+            if m.hostname in desired:
+                logger.warning(
+                    "Duplicate plugin hostname %s: %s shadows %s",
+                    m.hostname, m.name, desired[m.hostname].name,
+                )
+            desired[m.hostname] = m
 
         added, removed, updated = [], [], []
 
-        # Remove plugins no longer on disk
+        # Remove plugins whose directory no longer exists
         for m in self._plugin_manifests:
-            if m.hostname not in desired:
+            if m.hostname not in desired and not m.path.is_dir():
                 await self._intercept_server.unregister_app(m.hostname)
                 removed.append(m.hostname)
                 logger.info("Plugin unloaded: %s", m.hostname)

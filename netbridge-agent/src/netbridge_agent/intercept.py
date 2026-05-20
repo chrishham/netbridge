@@ -53,16 +53,19 @@ class InterceptServer:
 
     async def register_app(self, hostname: str, app: web.Application) -> None:
         hostname = hostname.lower()
-        if hostname in self._runners:
-            await self.unregister_app(hostname)
+        # Start new runner BEFORE tearing down old one (atomic swap)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
         sockets = site._server.sockets  # type: ignore[union-attr]
         port = sockets[0].getsockname()[1]
+        old = self._runners.get(hostname)
         self._runners[hostname] = (runner, site, port)
         _dynamic_hosts.add(hostname)
+        if old:
+            old_runner, _, _ = old
+            await old_runner.cleanup()
         if self.port is None:
             self.port = port
         logger.info("Registered app: %s on 127.0.0.1:%d", hostname, port)
