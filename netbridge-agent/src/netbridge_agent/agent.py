@@ -453,6 +453,14 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "error": "Intercept server is not running",
             })
             return
+        if host.lower() not in server.registered_hostnames:
+            await send_to_relay(ws, {
+                "type": "tcp_connect_result",
+                "stream_id": stream_id,
+                "success": False,
+                "error": f"Service {host} is not available",
+            })
+            return
         port = server.port
         host = "127.0.0.1"
         logger.info(

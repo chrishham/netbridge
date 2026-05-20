@@ -365,3 +365,37 @@ class TestAgentInterceptRouting:
         sent = json.loads(ws.send_str.call_args_list[0][0][0])
         assert sent["type"] == "tcp_connect_result"
         assert sent["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_magic_host_rejected_when_hostname_not_registered(self):
+        """TCP connect rejected at agent level when hostname isn't registered."""
+        from netbridge_agent.agent import AgentState, handle_tcp_connect
+        from unittest.mock import MagicMock, AsyncMock
+
+        server = InterceptServer()
+        await server.start()
+        try:
+            state = AgentState()
+            state.allow_loopback = True
+            state.get_intercept_server = lambda: server
+
+            ws = MagicMock()
+            ws.closed = False
+            ws.send_str = AsyncMock()
+
+            request = {
+                "stream_id": "test-stream-unreg",
+                "host": "netbridge-exec",
+                "port": 80,
+            }
+
+            await handle_tcp_connect(state, ws, request)
+            for task in list(state.pending_connections.values()):
+                await task
+
+            sent = json.loads(ws.send_str.call_args_list[0][0][0])
+            assert sent["type"] == "tcp_connect_result"
+            assert sent["success"] is False
+            assert "not available" in sent["error"].lower()
+        finally:
+            await server.stop()
