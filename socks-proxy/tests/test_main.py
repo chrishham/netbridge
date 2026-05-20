@@ -23,3 +23,54 @@ class TestIsLoopback:
 
     def test_empty_string(self):
         assert _is_loopback("") is False
+
+
+import subprocess
+import sys
+
+
+class TestSubcommands:
+    def test_serve_subcommand_help(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "socks_proxy", "serve", "--help"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "relay" in result.stdout.lower()
+
+    def test_plugin_subcommand_help(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "socks_proxy", "plugin", "--help"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "install" in result.stdout.lower()
+
+    def test_bare_invocation_shows_help(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "socks_proxy", "--help"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "serve" in result.stdout.lower()
+        assert "plugin" in result.stdout.lower()
+
+    def test_version_flag(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "socks_proxy", "--version"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+
+    def test_backward_compat_bare_invocation_with_relay_arg(self):
+        """Verify that old-style invocations still work (backward compat)."""
+        # This simulates: netbridge-socks --relay wss://... --port 1080
+        # It should default to serve subcommand
+        result = subprocess.run(
+            [sys.executable, "-m", "socks_proxy", "--relay", "test.example.com", "--help"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        # Should show serve help (with all the serve options)
+        assert "relay" in result.stdout.lower()
+        assert "socks5" in result.stdout.lower()

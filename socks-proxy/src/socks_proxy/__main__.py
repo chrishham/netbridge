@@ -169,34 +169,8 @@ async def run_server(
             on_status_change(connected=False)
 
 
-def main():
-    """Entry point for the SOCKS5 & HTTP proxy."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    parser = argparse.ArgumentParser(
-        description="SOCKS5 & HTTP proxy for Network Bridge",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  netbridge-proxy                         # SOCKS5 on :1080, HTTP on :3128
-  netbridge-proxy --port 8080             # SOCKS5 on :8080, HTTP on :3128
-  netbridge-proxy --http-port 8888        # SOCKS5 on :1080, HTTP on :8888
-  netbridge-proxy --no-http               # SOCKS5 only, no HTTP proxy
-  netbridge-proxy --relay custom.example.com
-  netbridge-proxy --no-auth               # Disable authentication (local testing)
-
-Environment variables for HTTP proxy clients:
-  PowerShell:  $env:HTTP_PROXY="http://127.0.0.1:3128"
-               $env:HTTPS_PROXY="http://127.0.0.1:3128"
-
-  Bash/Zsh:    export HTTP_PROXY="http://127.0.0.1:3128"
-               export HTTPS_PROXY="http://127.0.0.1:3128"
-        """,
-    )
+def _add_serve_args(parser):
+    """Add all serve subcommand arguments to the given parser."""
     parser.add_argument(
         "--host",
         default=DEFAULT_HOST,
@@ -255,14 +229,10 @@ Environment variables for HTTP proxy clients:
         help="Path to a custom CA certificate file for SSL verification. "
              "Use this instead of --no-verify-ssl when behind a TLS-intercepting proxy.",
     )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-    )
 
-    args = parser.parse_args()
 
+def serve_main(args):
+    """Run the SOCKS5 & HTTP proxy server with the given arguments."""
     # Enforce loopback-only binding unless --allow-remote is set
     if not _is_loopback(args.host) and not args.allow_remote:
         logger.error(
@@ -403,6 +373,68 @@ Environment variables for HTTP proxy clients:
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     logger.info("Goodbye!")
+
+
+def main():
+    """Entry point for netbridge-socks."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="netbridge-socks",
+        description="NetBridge — SOCKS5/HTTP proxy and plugin manager",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Run the SOCKS5 & HTTP proxy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  netbridge-socks serve                         # SOCKS5 on :1080, HTTP on :3128
+  netbridge-socks serve --port 8080             # SOCKS5 on :8080, HTTP on :3128
+  netbridge-socks serve --http-port 8888        # SOCKS5 on :1080, HTTP on :8888
+  netbridge-socks serve --no-http               # SOCKS5 only, no HTTP proxy
+  netbridge-socks serve --relay custom.example.com
+  netbridge-socks serve --no-auth               # Disable authentication (local testing)
+
+Environment variables for HTTP proxy clients:
+  PowerShell:  $env:HTTP_PROXY="http://127.0.0.1:3128"
+               $env:HTTPS_PROXY="http://127.0.0.1:3128"
+
+  Bash/Zsh:    export HTTP_PROXY="http://127.0.0.1:3128"
+               export HTTPS_PROXY="http://127.0.0.1:3128"
+        """,
+    )
+    _add_serve_args(serve_parser)
+
+    from .plugin_cli import add_plugin_subparser
+    add_plugin_subparser(subparsers)
+
+    # Check if first arg is a known subcommand or top-level flag
+    if len(sys.argv) > 1 and sys.argv[1] in ("serve", "plugin", "--help", "-h", "--version"):
+        # Explicit subcommand or top-level flag - parse normally
+        args = parser.parse_args()
+    else:
+        # No subcommand or legacy args - default to serve for backward compat
+        args = serve_parser.parse_args(sys.argv[1:])
+        args.command = "serve"
+
+    if args.command == "serve":
+        serve_main(args)
+    elif args.command == "plugin":
+        from .plugin_cli import plugin_main
+        plugin_main(args)
 
 
 if __name__ == "__main__":
