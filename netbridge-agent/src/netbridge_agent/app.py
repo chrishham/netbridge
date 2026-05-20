@@ -615,25 +615,26 @@ class NetBridgeApp:
         # Wait for exit request
         await self._stop_event.wait()
 
-        # Stop intercept server
-        if self._intercept_server:
-            await self._intercept_server.stop()
-
-        # Stop remote exec if active
-        if self._remote_exec_enabled:
-            self._remote_exec_enabled = False
-            await self._stop_remote_exec()
-
-        # Stop keep-alive
-        self._stop_keepalive()
-
-        # Cancel agent task if running
+        # Cancel agent task first so in-flight TCP streams close,
+        # preventing intercept server cleanup from stalling.
         if self._agent_task and not self._agent_task.done():
             self._agent_task.cancel()
             try:
                 await self._agent_task
             except asyncio.CancelledError:
                 pass
+
+        # Stop remote exec if active
+        if self._remote_exec_enabled:
+            self._remote_exec_enabled = False
+            await self._stop_remote_exec()
+
+        # Stop intercept server (after agent streams are closed)
+        if self._intercept_server:
+            await self._intercept_server.stop()
+
+        # Stop keep-alive
+        self._stop_keepalive()
 
     def _run_async_loop(self) -> None:
         """Run the async event loop in a background thread."""
