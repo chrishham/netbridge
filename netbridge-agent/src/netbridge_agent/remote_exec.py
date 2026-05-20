@@ -21,6 +21,8 @@ import socket
 
 from aiohttp import web
 
+from .config import get_app_dir
+
 LOG = logging.getLogger(__name__)
 
 _50_MB = 50 * 1024 * 1024
@@ -280,6 +282,58 @@ async def handle_exec_stream(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# /plugins  — plugin listing and hot-reload
+# ---------------------------------------------------------------------------
+
+
+def _get_plugins_dir():
+    """Return the plugins directory path. Extracted for test overrides."""
+    return get_app_dir() / "plugins"
+
+
+async def handle_plugins(request: web.Request) -> web.Response:
+    """List installed plugins."""
+    try:
+        from .plugin_loader import discover_plugins
+
+        plugins_dir = _get_plugins_dir()
+        manifests = discover_plugins(plugins_dir)
+        return web.json_response({
+            "plugins": [
+                {
+                    "name": m.name,
+                    "hostname": m.hostname,
+                    "description": m.description,
+                    "version": m.version,
+                }
+                for m in manifests
+            ]
+        })
+    except Exception:
+        LOG.exception("handle_plugins failed")
+        return web.json_response({"error": "internal error"}, status=500)
+
+
+async def handle_plugins_reload(request: web.Request) -> web.Response:
+    """Trigger re-discovery of plugins. Called after install/uninstall."""
+    try:
+        reload_fn = request.app.get("_plugin_reload_callback")
+        if not reload_fn:
+            return web.json_response(
+                {"error": "reload not available"}, status=501
+            )
+        added, removed = await reload_fn()
+        return web.json_response({
+            "status": "ok",
+            "added": added,
+            "removed": removed,
+        })
+    except Exception:
+        LOG.exception("handle_plugins_reload failed")
+        return web.json_response({"error": "internal error"}, status=500)
+
+
+# ---------------------------------------------------------------------------
 # Application factory
 # ---------------------------------------------------------------------------
 
@@ -294,4 +348,6 @@ def create_app() -> web.Application:
     app.router.add_delete("/files/{path:.+}", handle_file_delete)
     app.router.add_post("/exec", handle_exec)
     app.router.add_post("/exec/stream", handle_exec_stream)
+    app.router.add_get("/plugins", handle_plugins)
+    app.router.add_post("/plugins/reload", handle_plugins_reload)
     return app

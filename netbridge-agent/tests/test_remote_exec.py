@@ -1,5 +1,6 @@
 """Tests for netbridge_agent.remote_exec HTTP handlers."""
 
+import json
 import os
 
 import pytest
@@ -189,3 +190,73 @@ class TestExecStream:
         assert resp.status == 400
         data = await resp.json()
         assert "error" in data
+
+
+# ---------------------------------------------------------------------------
+# /plugins  (plugin listing)
+# ---------------------------------------------------------------------------
+
+
+class TestPlugins:
+    async def test_plugins_returns_empty_list(self, client: TestClient):
+        resp = await client.get("/plugins")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["plugins"] == []
+
+    async def test_plugins_returns_discovered_plugins(self, client: TestClient, tmp_path):
+        plugin_dir = tmp_path / "test-plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "manifest.json").write_text(json.dumps({
+            "name": "test-plugin",
+            "hostname": "netbridge-test",
+            "description": "A test plugin",
+            "version": "2.0.0",
+            "entry_point": "handlers.py",
+        }))
+        (plugin_dir / "handlers.py").write_text(
+            "from aiohttp import web\n"
+            "def create_app():\n"
+            "    return web.Application()\n"
+        )
+
+        import netbridge_agent.remote_exec as mod
+        original = mod._get_plugins_dir
+        mod._get_plugins_dir = lambda: tmp_path
+        try:
+            resp = await client.get("/plugins")
+            assert resp.status == 200
+            data = await resp.json()
+            assert len(data["plugins"]) == 1
+            p = data["plugins"][0]
+            assert p["name"] == "test-plugin"
+            assert p["hostname"] == "netbridge-test"
+            assert p["version"] == "2.0.0"
+        finally:
+            mod._get_plugins_dir = original
+
+
+# ---------------------------------------------------------------------------
+# /plugins/reload  (hot-reload trigger)
+# ---------------------------------------------------------------------------
+
+
+class TestPluginsReload:
+    async def test_reload_without_callback_returns_501(self, client: TestClient):
+        resp = await client.post("/plugins/reload")
+        assert resp.status == 501
+
+    async def test_reload_with_callback_invokes_it(self, aiohttp_client):
+        from unittest.mock import AsyncMock
+
+        app = create_app()
+        reload_mock = AsyncMock(return_value=(["netbridge-new"], ["netbridge-old"]))
+        app["_plugin_reload_callback"] = reload_mock
+
+        c = await aiohttp_client(app)
+        resp = await c.post("/plugins/reload")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["added"] == ["netbridge-new"]
+        assert data["removed"] == ["netbridge-old"]
+        reload_mock.assert_awaited_once()
