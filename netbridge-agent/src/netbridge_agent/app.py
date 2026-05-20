@@ -435,6 +435,9 @@ class NetBridgeApp:
             exec_app = create_exec_app()
             exec_app["_plugin_reload_callback"] = self._reload_plugins
             await self._intercept_server.register_app("netbridge-exec", exec_app)
+            if not self._remote_exec_enabled:
+                await self._intercept_server.unregister_app("netbridge-exec")
+                return
 
         if self._remote_exec_timer:
             self._remote_exec_timer.cancel()
