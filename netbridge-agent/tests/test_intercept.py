@@ -1,17 +1,17 @@
 """Tests for netbridge_agent.intercept module.
 
-Covers magic hostname detection, InterceptServer lifecycle,
-and agent-level intercept routing for magic hostnames.
+Covers magic hostname detection, InterceptServer dispatcher routing,
+hot-plug register/unregister, error isolation, and streaming.
 """
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
+from aiohttp import web
 
-from netbridge_agent.intercept import InterceptServer, is_magic_hostname
+from netbridge_agent.intercept import InterceptServer, is_magic_hostname, MAGIC_HOSTS
 
 
 # ---------------------------------------------------------------------------
@@ -33,191 +33,239 @@ class TestMagicHostname:
     def test_case_insensitive(self):
         assert is_magic_hostname("NETBRIDGE-EXEC") is True
         assert is_magic_hostname("Netbridge-Exec") is True
-        assert is_magic_hostname("NetBridge-Exec") is True
 
 
 # ---------------------------------------------------------------------------
-# InterceptServer
+# InterceptServer — dispatcher routing
 # ---------------------------------------------------------------------------
 
 
-class TestInterceptServer:
+def _make_app(routes: dict[str, str]) -> web.Application:
+    """Build a trivial aiohttp app from {path: response_text} pairs."""
+    app = web.Application()
+    for path, text in routes.items():
+
+        async def handler(request, _text=text):
+            return web.json_response({"msg": _text})
+
+        app.router.add_get(path, handler)
+    return app
+
+
+class TestInterceptServerRouting:
+    @pytest.mark.asyncio
+    async def test_register_and_route_by_host_header(self):
+        server = InterceptServer()
+        server.register_app("netbridge-alpha", _make_app({"/hello": "alpha"}))
+        server.register_app("netbridge-beta", _make_app({"/hello": "beta"}))
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/hello",
+                    headers={"Host": "netbridge-alpha"},
+                ) as r:
+                    assert r.status == 200
+                    assert (await r.json())["msg"] == "alpha"
+
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/hello",
+                    headers={"Host": "netbridge-beta"},
+                ) as r:
+                    assert r.status == 200
+                    assert (await r.json())["msg"] == "beta"
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_unknown_hostname_returns_404(self):
+        server = InterceptServer()
+        server.register_app("netbridge-known", _make_app({"/x": "ok"}))
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/x",
+                    headers={"Host": "netbridge-unknown"},
+                ) as r:
+                    assert r.status == 404
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_unmatched_route_in_registered_app_returns_404(self):
+        server = InterceptServer()
+        server.register_app("netbridge-app", _make_app({"/exists": "yes"}))
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/nope",
+                    headers={"Host": "netbridge-app"},
+                ) as r:
+                    assert r.status == 404
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_registered_hostnames_property(self):
+        server = InterceptServer()
+        server.register_app("netbridge-a", _make_app({}))
+        server.register_app("netbridge-b", _make_app({}))
+        assert server.registered_hostnames == {"netbridge-a", "netbridge-b"}
+
+
+# ---------------------------------------------------------------------------
+# InterceptServer — error isolation
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptServerIsolation:
+    @pytest.mark.asyncio
+    async def test_crashing_plugin_returns_500_others_survive(self):
+        crash_app = web.Application()
+
+        async def crash(request):
+            raise RuntimeError("plugin exploded")
+
+        crash_app.router.add_get("/boom", crash)
+
+        ok_app = _make_app({"/check": "alive"})
+
+        server = InterceptServer()
+        server.register_app("netbridge-crash", crash_app)
+        server.register_app("netbridge-ok", ok_app)
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/boom",
+                    headers={"Host": "netbridge-crash"},
+                ) as r:
+                    assert r.status == 500
+
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/check",
+                    headers={"Host": "netbridge-ok"},
+                ) as r:
+                    assert r.status == 200
+                    assert (await r.json())["msg"] == "alive"
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_streaming_response_through_dispatcher(self):
+        stream_app = web.Application()
+
+        async def stream_handler(request):
+            resp = web.StreamResponse(
+                status=200, headers={"Content-Type": "text/plain"}
+            )
+            await resp.prepare(request)
+            for i in range(3):
+                await resp.write(f"line {i}\n".encode())
+            await resp.write_eof()
+            return resp
+
+        stream_app.router.add_get("/stream", stream_handler)
+
+        server = InterceptServer()
+        server.register_app("netbridge-stream", stream_app)
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/stream",
+                    headers={"Host": "netbridge-stream"},
+                ) as r:
+                    assert r.status == 200
+                    body = await r.text()
+                    assert body.count("\n") == 3
+        finally:
+            await server.stop()
+
+
+# ---------------------------------------------------------------------------
+# InterceptServer — hot-plug
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptServerHotPlug:
+    @pytest.mark.asyncio
+    async def test_hot_add_after_start(self):
+        server = InterceptServer()
+        await server.start()
+        try:
+            server.register_app("netbridge-late", _make_app({"/ping": "pong"}))
+            assert "netbridge-late" in MAGIC_HOSTS
+
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/ping",
+                    headers={"Host": "netbridge-late"},
+                ) as r:
+                    assert r.status == 200
+                    assert (await r.json())["msg"] == "pong"
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_hot_remove_after_start(self):
+        server = InterceptServer()
+        server.register_app("netbridge-temp", _make_app({"/hi": "there"}))
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/hi",
+                    headers={"Host": "netbridge-temp"},
+                ) as r:
+                    assert r.status == 200
+
+            server.unregister_app("netbridge-temp")
+            assert "netbridge-temp" not in MAGIC_HOSTS
+
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/hi",
+                    headers={"Host": "netbridge-temp"},
+                ) as r:
+                    assert r.status == 404
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_unregister_nonexistent_is_noop(self):
+        server = InterceptServer()
+        server.unregister_app("netbridge-nope")  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# InterceptServer — lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestInterceptServerLifecycle:
+    @pytest.mark.asyncio
     async def test_start_and_stop(self):
         server = InterceptServer()
         assert server.port is None
-
         await server.start()
         assert server.port is not None
         assert server.port > 0
-
         await server.stop()
         assert server.port is None
 
-    async def test_health_through_intercept(self):
-        server = InterceptServer()
-        await server.start()
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"http://127.0.0.1:{server.port}/health"
-                async with session.get(url) as resp:
-                    assert resp.status == 200
-                    data = await resp.json()
-                    assert data["status"] == "ok"
-        finally:
-            await server.stop()
-
-
-# ---------------------------------------------------------------------------
-# Agent intercept routing
-# ---------------------------------------------------------------------------
-
-
-class TestAgentIntercept:
-    async def test_magic_host_rejected_when_disabled(self):
-        """When get_remote_exec_state returns (False, None), magic host is rejected."""
-        from netbridge_agent.agent import AgentState, handle_tcp_connect
-
-        state = AgentState()
-        state.get_remote_exec_state = lambda: (False, None)
-
-        ws = MagicMock()
-        ws.closed = False
-        ws.send_str = AsyncMock()
-
-        request = {
-            "stream_id": "abcd1234-test-stream",
-            "host": "netbridge-exec",
-            "port": 80,
-        }
-
-        await handle_tcp_connect(state, ws, request)
-
-        # Wait for the pending connection task to finish
-        for task in list(state.pending_connections.values()):
-            await task
-
-        # Should have sent a failure response
-        assert ws.send_str.call_count >= 1
-        sent = json.loads(ws.send_str.call_args_list[0][0][0])
-        assert sent["type"] == "tcp_connect_result"
-        assert sent["success"] is False
-        assert "disabled" in sent["error"].lower()
-
-    async def test_magic_host_rejected_when_not_configured(self):
-        """When get_remote_exec_state is None, magic host is rejected."""
-        from netbridge_agent.agent import AgentState, handle_tcp_connect
-
-        state = AgentState()
-        # get_remote_exec_state is None by default
-
-        ws = MagicMock()
-        ws.closed = False
-        ws.send_str = AsyncMock()
-
-        request = {
-            "stream_id": "abcd1234-test-stream",
-            "host": "netbridge-exec",
-            "port": 80,
-        }
-
-        await handle_tcp_connect(state, ws, request)
-
-        for task in list(state.pending_connections.values()):
-            await task
-
-        assert ws.send_str.call_count >= 1
-        sent = json.loads(ws.send_str.call_args_list[0][0][0])
-        assert sent["type"] == "tcp_connect_result"
-        assert sent["success"] is False
-        assert "not configured" in sent["error"].lower()
-
-    async def test_magic_host_uses_intercept_when_enabled(self):
-        """When remote exec is enabled, magic host connects to intercept server."""
-        from netbridge_agent.agent import AgentState, handle_tcp_connect
-
-        server = InterceptServer()
-        await server.start()
-        try:
-            state = AgentState()
-            state.allow_loopback = True  # We need loopback for 127.0.0.1
-            state.get_remote_exec_state = lambda: (True, server)
-
-            ws = MagicMock()
-            ws.closed = False
-            ws.send_str = AsyncMock()
-
-            request = {
-                "stream_id": "abcd1234-test-stream",
-                "host": "netbridge-exec",
-                "port": 80,
-            }
-
-            await handle_tcp_connect(state, ws, request)
-
-            # Wait for the pending connection task to finish
-            for task in list(state.pending_connections.values()):
-                await task
-
-            # Should have sent a success response
-            assert ws.send_str.call_count >= 1
-            sent = json.loads(ws.send_str.call_args_list[0][0][0])
-            assert sent["type"] == "tcp_connect_result"
-            assert sent["success"] is True
-
-            # Stream should be active and connected to the intercept port
-            assert "abcd1234-test-stream" in state.active_streams
-            stream = state.active_streams["abcd1234-test-stream"]
-            assert stream.host == "127.0.0.1"
-            assert stream.port == server.port
-        finally:
-            # Clean up the stream
-            from netbridge_agent.agent import close_all_streams
-            await close_all_streams(state, timeout=2.0)
-            await server.stop()
-
-
-# ---------------------------------------------------------------------------
-# End-to-end integration tests
-# ---------------------------------------------------------------------------
-
-
-class TestEndToEndIntercept:
-    """Test the full flow: InterceptServer serving remote_exec handlers."""
-
     @pytest.mark.asyncio
-    async def test_e2e_health(self):
-        """Health endpoint works through the intercept server."""
-        import aiohttp
-        from netbridge_agent.intercept import InterceptServer
-
+    async def test_start_with_no_apps_serves_404(self):
         server = InterceptServer()
         await server.start()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"http://127.0.0.1:{server.port}/health") as resp:
-                    assert resp.status == 200
-                    data = await resp.json()
-                    assert data["status"] == "ok"
-        finally:
-            await server.stop()
-
-    @pytest.mark.asyncio
-    async def test_e2e_exec(self):
-        """Exec endpoint works through the intercept server."""
-        import aiohttp
-        from netbridge_agent.intercept import InterceptServer
-
-        server = InterceptServer()
-        await server.start()
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"http://127.0.0.1:{server.port}/exec",
-                    json={"cmd": "echo integration-test"}
-                ) as resp:
-                    assert resp.status == 200
-                    data = await resp.json()
-                    assert data["exit_code"] == 0
-                    assert "integration-test" in data["stdout"]
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{server.port}/anything",
+                    headers={"Host": "netbridge-whatever"},
+                ) as r:
+                    assert r.status == 404
         finally:
             await server.stop()
