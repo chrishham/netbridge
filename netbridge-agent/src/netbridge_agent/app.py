@@ -124,6 +124,7 @@ class NetBridgeApp:
         self._remote_exec_timer: Optional[asyncio.TimerHandle] = None
         self._intercept_server = None
         self._plugin_manifests: list = []
+        self._reload_lock: Optional[asyncio.Lock] = None
 
         logger.info(f"{APP_NAME} v{APP_VERSION} starting")
 
@@ -426,6 +427,8 @@ class NetBridgeApp:
 
     async def _start_remote_exec(self) -> None:
         """Register the remote exec app in the intercept server."""
+        if not self._remote_exec_enabled:
+            return
         from .remote_exec import create_app as create_exec_app
 
         if self._intercept_server:
@@ -464,6 +467,12 @@ class NetBridgeApp:
 
     async def _reload_plugins(self) -> tuple[list[str], list[str]]:
         """Re-discover plugins and hot-add/remove from intercept server."""
+        if self._reload_lock is None:
+            self._reload_lock = asyncio.Lock()
+        async with self._reload_lock:
+            return await self._reload_plugins_locked()
+
+    async def _reload_plugins_locked(self) -> tuple[list[str], list[str]]:
         from .plugin_loader import discover_plugins, load_plugin_app
 
         plugins_dir = get_app_dir() / "plugins"
