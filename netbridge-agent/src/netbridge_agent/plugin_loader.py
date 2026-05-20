@@ -89,8 +89,15 @@ def load_plugin_app(manifest: PluginManifest) -> web.Application:
     plugin_dir = str(manifest.path.resolve())
     prefix = f"netbridge_plugin_{manifest.hostname}"
 
-    # Clear cached modules from previous loads so reload picks up changes
-    stale = [k for k in sys.modules if k == prefix or k.startswith(prefix + ".")]
+    # Clear cached modules from previous loads so reload picks up changes.
+    # This includes both the namespaced entry module and any helpers
+    # imported from within the plugin directory.
+    stale = []
+    for k, mod in sys.modules.items():
+        if k == prefix or k.startswith(prefix + "."):
+            stale.append(k)
+        elif hasattr(mod, "__file__") and mod.__file__ and mod.__file__.startswith(plugin_dir):
+            stale.append(k)
     for k in stale:
         del sys.modules[k]
 
@@ -114,9 +121,13 @@ def discover_plugins(plugins_dir: Path) -> list[PluginManifest]:
     if not plugins_dir.is_dir():
         return []
 
+    resolved_root = plugins_dir.resolve()
     manifests = []
     for child in sorted(plugins_dir.iterdir()):
         if not child.is_dir() or child.is_symlink():
+            continue
+        if not child.resolve().is_relative_to(resolved_root):
+            LOG.warning("Skipping plugin %s: resolves outside plugins dir", child.name)
             continue
         try:
             manifest = load_manifest(child)
