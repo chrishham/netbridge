@@ -462,10 +462,6 @@ class NetBridgeApp:
                     "Remote execution auto-disabled after timeout.",
                 )
 
-    def _get_remote_exec_state(self):
-        """Return (enabled, server) for remote exec — called from agent."""
-        return self._remote_exec_enabled, self._intercept_server
-
     async def _reload_plugins(self) -> tuple[list[str], list[str]]:
         """Re-discover plugins and hot-add/remove from intercept server."""
         from .plugin_loader import discover_plugins, load_plugin_app
@@ -541,7 +537,7 @@ class NetBridgeApp:
                 on_status_change=self._on_agent_status,
                 on_session_info=self.set_session_info,
                 on_proxy_auth_rejected=self._on_proxy_auth_rejected,
-                get_remote_exec_state=self._get_remote_exec_state,
+                get_intercept_server=lambda: self._intercept_server,
             )
         except Exception as e:
             logger.error(f"Agent error: {e}")

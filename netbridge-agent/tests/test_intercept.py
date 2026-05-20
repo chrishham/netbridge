@@ -269,3 +269,99 @@ class TestInterceptServerLifecycle:
                     assert r.status == 404
         finally:
             await server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Agent intercept routing (simplified)
+# ---------------------------------------------------------------------------
+
+
+class TestAgentInterceptRouting:
+    @pytest.mark.asyncio
+    async def test_magic_host_routes_to_intercept_server(self):
+        from netbridge_agent.agent import AgentState, handle_tcp_connect
+        from netbridge_agent.remote_exec import create_app
+        from unittest.mock import MagicMock, AsyncMock
+
+        server = InterceptServer()
+        server.register_app("netbridge-exec", create_app())
+        await server.start()
+        try:
+            state = AgentState()
+            state.allow_loopback = True
+            state.get_intercept_server = lambda: server
+
+            ws = MagicMock()
+            ws.closed = False
+            ws.send_str = AsyncMock()
+
+            request = {
+                "stream_id": "test-stream-1234",
+                "host": "netbridge-exec",
+                "port": 80,
+            }
+
+            await handle_tcp_connect(state, ws, request)
+            for task in list(state.pending_connections.values()):
+                await task
+
+            sent = json.loads(ws.send_str.call_args_list[0][0][0])
+            assert sent["type"] == "tcp_connect_result"
+            assert sent["success"] is True
+        finally:
+            from netbridge_agent.agent import close_all_streams
+            await close_all_streams(state, timeout=2.0)
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_magic_host_rejected_when_no_server(self):
+        from netbridge_agent.agent import AgentState, handle_tcp_connect
+        from unittest.mock import MagicMock, AsyncMock
+
+        state = AgentState()
+        state.get_intercept_server = lambda: None
+
+        ws = MagicMock()
+        ws.closed = False
+        ws.send_str = AsyncMock()
+
+        request = {
+            "stream_id": "test-stream-5678",
+            "host": "netbridge-exec",
+            "port": 80,
+        }
+
+        await handle_tcp_connect(state, ws, request)
+        for task in list(state.pending_connections.values()):
+            await task
+
+        sent = json.loads(ws.send_str.call_args_list[0][0][0])
+        assert sent["type"] == "tcp_connect_result"
+        assert sent["success"] is False
+        assert "not running" in sent["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_magic_host_rejected_when_no_callback(self):
+        from netbridge_agent.agent import AgentState, handle_tcp_connect
+        from unittest.mock import MagicMock, AsyncMock
+
+        state = AgentState()
+        # get_intercept_server is None by default
+
+        ws = MagicMock()
+        ws.closed = False
+        ws.send_str = AsyncMock()
+
+        request = {
+            "stream_id": "test-stream-9999",
+            "host": "netbridge-exec",
+            "port": 80,
+        }
+
+        await handle_tcp_connect(state, ws, request)
+        for task in list(state.pending_connections.values()):
+            await task
+
+        sent = json.loads(ws.send_str.call_args_list[0][0][0])
+        assert sent["type"] == "tcp_connect_result"
+        assert sent["success"] is False
