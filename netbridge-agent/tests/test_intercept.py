@@ -257,7 +257,7 @@ class TestAgentInterceptRouting:
         await server.start()
         try:
             state = AgentState()
-            state.allow_loopback = True
+            state.allow_loopback = False
             state.get_intercept_server = lambda: server
 
             ws = MagicMock()
@@ -345,7 +345,7 @@ class TestAgentInterceptRouting:
         await server.start()
         try:
             state = AgentState()
-            state.allow_loopback = True
+            state.allow_loopback = False
             state.get_intercept_server = lambda: server
 
             ws = MagicMock()

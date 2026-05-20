@@ -434,6 +434,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
         return
 
     # Intercept magic hostnames
+    intercepted = False
     from .intercept import is_magic_hostname
     if is_magic_hostname(host):
         if not state.get_intercept_server:
@@ -468,26 +469,29 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             return
         port = intercept_port
         host = "127.0.0.1"
+        intercepted = True
         logger.info(
             "Intercept: %s -> %s:%s via 127.0.0.1:%d",
             stream_id[:8], request.get("host"), request.get("port"), port,
         )
 
-    # Validate destination against private ranges and config lists
-    dest_allowed, dest_reason = await validate_destination(
-        host, port, state.allowed_destinations, state.denied_destinations,
-        allow_private=state.allow_private_destinations,
-        allow_loopback=state.allow_loopback,
-    )
-    if not dest_allowed:
-        logger.warning(f"Destination denied: {stream_id[:8]} -> {host}:{port}: {dest_reason}")
-        await send_to_relay(ws, {
-            "type": "tcp_connect_result",
-            "stream_id": stream_id,
-            "success": False,
-            "error": f"Destination {host}:{port} is not allowed",
-        })
-        return
+    # Skip validation for intercepted connections — they route to our
+    # own in-process server, not to an external destination.
+    if not intercepted:
+        dest_allowed, dest_reason = await validate_destination(
+            host, port, state.allowed_destinations, state.denied_destinations,
+            allow_private=state.allow_private_destinations,
+            allow_loopback=state.allow_loopback,
+        )
+        if not dest_allowed:
+            logger.warning(f"Destination denied: {stream_id[:8]} -> {host}:{port}: {dest_reason}")
+            await send_to_relay(ws, {
+                "type": "tcp_connect_result",
+                "stream_id": stream_id,
+                "success": False,
+                "error": f"Destination {host}:{port} is not allowed",
+            })
+            return
 
     logger.info(f"Connect: {stream_id[:8]} -> {host}:{port}")
 
