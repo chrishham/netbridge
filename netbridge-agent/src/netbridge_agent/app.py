@@ -429,15 +429,20 @@ class NetBridgeApp:
         """Register the remote exec app in the intercept server."""
         if not self._remote_exec_enabled:
             return
+        if not self._intercept_server:
+            logger.warning("Remote exec toggled before intercept server ready")
+            self._remote_exec_enabled = False
+            if self.tray:
+                self.tray.set_remote_exec(False)
+            return
         from .remote_exec import create_app as create_exec_app
 
-        if self._intercept_server:
-            exec_app = create_exec_app()
-            exec_app["_plugin_reload_callback"] = self._reload_plugins
-            await self._intercept_server.register_app("netbridge-exec", exec_app)
-            if not self._remote_exec_enabled:
-                await self._intercept_server.unregister_app("netbridge-exec")
-                return
+        exec_app = create_exec_app()
+        exec_app["_plugin_reload_callback"] = self._reload_plugins
+        await self._intercept_server.register_app("netbridge-exec", exec_app)
+        if not self._remote_exec_enabled:
+            await self._intercept_server.unregister_app("netbridge-exec")
+            return
 
         if self._remote_exec_timer:
             self._remote_exec_timer.cancel()
