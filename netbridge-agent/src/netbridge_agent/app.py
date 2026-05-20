@@ -469,7 +469,6 @@ class NetBridgeApp:
         plugins_dir = get_app_dir() / "plugins"
         new_manifests = discover_plugins(plugins_dir)
 
-        current = {m.hostname for m in self._plugin_manifests}
         desired = {}
         for m in new_manifests:
             if m.hostname in desired:
@@ -479,41 +478,33 @@ class NetBridgeApp:
                 )
             desired[m.hostname] = m
 
-        added, removed, updated = [], [], []
+        added, removed = [], []
 
-        # Remove plugins whose directory no longer exists
+        # Load or reload all desired plugins
+        loaded = []
+        for hostname, m in desired.items():
+            try:
+                app = load_plugin_app(m)
+                await self._intercept_server.register_app(hostname, app)
+                loaded.append(m)
+                if hostname not in {p.hostname for p in self._plugin_manifests}:
+                    added.append(hostname)
+                    logger.info("Plugin loaded: %s", hostname)
+                else:
+                    logger.info("Plugin reloaded: %s", hostname)
+            except Exception as e:
+                logger.warning("Failed to load plugin %s: %s", m.name, e)
+
+        # Unregister hostnames from previous load that are no longer desired
+        # or failed to reload (stale runners)
+        loaded_hostnames = {m.hostname for m in loaded}
         for m in self._plugin_manifests:
-            if m.hostname not in desired and not m.path.is_dir():
+            if m.hostname not in loaded_hostnames:
                 await self._intercept_server.unregister_app(m.hostname)
                 removed.append(m.hostname)
                 logger.info("Plugin unloaded: %s", m.hostname)
 
-        loaded = []
-        for hostname, m in desired.items():
-            if hostname not in current:
-                # New plugin
-                try:
-                    app = load_plugin_app(m)
-                    await self._intercept_server.register_app(hostname, app)
-                    added.append(hostname)
-                    loaded.append(m)
-                    logger.info("Plugin loaded: %s", hostname)
-                except Exception as e:
-                    logger.warning("Failed to load plugin %s: %s", m.name, e)
-            else:
-                # Existing plugin — re-register to pick up code changes
-                try:
-                    app = load_plugin_app(m)
-                    await self._intercept_server.register_app(hostname, app)
-                    updated.append(hostname)
-                    loaded.append(m)
-                    logger.info("Plugin reloaded: %s", hostname)
-                except Exception as e:
-                    logger.warning("Failed to reload plugin %s: %s", m.name, e)
-
-        self._plugin_manifests = [
-            m for m in new_manifests if m in loaded
-        ]
+        self._plugin_manifests = loaded
         return added, removed
 
     def request_exit(self) -> None:
@@ -602,17 +593,7 @@ class NetBridgeApp:
         from .intercept import InterceptServer
         self._intercept_server = InterceptServer()
         await self._intercept_server.start()
-
-        from .plugin_loader import discover_plugins, load_plugin_app
-        plugins_dir = get_app_dir() / "plugins"
-        for manifest in discover_plugins(plugins_dir):
-            try:
-                plugin_app = load_plugin_app(manifest)
-                await self._intercept_server.register_app(manifest.hostname, plugin_app)
-                self._plugin_manifests.append(manifest)
-                logger.info("Plugin loaded: %s (%s)", manifest.name, manifest.hostname)
-            except Exception as e:
-                logger.warning("Failed to load plugin %s: %s", manifest.name, e)
+        await self._reload_plugins()
 
         # Auto-connect if configured
         if self.config.auto_connect:
