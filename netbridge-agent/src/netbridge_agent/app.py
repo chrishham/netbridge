@@ -428,23 +428,18 @@ class NetBridgeApp:
             asyncio.create_task(self._stop_remote_exec())
 
     async def _start_remote_exec(self) -> None:
-        """Register the remote exec app in the intercept server."""
+        """Enable the remote exec gate flag."""
         if not self._remote_exec_enabled:
             return
-        if not self._intercept_server:
-            logger.warning("Remote exec toggled before intercept server ready")
+        if not hasattr(self, '_exec_app') or self._exec_app is None:
+            logger.warning("Remote exec toggled before exec app ready")
             self._remote_exec_enabled = False
             if self.tray:
                 self.tray.set_remote_exec(False)
             return
-        from .remote_exec import create_app as create_exec_app
 
-        exec_app = create_exec_app()
-        exec_app["_plugin_reload_callback"] = self._reload_plugins
-        await self._intercept_server.register_app("netbridge-exec", exec_app)
-        if not self._remote_exec_enabled:
-            await self._intercept_server.unregister_app("netbridge-exec")
-            return
+        self._exec_app["_remote_exec_enabled"] = True
+        logger.info("Remote exec gate opened")
 
         if self._remote_exec_timer:
             self._remote_exec_timer.cancel()
@@ -455,12 +450,13 @@ class NetBridgeApp:
         )
 
     async def _stop_remote_exec(self) -> None:
-        """Unregister the remote exec app (server keeps running for plugins)."""
+        """Disable the remote exec gate flag."""
         if self._remote_exec_timer:
             self._remote_exec_timer.cancel()
             self._remote_exec_timer = None
-        if self._intercept_server:
-            await self._intercept_server.unregister_app("netbridge-exec")
+        if hasattr(self, '_exec_app') and self._exec_app is not None:
+            self._exec_app["_remote_exec_enabled"] = False
+            logger.info("Remote exec gate closed")
 
     async def _remote_exec_auto_disable(self) -> None:
         """Auto-disable remote exec after timeout."""
@@ -607,11 +603,17 @@ class NetBridgeApp:
         """Main async loop running in background thread."""
         self._stop_event = asyncio.Event()
 
-        # Start intercept server and load plugins BEFORE agent connects,
-        # so plugin hostnames are registered when relay traffic arrives.
+        # Start intercept server, register netbridge-exec, and load plugins
+        # BEFORE agent connects so hostnames are ready for relay traffic.
         from .intercept import InterceptServer
         self._intercept_server = InterceptServer()
         await self._intercept_server.start()
+
+        from .remote_exec import create_app as create_exec_app
+        self._exec_app = create_exec_app()
+        self._exec_app["_plugin_reload_callback"] = self._reload_plugins
+        await self._intercept_server.register_app("netbridge-exec", self._exec_app)
+
         await self._reload_plugins()
 
         # Auto-connect if configured

@@ -1,11 +1,12 @@
 """HTTP handlers for remote file and command operations.
 
 These handlers are embedded inside the netbridge tunnel agent and served
-by an internal InterceptServer.  They are only reachable through the
-Azure AD-authenticated tunnel **and** only when the user has manually
-toggled "Remote Exec" ON from the VDI system tray.  There is no
-handler-level authentication — the trust boundary is the tunnel + tray
-toggle.
+by an internal InterceptServer.  They are reachable through the Azure
+AD-authenticated tunnel.
+
+Plugin management routes (/plugins/*) are always available.  File and
+exec routes (/files, /exec, /health) are gated by the remote exec
+tray toggle via middleware.
 
 Handlers must **never** let exceptions propagate — an uncaught exception
 would crash the tunnel.
@@ -338,9 +339,23 @@ async def handle_plugins_reload(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 
+@web.middleware
+async def exec_gate_middleware(request, handler):
+    """Block /files, /exec, and /health when remote exec is disabled."""
+    gated_prefixes = ("/files", "/exec", "/health")
+    if any(request.path.startswith(p) for p in gated_prefixes):
+        if not request.app.get("_remote_exec_enabled", False):
+            return web.json_response(
+                {"error": "Remote exec is disabled — enable it from the VDI system tray"},
+                status=403,
+            )
+    return await handler(request)
+
+
 def create_app() -> web.Application:
     """Create and return the aiohttp application with all routes."""
-    app = web.Application(client_max_size=_50_MB)
+    app = web.Application(client_max_size=_50_MB, middlewares=[exec_gate_middleware])
+    # Gated routes (require remote exec toggle)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/files", handle_file_list)
     app.router.add_get("/files/{path:.+}", handle_file_read)
@@ -348,6 +363,7 @@ def create_app() -> web.Application:
     app.router.add_delete("/files/{path:.+}", handle_file_delete)
     app.router.add_post("/exec", handle_exec)
     app.router.add_post("/exec/stream", handle_exec_stream)
+    # Always-on routes (plugin management)
     app.router.add_get("/plugins", handle_plugins)
     app.router.add_post("/plugins/reload", handle_plugins_reload)
     return app

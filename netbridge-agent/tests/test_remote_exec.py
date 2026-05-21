@@ -11,8 +11,9 @@ from netbridge_agent.remote_exec import create_app
 
 @pytest.fixture
 async def client(aiohttp_client):
-    """Create a test client for the remote_exec app."""
+    """Create a test client for the remote_exec app with exec enabled."""
     app = create_app()
+    app["_remote_exec_enabled"] = True
     return await aiohttp_client(app)
 
 
@@ -260,3 +261,38 @@ class TestPluginsReload:
         assert data["added"] == ["netbridge-new"]
         assert data["removed"] == ["netbridge-old"]
         reload_mock.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Exec gate middleware
+# ---------------------------------------------------------------------------
+
+
+class TestExecGateMiddleware:
+    async def test_gated_routes_blocked_when_disabled(self, aiohttp_client):
+        app = create_app()
+        # _remote_exec_enabled NOT set (defaults to False)
+        c = await aiohttp_client(app)
+
+        for path in ["/health", "/files", "/exec"]:
+            method = c.post if path == "/exec" else c.get
+            resp = await method(path)
+            assert resp.status == 403, f"{path} should be blocked"
+            data = await resp.json()
+            assert "disabled" in data["error"].lower()
+
+    async def test_plugin_routes_always_available(self, aiohttp_client):
+        app = create_app()
+        # _remote_exec_enabled NOT set
+        c = await aiohttp_client(app)
+
+        resp = await c.get("/plugins")
+        assert resp.status == 200
+
+    async def test_gated_routes_open_when_enabled(self, aiohttp_client):
+        app = create_app()
+        app["_remote_exec_enabled"] = True
+        c = await aiohttp_client(app)
+
+        resp = await c.get("/health")
+        assert resp.status == 200

@@ -339,9 +339,11 @@ class TestAgentInterceptRouting:
     async def test_magic_host_rejected_when_hostname_not_registered(self):
         """TCP connect rejected at agent level when hostname isn't registered."""
         from netbridge_agent.agent import AgentState, handle_tcp_connect
+        from netbridge_agent.intercept import _dynamic_hosts
         from unittest.mock import MagicMock, AsyncMock
 
         server = InterceptServer()
+        _dynamic_hosts.add("netbridge-fakeplugin")
         await server.start()
         try:
             state = AgentState()
@@ -354,7 +356,7 @@ class TestAgentInterceptRouting:
 
             request = {
                 "stream_id": "test-stream-unreg",
-                "host": "netbridge-exec",
+                "host": "netbridge-fakeplugin",
                 "port": 80,
             }
 
@@ -365,6 +367,7 @@ class TestAgentInterceptRouting:
             sent = json.loads(ws.send_str.call_args_list[0][0][0])
             assert sent["type"] == "tcp_connect_result"
             assert sent["success"] is False
-            assert "remote exec is disabled" in sent["error"].lower()
+            assert "not available" in sent["error"].lower()
         finally:
+            _dynamic_hosts.discard("netbridge-fakeplugin")
             await server.stop()

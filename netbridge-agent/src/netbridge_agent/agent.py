@@ -456,15 +456,11 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             return
         intercept_port = server.port_for(host)
         if intercept_port is None:
-            if host.lower() == "netbridge-exec":
-                err = "Remote exec is disabled — enable it from the VDI system tray"
-            else:
-                err = f"Service {host} is not available"
             await send_to_relay(ws, {
                 "type": "tcp_connect_result",
                 "stream_id": stream_id,
                 "success": False,
-                "error": err,
+                "error": f"Service {host} is not available",
             })
             return
         port = intercept_port
