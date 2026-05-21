@@ -71,10 +71,12 @@ def _get_remote_plugins_dir(proxy_port):
 
 def _clone_repo(repo_url):
     """Clone a git repo to a temporary directory."""
+    if repo_url.startswith("-"):
+        raise ValueError(f"Invalid repo URL: {repo_url}")
     tmpdir = Path(tempfile.mkdtemp(prefix="netbridge-plugin-"))
     try:
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, str(tmpdir)],
+            ["git", "clone", "--depth", "1", "--", repo_url, str(tmpdir)],
             capture_output=True,
             timeout=300,
         )
