@@ -287,6 +287,10 @@ def cmd_uninstall(proxy_port, plugin_name):
     if output:
         print(f"  {output}")
 
+    warning = response.get("warning", "").strip()
+    if warning:
+        print(f"  Warning: {warning}")
+
     removed = response.get("removed", [])
     print(f"\nPlugin '{plugin_name}' uninstalled.")
     if removed:

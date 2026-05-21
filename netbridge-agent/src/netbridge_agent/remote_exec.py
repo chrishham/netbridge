@@ -361,7 +361,7 @@ async def handle_plugin_uninstall(request: web.Request) -> web.Response:
             )
 
         resolved = plugin_dir.resolve()
-        if not str(resolved).startswith(str(plugins_dir.resolve())):
+        if not resolved.is_relative_to(plugins_dir.resolve()):
             return web.json_response(
                 {"error": "invalid plugin directory"}, status=400
             )
