@@ -202,10 +202,14 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         if not hostname.startswith("netbridge-"):
             raise ValueError(f"hostname must start with 'netbridge-', got '{hostname}'")
 
-        # Store repo_url in manifest for later updates (strip tokens, keep git@ and port)
+        # Store repo_url in manifest for later updates (strip credentials)
         from urllib.parse import urlparse, urlunparse
         parsed = urlparse(repo_url)
-        if parsed.password:
+        has_creds = parsed.username or parsed.password
+        is_ssh = parsed.scheme in ("ssh", "git") or (
+            not parsed.scheme and "@" in (parsed.netloc or "")
+        )
+        if has_creds and not is_ssh:
             host = parsed.hostname or parsed.netloc
             if parsed.port:
                 host = f"{host}:{parsed.port}"
@@ -262,11 +266,10 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         if hostname in added:
             print(f"\nPlugin '{manifest['name']}' installed and loaded!")
             print(f"Access via: curl --proxy socks5h://localhost:{proxy_port} http://{hostname}/")
+            _install_laptop_files(plugin_dir, plugin_name)
         else:
             print(f"\nPlugin '{manifest['name']}' files uploaded but failed to load.")
             print("Check agent logs on VDI for details.")
-
-        _install_laptop_files(plugin_dir, plugin_name)
 
     finally:
         shutil.rmtree(repo_dir, ignore_errors=True)
