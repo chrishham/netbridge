@@ -328,7 +328,7 @@ def cmd_update(proxy_port, plugin_name):
         return
 
     repo_url = plugin.get("repo_url", "")
-    if not repo_url:
+    if not repo_url or not isinstance(repo_url, str):
         print(f"Plugin '{plugin_name}' has no repo_url stored.")
         print("Use 'netbridge-socks plugin install <repo_url> <name>' instead.")
         return
