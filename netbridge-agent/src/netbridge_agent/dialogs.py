@@ -492,7 +492,7 @@ def prompt_proxy_credentials(
     # Username label
     h_user_label = user32.CreateWindowExW(
         0, "STATIC",
-        "Username (e.g. user@nbg.gr or DOMAIN\\user):",
+        "Username (e.g. user@example.com or DOMAIN\\user):",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         20, 20, 430, 20,
         hwnd, ID_LABEL, wc.hInstance, None,
