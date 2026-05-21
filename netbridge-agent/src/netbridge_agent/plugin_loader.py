@@ -36,6 +36,7 @@ class PluginManifest:
     version: str
     entry_point: str
     path: Path
+    repo_url: str = ""
 
 
 def load_manifest(plugin_dir: Path) -> PluginManifest:
@@ -75,6 +76,7 @@ def load_manifest(plugin_dir: Path) -> PluginManifest:
         version=data["version"],
         entry_point=data["entry_point"],
         path=plugin_dir,
+        repo_url=data.get("repo_url", ""),
     )
 
 

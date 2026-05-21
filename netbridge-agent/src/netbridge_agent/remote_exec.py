@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import socket
 
@@ -306,6 +307,7 @@ async def handle_plugins(request: web.Request) -> web.Response:
                     "hostname": m.hostname,
                     "description": m.description,
                     "version": m.version,
+                    "repo_url": m.repo_url,
                 }
                 for m in manifests
             ]
@@ -339,6 +341,56 @@ async def handle_plugins_reload(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------
 
 
+async def handle_plugin_uninstall(request: web.Request) -> web.Response:
+    """Uninstall a plugin by name. Runs uninstall.py, deletes dir, reloads."""
+    try:
+        name = request.match_info["name"]
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', name):
+            return web.json_response({"error": "invalid plugin name"}, status=400)
+
+        plugins_dir = _get_plugins_dir()
+        plugin_dir = plugins_dir / name
+
+        if not plugin_dir.is_dir():
+            return web.json_response(
+                {"error": f"plugin '{name}' not found"}, status=404
+            )
+
+        uninstall_output = ""
+        uninstall_script = plugin_dir / "uninstall.py"
+        if uninstall_script.exists():
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "python", str(uninstall_script),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(plugin_dir),
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=60
+                )
+                uninstall_output = stdout.decode(errors="replace")
+            except Exception as e:
+                LOG.warning("uninstall.py for %s failed: %s", name, e)
+
+        shutil.rmtree(plugin_dir)
+        LOG.info("Deleted plugin directory: %s", plugin_dir)
+
+        reload_fn = request.app.get("_plugin_reload_callback")
+        added, removed = [], []
+        if reload_fn:
+            added, removed = await reload_fn()
+
+        return web.json_response({
+            "status": "ok",
+            "removed": removed,
+            "uninstall_output": uninstall_output.strip(),
+        })
+    except Exception:
+        LOG.exception("handle_plugin_uninstall failed")
+        return web.json_response({"error": "internal error"}, status=500)
+
+
 @web.middleware
 async def exec_gate_middleware(request, handler):
     """Block /files, /exec, and /health when remote exec is disabled."""
@@ -366,4 +418,5 @@ def create_app() -> web.Application:
     # Always-on routes (plugin management)
     app.router.add_get("/plugins", handle_plugins)
     app.router.add_post("/plugins/reload", handle_plugins_reload)
+    app.router.add_post("/plugins/uninstall/{name}", handle_plugin_uninstall)
     return app
