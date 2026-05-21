@@ -297,7 +297,6 @@ def cmd_install(proxy_port, repo_url, plugin_name):
                 active = [p.get("hostname") for p in plugins_resp.get("plugins", [])]
                 if hostname in active:
                     print(f"\nPlugin '{manifest['name']}' installed and loaded!")
-                    print(f"Access via: curl --proxy socks5h://localhost:{proxy_port} http://{hostname}/")
                     _install_laptop_files(plugin_dir, plugin_name)
                 else:
                     print(f"\nPlugin '{manifest['name']}' files uploaded but failed to load.")
