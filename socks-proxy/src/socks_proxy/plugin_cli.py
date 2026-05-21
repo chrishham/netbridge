@@ -101,7 +101,7 @@ def _install_laptop_files(plugin_dir, plugin_name, bin_dir=None, config_dir=None
     skipped = []
 
     laptop_bin = laptop_dir / "bin"
-    if laptop_bin.is_dir():
+    if not laptop_bin.is_symlink() and laptop_bin.is_dir():
         bin_dir.mkdir(parents=True, exist_ok=True)
         for f in sorted(laptop_bin.iterdir()):
             if f.is_symlink():
@@ -112,10 +112,13 @@ def _install_laptop_files(plugin_dir, plugin_name, bin_dir=None, config_dir=None
                 dest.chmod(dest.stat().st_mode | 0o755)
                 installed.append(f"~/.local/bin/{f.name}")
 
-    env_template = laptop_dir / "config" / ".env.template"
-    if env_template.is_symlink():
-        env_template = None
-    if env_template and env_template.is_file():
+    config_dir_src = laptop_dir / "config"
+    env_template = None
+    if not config_dir_src.is_symlink() and config_dir_src.is_dir():
+        candidate = config_dir_src / ".env.template"
+        if not candidate.is_symlink() and candidate.is_file():
+            env_template = candidate
+    if env_template:
         env_dest_dir = config_dir / plugin_name
         env_dest = env_dest_dir / ".env"
         if env_dest.exists():

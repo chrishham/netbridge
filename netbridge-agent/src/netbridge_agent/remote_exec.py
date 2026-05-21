@@ -369,7 +369,7 @@ async def handle_plugin_uninstall(request: web.Request) -> web.Response:
         uninstall_output = ""
         uninstall_warning = ""
         uninstall_script = plugin_dir / "uninstall.py"
-        if uninstall_script.exists():
+        if not uninstall_script.is_symlink() and uninstall_script.exists():
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "python", str(uninstall_script),
