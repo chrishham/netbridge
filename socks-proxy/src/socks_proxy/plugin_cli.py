@@ -1,6 +1,7 @@
 """Plugin management CLI for NetBridge VDI plugins."""
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -83,6 +84,50 @@ def _clone_repo(repo_url):
     except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
+
+
+def _install_laptop_files(plugin_dir, plugin_name, bin_dir=None, config_dir=None):
+    """Install laptop-side files from plugin's laptop/ directory."""
+    laptop_dir = plugin_dir / "laptop"
+    if not laptop_dir.is_dir():
+        return
+
+    if bin_dir is None:
+        bin_dir = Path.home() / ".local" / "bin"
+    if config_dir is None:
+        config_dir = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+
+    installed = []
+    skipped = []
+
+    laptop_bin = laptop_dir / "bin"
+    if laptop_bin.is_dir():
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for f in sorted(laptop_bin.iterdir()):
+            if f.is_file() and not f.name.startswith("."):
+                dest = bin_dir / f.name
+                shutil.copy2(f, dest)
+                dest.chmod(dest.stat().st_mode | 0o755)
+                installed.append(f"~/.local/bin/{f.name}")
+
+    env_template = laptop_dir / "config" / ".env.template"
+    if env_template.is_file():
+        env_dest_dir = config_dir / plugin_name
+        env_dest = env_dest_dir / ".env"
+        if env_dest.exists():
+            skipped.append(f"~/.config/{plugin_name}/.env (already exists)")
+        else:
+            env_dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(env_template, env_dest)
+            installed.append(f"~/.config/{plugin_name}/.env (fill in your credentials)")
+
+    if installed or skipped:
+        print("  Laptop setup:")
+        for item in installed:
+            label = "Created" if ".env" in item else "Installed"
+            print(f"    {label}: {item}")
+        for item in skipped:
+            print(f"    Skipped: {item}")
 
 
 def cmd_list(proxy_port):
@@ -173,8 +218,10 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         for file_path in sorted(plugin_dir.rglob("*")):
             if file_path.is_symlink():
                 continue
+            rel_path = file_path.relative_to(plugin_dir)
+            if rel_path.parts[0] == "laptop":
+                continue
             if file_path.is_file() and not file_path.name.startswith("."):
-                rel_path = file_path.relative_to(plugin_dir)
                 remote_path = f"{remote_plugin_dir}\\{str(rel_path).replace('/', chr(92))}"
 
                 with open(file_path, "rb") as f:
@@ -212,6 +259,8 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         else:
             print(f"\nPlugin '{manifest['name']}' files uploaded but failed to load.")
             print("Check agent logs on VDI for details.")
+
+        _install_laptop_files(plugin_dir, plugin_name)
 
     finally:
         shutil.rmtree(repo_dir, ignore_errors=True)

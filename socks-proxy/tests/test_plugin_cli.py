@@ -7,7 +7,7 @@ import pytest
 
 from socks_proxy.plugin_cli import (
     cmd_list, cmd_install, cmd_uninstall, cmd_update, cmd_info,
-    _curl, _validate_plugin_name,
+    _curl, _validate_plugin_name, _install_laptop_files,
 )
 
 
@@ -178,6 +178,28 @@ class TestPluginInstall:
             with pytest.raises(PermissionError):
                 cmd_install(1080, "https://example.com/repo.git", "test")
 
+    def test_install_calls_laptop_files(self, tmp_path):
+        plugin_dir = tmp_path / "repo" / "test-plugin"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "manifest.json").write_text(json.dumps({
+            "name": "test", "hostname": "netbridge-test",
+            "description": "test plugin", "version": "1.0.0",
+            "entry_point": "handlers.py",
+        }))
+        (plugin_dir / "handlers.py").write_text("pass")
+
+        exec_resp = {"exit_code": 0, "stdout": "C:\\Users\\user\\AppData\\Local"}
+        ok_resp = {"status": "ok"}
+        reload_resp = {"status": "ok", "added": ["netbridge-test"], "removed": []}
+
+        with patch("socks_proxy.plugin_cli._clone_repo") as mock_clone, \
+             patch("socks_proxy.plugin_cli._curl") as mock_curl, \
+             patch("socks_proxy.plugin_cli._install_laptop_files") as mock_laptop:
+            mock_clone.return_value = tmp_path / "repo"
+            mock_curl.side_effect = [exec_resp, ok_resp, ok_resp, reload_resp]
+            cmd_install(1080, "https://example.com/repo.git", "test-plugin")
+            mock_laptop.assert_called_once_with(plugin_dir, "test-plugin")
+
 
 class TestPluginUninstall:
     def test_uninstall_calls_endpoint(self, capsys):
@@ -229,3 +251,96 @@ class TestPluginUpdate:
             cmd_update(1080, "nonexistent")
         out = capsys.readouterr().out
         assert "not found" in out.lower()
+
+
+class TestInstallLaptopFiles:
+    def test_copies_bin_files_and_makes_executable(self, tmp_path, capsys):
+        plugin_dir = tmp_path / "plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "laptop").mkdir()
+        (plugin_dir / "laptop" / "bin").mkdir()
+        (plugin_dir / "laptop" / "bin" / "glogin-auto").write_text("#!/bin/bash\necho test")
+
+        bin_dir = tmp_path / "bin"
+        config_dir = tmp_path / "config"
+
+        _install_laptop_files(plugin_dir, "gauth", bin_dir=bin_dir, config_dir=config_dir)
+
+        dest = bin_dir / "glogin-auto"
+        assert dest.exists()
+        assert dest.read_text() == "#!/bin/bash\necho test"
+        assert dest.stat().st_mode & 0o111 != 0
+
+        out = capsys.readouterr().out
+        assert "glogin-auto" in out
+
+    def test_creates_env_from_template_if_missing(self, tmp_path, capsys):
+        plugin_dir = tmp_path / "plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "laptop").mkdir()
+        (plugin_dir / "laptop" / "config").mkdir()
+        (plugin_dir / "laptop" / "config" / ".env.template").write_text("API_KEY=\nSECRET=\n")
+
+        bin_dir = tmp_path / "bin"
+        config_dir = tmp_path / "config"
+
+        _install_laptop_files(plugin_dir, "gauth", bin_dir=bin_dir, config_dir=config_dir)
+
+        env_file = config_dir / "gauth" / ".env"
+        assert env_file.exists()
+        assert env_file.read_text() == "API_KEY=\nSECRET=\n"
+
+        out = capsys.readouterr().out
+        assert "Created" in out
+        assert ".env" in out
+
+    def test_skips_env_if_already_exists(self, tmp_path, capsys):
+        plugin_dir = tmp_path / "plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "laptop").mkdir()
+        (plugin_dir / "laptop" / "config").mkdir()
+        (plugin_dir / "laptop" / "config" / ".env.template").write_text("API_KEY=\nSECRET=\n")
+
+        bin_dir = tmp_path / "bin"
+        config_dir = tmp_path / "config"
+        (config_dir / "gauth").mkdir(parents=True)
+        (config_dir / "gauth" / ".env").write_text("EXISTING=secret\n")
+
+        _install_laptop_files(plugin_dir, "gauth", bin_dir=bin_dir, config_dir=config_dir)
+
+        env_file = config_dir / "gauth" / ".env"
+        assert env_file.read_text() == "EXISTING=secret\n"
+
+        out = capsys.readouterr().out
+        assert "Skipped" in out
+        assert ".env" in out
+
+    def test_no_laptop_dir_is_silent(self, tmp_path, capsys):
+        plugin_dir = tmp_path / "plugin"
+        plugin_dir.mkdir()
+
+        bin_dir = tmp_path / "bin"
+        config_dir = tmp_path / "config"
+
+        _install_laptop_files(plugin_dir, "gauth", bin_dir=bin_dir, config_dir=config_dir)
+
+        out = capsys.readouterr().out
+        assert "Laptop setup" not in out
+
+    def test_multiple_bin_files(self, tmp_path):
+        plugin_dir = tmp_path / "plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "laptop").mkdir()
+        (plugin_dir / "laptop" / "bin").mkdir()
+        (plugin_dir / "laptop" / "bin" / "script1").write_text("#!/bin/bash\necho 1")
+        (plugin_dir / "laptop" / "bin" / "script2").write_text("#!/bin/bash\necho 2")
+
+        bin_dir = tmp_path / "bin"
+        config_dir = tmp_path / "config"
+
+        _install_laptop_files(plugin_dir, "gauth", bin_dir=bin_dir, config_dir=config_dir)
+
+        assert (bin_dir / "script1").exists()
+        assert (bin_dir / "script2").exists()
+        assert (bin_dir / "script1").stat().st_mode & 0o111 != 0
+        assert (bin_dir / "script2").stat().st_mode & 0o111 != 0
