@@ -41,11 +41,17 @@ def _curl(method, path, proxy_port=1080, json_body=None, data=None, timeout=30):
         stderr = result.stderr.decode(errors="replace").strip()
         stdout = result.stdout.decode(errors="replace").strip()
         detail = stderr or stdout
+        if "403" in detail:
+            raise PermissionError(
+                "Remote exec is disabled — enable it from the VDI system tray"
+            )
         raise ConnectionError(f"Request failed: {detail}")
     if not result.stdout:
         return {}
     resp = json.loads(result.stdout)
     if "error" in resp:
+        if "disabled" in resp["error"].lower() and "tray" in resp["error"].lower():
+            raise PermissionError(resp["error"])
         raise RuntimeError(f"Agent error: {resp['error']}")
     return resp
 
@@ -112,6 +118,9 @@ def cmd_info(proxy_port, plugin_name):
     print(f"Version:     {plugin.get('version', '?')}")
     print(f"Hostname:    {plugin.get('hostname', '?')}")
     print(f"Description: {plugin.get('description', '')}")
+    repo = plugin.get("repo_url", "")
+    if repo:
+        print(f"Repository:  {repo}")
 
 
 def cmd_install(proxy_port, repo_url, plugin_name):
@@ -147,6 +156,11 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         hostname = manifest["hostname"]
         if not hostname.startswith("netbridge-"):
             raise ValueError(f"hostname must start with 'netbridge-', got '{hostname}'")
+
+        # Store repo_url in manifest for later updates
+        manifest["repo_url"] = repo_url
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
 
         print(f"Installing plugin '{manifest['name']}' v{manifest['version']}...")
 
@@ -204,53 +218,39 @@ def cmd_uninstall(proxy_port, plugin_name):
     """Uninstall a plugin from VDI."""
     _validate_plugin_name(plugin_name)
 
-    remote_base = _get_remote_plugins_dir(proxy_port)
-    remote_path = f"{remote_base}\\{plugin_name}"
+    print(f"Uninstalling plugin '{plugin_name}'...")
+    response = _curl("POST", f"/plugins/uninstall/{quote(plugin_name, safe='')}", proxy_port)
 
-    try:
-        list_response = _curl("GET", f"/files?dir={quote(remote_path, safe='')}", proxy_port)
-    except (ConnectionError, RuntimeError) as e:
-        err = str(e).lower()
-        if "404" in err or "not found" in err or "directory not found" in err:
-            print(f"Plugin '{plugin_name}' not found on VDI.")
-            return
-        raise
+    output = response.get("uninstall_output", "").strip()
+    if output:
+        print(f"  {output}")
 
-    entries = list_response.get("entries", [])
-
-    if any(e.get("name") == "uninstall.py" for e in entries):
-        print(f"Running uninstall.py for '{plugin_name}'...")
-        uninstall_script = f"{remote_path}\\uninstall.py"
-        try:
-            exec_response = _curl(
-                "POST", "/exec", proxy_port,
-                json_body={
-                    "cmd": f'python "{uninstall_script}"',
-                    "cwd": remote_path,
-                    "timeout": 300,
-                },
-                timeout=300,
-            )
-            if exec_response.get("exit_code") != 0:
-                print(f"  Warning: uninstall.py exited with code {exec_response.get('exit_code')}")
-        except Exception as e:
-            print(f"  Warning: uninstall.py failed: {e}")
-
-    print("Removing plugin directory...")
-    _curl("DELETE", f"/files/{quote(remote_path, safe='')}", proxy_port)
-
-    print("Reloading plugins...")
-    reload_response = _curl("POST", "/plugins/reload", proxy_port)
-
+    removed = response.get("removed", [])
     print(f"\nPlugin '{plugin_name}' uninstalled.")
-    if reload_response.get("removed"):
-        print(f"Removed: {', '.join(reload_response['removed'])}")
+    if removed:
+        print(f"Removed: {', '.join(removed)}")
 
 
-def cmd_update(proxy_port, repo_url, plugin_name):
-    """Update a plugin by reinstalling from repository."""
+def cmd_update(proxy_port, plugin_name):
+    """Update a plugin using the repo_url stored in its manifest."""
     _validate_plugin_name(plugin_name)
-    print(f"Updating plugin '{plugin_name}'...")
+
+    # Get repo_url from installed manifest
+    response = _curl("GET", "/plugins", proxy_port)
+    plugins = response.get("plugins", [])
+    plugin = next((p for p in plugins if p.get("name") == plugin_name), None)
+
+    if not plugin:
+        print(f"Plugin '{plugin_name}' not found.")
+        return
+
+    repo_url = plugin.get("repo_url", "")
+    if not repo_url:
+        print(f"Plugin '{plugin_name}' has no repo_url stored.")
+        print("Use 'netbridge-socks plugin install <repo_url> <name>' instead.")
+        return
+
+    print(f"Updating plugin '{plugin_name}' from {repo_url}...")
     cmd_uninstall(proxy_port, plugin_name)
     print()
     cmd_install(proxy_port, repo_url, plugin_name)
@@ -273,8 +273,7 @@ def add_plugin_subparser(subparsers):
     uninstall_p = plugin_sub.add_parser("uninstall", help="Uninstall a plugin from VDI")
     uninstall_p.add_argument("plugin_name", help="Plugin name to uninstall")
 
-    update_p = plugin_sub.add_parser("update", help="Update a plugin (reinstall from repo)")
-    update_p.add_argument("repo_url", help="Git repo URL")
+    update_p = plugin_sub.add_parser("update", help="Update a plugin from its stored repo")
     update_p.add_argument("plugin_name", help="Plugin name to update")
 
     info_p = plugin_sub.add_parser("info", help="Show plugin details")
@@ -303,12 +302,15 @@ def plugin_main(args):
         elif args.plugin_command == "uninstall":
             cmd_uninstall(args.proxy_port, args.plugin_name)
         elif args.plugin_command == "update":
-            cmd_update(args.proxy_port, args.repo_url, args.plugin_name)
+            cmd_update(args.proxy_port, args.plugin_name)
         elif args.plugin_command == "info":
             cmd_info(args.proxy_port, args.plugin_name)
+    except PermissionError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     except ConnectionError as e:
         print(f"Error: {e}")
-        print("Make sure netbridge-socks proxy is running and remote exec is enabled on the VDI.")
+        print("Make sure netbridge-socks proxy is running and the VDI agent is connected.")
         sys.exit(1)
     except Exception as e:
         print(f"Error: {e}")
