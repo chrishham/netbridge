@@ -357,6 +357,7 @@ async def handle_plugin_uninstall(request: web.Request) -> web.Response:
             )
 
         uninstall_output = ""
+        uninstall_warning = ""
         uninstall_script = plugin_dir / "uninstall.py"
         if uninstall_script.exists():
             try:
@@ -370,8 +371,12 @@ async def handle_plugin_uninstall(request: web.Request) -> web.Response:
                     proc.communicate(), timeout=60
                 )
                 uninstall_output = stdout.decode(errors="replace")
+                if proc.returncode != 0:
+                    uninstall_warning = f"uninstall.py exited with code {proc.returncode}"
+                    LOG.warning("uninstall.py for %s: %s", name, uninstall_warning)
             except Exception as e:
-                LOG.warning("uninstall.py for %s failed: %s", name, e)
+                uninstall_warning = f"uninstall.py failed: {e}"
+                LOG.warning("uninstall.py for %s: %s", name, e)
 
         shutil.rmtree(plugin_dir)
         LOG.info("Deleted plugin directory: %s", plugin_dir)
@@ -381,11 +386,14 @@ async def handle_plugin_uninstall(request: web.Request) -> web.Response:
         if reload_fn:
             added, removed = await reload_fn()
 
-        return web.json_response({
+        resp = {
             "status": "ok",
             "removed": removed,
             "uninstall_output": uninstall_output.strip(),
-        })
+        }
+        if uninstall_warning:
+            resp["warning"] = uninstall_warning
+        return web.json_response(resp)
     except Exception:
         LOG.exception("handle_plugin_uninstall failed")
         return web.json_response({"error": "internal error"}, status=500)

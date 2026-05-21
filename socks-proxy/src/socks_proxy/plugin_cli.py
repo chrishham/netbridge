@@ -157,8 +157,11 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         if not hostname.startswith("netbridge-"):
             raise ValueError(f"hostname must start with 'netbridge-', got '{hostname}'")
 
-        # Store repo_url in manifest for later updates
-        manifest["repo_url"] = repo_url
+        # Store repo_url in manifest for later updates (strip credentials)
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(repo_url)
+        safe_url = urlunparse(parsed._replace(netloc=parsed.hostname or parsed.netloc))
+        manifest["repo_url"] = safe_url
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
 
@@ -219,7 +222,14 @@ def cmd_uninstall(proxy_port, plugin_name):
     _validate_plugin_name(plugin_name)
 
     print(f"Uninstalling plugin '{plugin_name}'...")
-    response = _curl("POST", f"/plugins/uninstall/{quote(plugin_name, safe='')}", proxy_port)
+    try:
+        response = _curl("POST", f"/plugins/uninstall/{quote(plugin_name, safe='')}", proxy_port)
+    except (ConnectionError, RuntimeError) as e:
+        err = str(e).lower()
+        if "404" in err or "not found" in err:
+            print(f"Plugin '{plugin_name}' not found on VDI.")
+            return
+        raise
 
     output = response.get("uninstall_output", "").strip()
     if output:
