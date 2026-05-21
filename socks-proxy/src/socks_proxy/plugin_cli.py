@@ -138,6 +138,18 @@ def _install_laptop_files(plugin_dir, plugin_name, bin_dir=None, config_dir=None
         for item in skipped:
             print(f"    Skipped: {item}")
 
+        env_items = [i for i in installed if ".env" in i]
+        bin_items = [i for i in installed if ".env" not in i]
+        if env_items or bin_items:
+            print(f"\n  Next steps:")
+            if env_items:
+                env_path = f"~/.config/{plugin_name}/.env"
+                print(f"    1. Edit {env_path} and fill in your credentials")
+            if bin_items:
+                cmd = bin_items[0].split("/")[-1]
+                step = "2" if env_items else "1"
+                print(f"\n    {step}. Run:\n\n       {cmd}\n")
+
 
 def cmd_list(proxy_port):
     """List installed plugins on VDI."""
@@ -276,7 +288,6 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         added = reload_response.get("added", [])
         if hostname in added:
             print(f"\nPlugin '{manifest['name']}' installed and loaded!")
-            print(f"Access via: curl --proxy socks5h://localhost:{proxy_port} http://{hostname}/")
             _install_laptop_files(plugin_dir, plugin_name)
         else:
             # Plugin may already have been loaded (reinstall/update case) —
