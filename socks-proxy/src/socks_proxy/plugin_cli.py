@@ -89,7 +89,7 @@ def _clone_repo(repo_url):
 def _install_laptop_files(plugin_dir, plugin_name, bin_dir=None, config_dir=None):
     """Install laptop-side files from plugin's laptop/ directory."""
     laptop_dir = plugin_dir / "laptop"
-    if not laptop_dir.is_dir():
+    if laptop_dir.is_symlink() or not laptop_dir.is_dir():
         return
 
     if bin_dir is None:
@@ -194,6 +194,8 @@ def cmd_install(proxy_port, repo_url, plugin_name):
             )
 
         manifest_path = plugin_dir / "manifest.json"
+        if manifest_path.is_symlink():
+            raise ValueError("manifest.json is a symlink — rejected")
         if not manifest_path.exists():
             raise FileNotFoundError(f"manifest.json not found in {plugin_name}/")
 
