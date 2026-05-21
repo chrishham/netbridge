@@ -202,13 +202,16 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         if not hostname.startswith("netbridge-"):
             raise ValueError(f"hostname must start with 'netbridge-', got '{hostname}'")
 
-        # Store repo_url in manifest for later updates (strip credentials but keep port)
+        # Store repo_url in manifest for later updates (strip tokens, keep git@ and port)
         from urllib.parse import urlparse, urlunparse
         parsed = urlparse(repo_url)
-        host = parsed.hostname or parsed.netloc
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
-        safe_url = urlunparse(parsed._replace(netloc=host))
+        if parsed.password:
+            host = parsed.hostname or parsed.netloc
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            safe_url = urlunparse(parsed._replace(netloc=host))
+        else:
+            safe_url = repo_url
         manifest["repo_url"] = safe_url
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
