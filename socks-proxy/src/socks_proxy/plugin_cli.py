@@ -104,6 +104,8 @@ def _install_laptop_files(plugin_dir, plugin_name, bin_dir=None, config_dir=None
     if laptop_bin.is_dir():
         bin_dir.mkdir(parents=True, exist_ok=True)
         for f in sorted(laptop_bin.iterdir()):
+            if f.is_symlink():
+                continue
             if f.is_file() and not f.name.startswith("."):
                 dest = bin_dir / f.name
                 shutil.copy2(f, dest)
@@ -111,7 +113,9 @@ def _install_laptop_files(plugin_dir, plugin_name, bin_dir=None, config_dir=None
                 installed.append(f"~/.local/bin/{f.name}")
 
     env_template = laptop_dir / "config" / ".env.template"
-    if env_template.is_file():
+    if env_template.is_symlink():
+        env_template = None
+    if env_template and env_template.is_file():
         env_dest_dir = config_dir / plugin_name
         env_dest = env_dest_dir / ".env"
         if env_dest.exists():
@@ -334,7 +338,13 @@ def cmd_update(proxy_port, plugin_name):
     print(f"Updating plugin '{plugin_name}' from {repo_url}...")
     cmd_uninstall(proxy_port, plugin_name)
     print()
-    cmd_install(proxy_port, repo_url, plugin_name)
+    try:
+        cmd_install(proxy_port, repo_url, plugin_name)
+    except Exception as e:
+        print(f"\nReinstall failed: {e}")
+        print(f"The plugin was uninstalled. To restore it manually:")
+        print(f"  netbridge-socks plugin install {repo_url} {plugin_name}")
+        raise
 
 
 def add_plugin_subparser(subparsers):
