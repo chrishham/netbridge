@@ -351,9 +351,19 @@ async def handle_plugin_uninstall(request: web.Request) -> web.Response:
         plugins_dir = _get_plugins_dir()
         plugin_dir = plugins_dir / name
 
-        if not plugin_dir.is_dir():
+        if plugin_dir.is_symlink() or not plugin_dir.is_dir():
+            if plugin_dir.is_symlink():
+                return web.json_response(
+                    {"error": "invalid plugin directory"}, status=400
+                )
             return web.json_response(
                 {"error": f"plugin '{name}' not found"}, status=404
+            )
+
+        resolved = plugin_dir.resolve()
+        if not str(resolved).startswith(str(plugins_dir.resolve())):
+            return web.json_response(
+                {"error": "invalid plugin directory"}, status=400
             )
 
         uninstall_output = ""
@@ -374,6 +384,14 @@ async def handle_plugin_uninstall(request: web.Request) -> web.Response:
                 if proc.returncode != 0:
                     uninstall_warning = f"uninstall.py exited with code {proc.returncode}"
                     LOG.warning("uninstall.py for %s: %s", name, uninstall_warning)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+                uninstall_warning = "uninstall.py timed out after 60s"
+                LOG.warning("uninstall.py for %s: timed out", name)
             except Exception as e:
                 uninstall_warning = f"uninstall.py failed: {e}"
                 LOG.warning("uninstall.py for %s: %s", name, e)

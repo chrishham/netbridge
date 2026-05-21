@@ -202,10 +202,13 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         if not hostname.startswith("netbridge-"):
             raise ValueError(f"hostname must start with 'netbridge-', got '{hostname}'")
 
-        # Store repo_url in manifest for later updates (strip credentials)
+        # Store repo_url in manifest for later updates (strip credentials but keep port)
         from urllib.parse import urlparse, urlunparse
         parsed = urlparse(repo_url)
-        safe_url = urlunparse(parsed._replace(netloc=parsed.hostname or parsed.netloc))
+        host = parsed.hostname or parsed.netloc
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        safe_url = urlunparse(parsed._replace(netloc=host))
         manifest["repo_url"] = safe_url
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
@@ -308,6 +311,15 @@ def cmd_update(proxy_port, plugin_name):
         print(f"Plugin '{plugin_name}' has no repo_url stored.")
         print("Use 'netbridge-socks plugin install <repo_url> <name>' instead.")
         return
+
+    # Verify remote exec is available before uninstalling — otherwise
+    # uninstall succeeds but reinstall fails, leaving the plugin removed.
+    try:
+        _curl("POST", "/exec", proxy_port, json_body={"cmd": "echo ok"})
+    except PermissionError:
+        raise
+    except ConnectionError:
+        raise
 
     print(f"Updating plugin '{plugin_name}' from {repo_url}...")
     cmd_uninstall(proxy_port, plugin_name)
