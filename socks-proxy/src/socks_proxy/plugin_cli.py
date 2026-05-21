@@ -279,8 +279,21 @@ def cmd_install(proxy_port, repo_url, plugin_name):
             print(f"Access via: curl --proxy socks5h://localhost:{proxy_port} http://{hostname}/")
             _install_laptop_files(plugin_dir, plugin_name)
         else:
-            print(f"\nPlugin '{manifest['name']}' files uploaded but failed to load.")
-            print("Check agent logs on VDI for details.")
+            # Plugin may already have been loaded (reinstall/update case) —
+            # verify it's actually running before reporting failure.
+            try:
+                plugins_resp = _curl("GET", "/plugins", proxy_port)
+                active = [p.get("hostname") for p in plugins_resp.get("plugins", [])]
+                if hostname in active:
+                    print(f"\nPlugin '{manifest['name']}' installed and loaded!")
+                    print(f"Access via: curl --proxy socks5h://localhost:{proxy_port} http://{hostname}/")
+                    _install_laptop_files(plugin_dir, plugin_name)
+                else:
+                    print(f"\nPlugin '{manifest['name']}' files uploaded but failed to load.")
+                    print("Check agent logs on VDI for details.")
+            except Exception:
+                print(f"\nPlugin '{manifest['name']}' files uploaded but failed to load.")
+                print("Check agent logs on VDI for details.")
 
     finally:
         shutil.rmtree(repo_dir, ignore_errors=True)
