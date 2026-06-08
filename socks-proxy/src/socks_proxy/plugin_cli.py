@@ -189,12 +189,20 @@ def cmd_info(proxy_port, plugin_name):
         print(f"Repository:  {repo}")
 
 
-def cmd_install(proxy_port, repo_url, plugin_name):
+def cmd_install(proxy_port, repo_url, plugin_name, laptop_only=False):
     """Install a plugin from a git repository."""
     _validate_plugin_name(plugin_name)
 
-    print(f"Cloning {repo_url}...")
-    repo_dir = _clone_repo(repo_url)
+    local_path = Path(repo_url).expanduser()
+    is_local = local_path.is_dir()
+
+    if is_local:
+        repo_dir = local_path
+        cloned = False
+    else:
+        print(f"Cloning {repo_url}...")
+        repo_dir = _clone_repo(repo_url)
+        cloned = True
 
     try:
         plugin_dir = repo_dir / plugin_name
@@ -224,6 +232,10 @@ def cmd_install(proxy_port, repo_url, plugin_name):
         hostname = manifest["hostname"]
         if not hostname.startswith("netbridge-"):
             raise ValueError(f"hostname must start with 'netbridge-', got '{hostname}'")
+
+        if laptop_only:
+            _install_laptop_files(plugin_dir, plugin_name)
+            return
 
         # Store repo_url in manifest for later updates (strip credentials)
         from urllib.parse import urlparse, urlunparse
@@ -306,7 +318,8 @@ def cmd_install(proxy_port, repo_url, plugin_name):
                 print("Check agent logs on VDI for details.")
 
     finally:
-        shutil.rmtree(repo_dir, ignore_errors=True)
+        if cloned:
+            shutil.rmtree(repo_dir, ignore_errors=True)
 
 
 def cmd_uninstall(proxy_port, plugin_name):
@@ -388,8 +401,12 @@ def add_plugin_subparser(subparsers):
     plugin_sub.add_parser("list", help="List installed plugins on VDI")
 
     install_p = plugin_sub.add_parser("install", help="Install a plugin from a git repo")
-    install_p.add_argument("repo_url", help="Git repo URL")
+    install_p.add_argument("repo_url", help="Git repo URL or local path")
     install_p.add_argument("plugin_name", help="Plugin directory name in the repo")
+    install_p.add_argument(
+        "--laptop-only", action="store_true",
+        help="Only install laptop-side files (CLI tools, config) — skip VDI deployment",
+    )
 
     uninstall_p = plugin_sub.add_parser("uninstall", help="Uninstall a plugin from VDI")
     uninstall_p.add_argument("plugin_name", help="Plugin name to uninstall")
@@ -419,7 +436,7 @@ def plugin_main(args):
         if args.plugin_command == "list":
             cmd_list(args.proxy_port)
         elif args.plugin_command == "install":
-            cmd_install(args.proxy_port, args.repo_url, args.plugin_name)
+            cmd_install(args.proxy_port, args.repo_url, args.plugin_name, args.laptop_only)
         elif args.plugin_command == "uninstall":
             cmd_uninstall(args.proxy_port, args.plugin_name)
         elif args.plugin_command == "update":
