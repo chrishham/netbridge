@@ -27,7 +27,7 @@ from .config import get_app_dir
 
 LOG = logging.getLogger(__name__)
 
-_50_MB = 50 * 1024 * 1024
+_500_MB = 500 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +432,7 @@ async def exec_gate_middleware(request, handler):
 
 def create_app() -> web.Application:
     """Create and return the aiohttp application with all routes."""
-    app = web.Application(client_max_size=_50_MB, middlewares=[exec_gate_middleware])
+    app = web.Application(client_max_size=_500_MB, middlewares=[exec_gate_middleware])
     # Gated routes (require remote exec toggle)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/files", handle_file_list)
