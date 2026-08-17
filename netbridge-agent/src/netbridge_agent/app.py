@@ -573,7 +573,6 @@ class NetBridgeApp:
 
     async def _do_update(self) -> None:
         """Download and apply the update."""
-        import aiohttp
         from .updater import check_for_update, download_update
         from .installer import Installer, get_installed_exe_path
         from .config import get_app_dir
