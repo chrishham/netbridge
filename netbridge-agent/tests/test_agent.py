@@ -10,12 +10,13 @@ import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from netbridge_agent.agent import (
     AgentState,
     StreamInfo,
-    get_proxy_auth,
+    get_proxy_auth_header,
     handle_message,
     handle_tcp_close,
     handle_tcp_data,
@@ -237,36 +238,32 @@ class TestAgentState:
 
 
 # ---------------------------------------------------------------------------
-# get_proxy_auth
+# get_proxy_auth_header
 # ---------------------------------------------------------------------------
 
 
-class TestGetProxyAuth:
+class TestGetProxyAuthHeader:
     def test_cli_user_takes_precedence(self):
-        auth = get_proxy_auth("http://other:pass@proxy:8080", "cli_user", "cli_pass")
-        assert auth.login == "cli_user"
-        assert auth.password == "cli_pass"
+        header = get_proxy_auth_header("http://other:pass@proxy:8080", "cli_user", "cli_pass")
+        assert header == aiohttp.encode_basic_auth("cli_user", "cli_pass")
 
     def test_cli_user_empty_password(self):
-        auth = get_proxy_auth(None, "user", None)
-        assert auth.login == "user"
-        assert auth.password == ""
+        header = get_proxy_auth_header(None, "user", None)
+        assert header == aiohttp.encode_basic_auth("user", "")
 
     def test_proxy_url_credentials(self):
-        auth = get_proxy_auth("http://user:pass@proxy:8080", None, None)
-        assert auth.login == "user"
-        assert auth.password == "pass"
+        header = get_proxy_auth_header("http://user:pass@proxy:8080", None, None)
+        assert header == aiohttp.encode_basic_auth("user", "pass")
 
     def test_proxy_url_user_no_password(self):
-        auth = get_proxy_auth("http://user@proxy:8080", None, None)
-        assert auth.login == "user"
-        assert auth.password == ""
+        header = get_proxy_auth_header("http://user@proxy:8080", None, None)
+        assert header == aiohttp.encode_basic_auth("user", "")
 
     def test_no_auth_returns_none(self):
-        assert get_proxy_auth(None, None, None) is None
+        assert get_proxy_auth_header(None, None, None) is None
 
     def test_proxy_url_no_credentials_returns_none(self):
-        assert get_proxy_auth("http://proxy:8080", None, None) is None
+        assert get_proxy_auth_header("http://proxy:8080", None, None) is None
 
 
 # ---------------------------------------------------------------------------
