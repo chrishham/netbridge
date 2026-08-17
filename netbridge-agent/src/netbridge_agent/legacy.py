@@ -140,13 +140,13 @@ def get_system_proxy() -> str | None:
     return proxies.get("https") or proxies.get("http")
 
 
-def get_proxy_auth(proxy_url: str | None, cli_user: str | None, cli_pass: str | None) -> aiohttp.BasicAuth | None:
+def get_proxy_auth_header(proxy_url: str | None, cli_user: str | None, cli_pass: str | None) -> str | None:
     if cli_user:
-        return aiohttp.BasicAuth(cli_user, cli_pass or "")
+        return aiohttp.encode_basic_auth(cli_user, cli_pass or "")
     if proxy_url:
         parsed = urlparse(proxy_url)
         if parsed.username:
-            return aiohttp.BasicAuth(parsed.username, parsed.password or "")
+            return aiohttp.encode_basic_auth(parsed.username, parsed.password or "")
     return None
 
 
@@ -532,7 +532,7 @@ async def heartbeat_sender(ws, stop_event: asyncio.Event, liveness_tracker: dict
 async def connect_and_run(
     relay_url: str,
     proxy: str | None,
-    proxy_auth: aiohttp.BasicAuth | None,
+    proxy_auth_header: str | None,
     auth_token: str | None,
     stop_event: asyncio.Event,
 ):
@@ -540,12 +540,13 @@ async def connect_and_run(
     session_id = get_session_id()
     headers = build_auth_headers(session_id, auth_token)
     timeout = create_tunnel_timeout()
+    proxy_headers = {"Proxy-Authorization": proxy_auth_header} if proxy_auth_header else None
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async with session.ws_connect(
             relay_url,
             proxy=proxy,
-            proxy_auth=proxy_auth,
+            proxy_headers=proxy_headers,
             heartbeat=HEARTBEAT_INTERVAL,
             headers=headers,
         ) as ws:
@@ -652,9 +653,9 @@ async def async_main(
     else:
         print(f"[{ts()}] [*] Relay connection: direct (no proxy)")
 
-    proxy_auth = get_proxy_auth(proxy, proxy_user, proxy_pass)
-    if proxy_auth:
-        print(f"[{ts()}] [*] Relay proxy auth: {proxy_auth.login}")
+    proxy_auth_header = get_proxy_auth_header(proxy, proxy_user, proxy_pass)
+    if proxy_auth_header:
+        print(f"[{ts()}] [*] Relay proxy auth: configured")
 
     print(f"[{ts()}] [*] Relay: {relay_url}")
     print(f"[{ts()}] [*] Heartbeat interval: {HEARTBEAT_INTERVAL}s")
@@ -702,7 +703,7 @@ async def async_main(
 
             connection_succeeded = False
             try:
-                await connect_and_run(relay_url, proxy, proxy_auth, token_holder.get(), _stop_event)
+                await connect_and_run(relay_url, proxy, proxy_auth_header, token_holder.get(), _stop_event)
                 if _stop_event.is_set():
                     break
                 print(f"[{ts()}] [*] Connection ended normally")

@@ -236,14 +236,14 @@ def get_system_proxy() -> Optional[str]:
     return proxies.get("https") or proxies.get("http")
 
 
-def get_proxy_auth(proxy_url: Optional[str], cli_user: Optional[str], cli_pass: Optional[str]) -> Optional[aiohttp.BasicAuth]:
-    """Get proxy authentication."""
+def get_proxy_auth_header(proxy_url: Optional[str], cli_user: Optional[str], cli_pass: Optional[str]) -> Optional[str]:
+    """Get proxy authentication as an encoded Proxy-Authorization header value."""
     if cli_user:
-        return aiohttp.BasicAuth(cli_user, cli_pass or "")
+        return aiohttp.encode_basic_auth(cli_user, cli_pass or "")
     if proxy_url:
         parsed = urlparse(proxy_url)
         if parsed.username:
-            return aiohttp.BasicAuth(parsed.username, parsed.password or "")
+            return aiohttp.encode_basic_auth(parsed.username, parsed.password or "")
     return None
 
 
@@ -698,7 +698,7 @@ async def connect_and_run(
     state: AgentState,
     relay_url: str,
     proxy: Optional[str],
-    proxy_auth: Optional[aiohttp.BasicAuth],
+    proxy_auth_header: Optional[str],
     auth_token: Optional[str],
     stop_event: asyncio.Event,
     on_status_change: Optional[StatusCallback],
@@ -712,12 +712,13 @@ async def connect_and_run(
     session_id = get_session_id()
     headers = build_auth_headers(session_id, auth_token)
     timeout = create_tunnel_timeout()
+    proxy_headers = {"Proxy-Authorization": proxy_auth_header} if proxy_auth_header else None
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async with session.ws_connect(
             relay_url,
             proxy=proxy,
-            proxy_auth=proxy_auth,
+            proxy_headers=proxy_headers,
             heartbeat=HEARTBEAT_INTERVAL,
             headers=headers,
         ) as ws:
@@ -872,7 +873,7 @@ async def run_agent(
     proxy = get_system_proxy()
     if proxy:
         logger.info(f"Relay proxy: {redact_proxy_url(proxy)}")
-    proxy_auth = get_proxy_auth(proxy, None, None)
+    proxy_auth_header = get_proxy_auth_header(proxy, None, None)
 
     # Token holder for refresh
     token_holder = TokenHolder(auth_token, token_refresh)
@@ -906,7 +907,7 @@ async def run_agent(
                     on_status_change(False, False)  # Connecting
 
                 success = await connect_and_run(
-                    state, relay_url, proxy, proxy_auth,
+                    state, relay_url, proxy, proxy_auth_header,
                     token_holder.get(), stop_event,
                     on_status_change, on_session_info,
                 )

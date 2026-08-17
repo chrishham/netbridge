@@ -11,7 +11,7 @@ import pytest
 
 from netbridge_agent.legacy import (
     StreamInfo,
-    get_proxy_auth,
+    get_proxy_auth_header,
     get_system_proxy,
     handle_message,
     handle_tcp_close,
@@ -62,38 +62,34 @@ class TestGetSystemProxy:
 
 
 # ---------------------------------------------------------------------------
-# get_proxy_auth
+# get_proxy_auth_header
 # ---------------------------------------------------------------------------
-class TestGetProxyAuth:
-    """Tests for get_proxy_auth()."""
+class TestGetProxyAuthHeader:
+    """Tests for get_proxy_auth_header()."""
 
     def test_cli_credentials(self):
         """CLI user/pass takes precedence."""
-        result = get_proxy_auth("http://proxy:8080", "user", "pass")
-        assert isinstance(result, aiohttp.BasicAuth)
-        assert result.login == "user"
-        assert result.password == "pass"
+        result = get_proxy_auth_header("http://proxy:8080", "user", "pass")
+        assert result == aiohttp.encode_basic_auth("user", "pass")
 
     def test_cli_user_no_pass(self):
         """CLI user with no password uses empty string."""
-        result = get_proxy_auth(None, "user", None)
-        assert result.login == "user"
-        assert result.password == ""
+        result = get_proxy_auth_header(None, "user", None)
+        assert result == aiohttp.encode_basic_auth("user", "")
 
     def test_url_credentials(self):
         """Extracts credentials from proxy URL."""
-        result = get_proxy_auth("http://user:secret@proxy:8080", None, None)
-        assert result.login == "user"
-        assert result.password == "secret"
+        result = get_proxy_auth_header("http://user:secret@proxy:8080", None, None)
+        assert result == aiohttp.encode_basic_auth("user", "secret")
 
     def test_no_credentials(self):
         """Returns None when no credentials available."""
-        result = get_proxy_auth("http://proxy:8080", None, None)
+        result = get_proxy_auth_header("http://proxy:8080", None, None)
         assert result is None
 
     def test_no_proxy_no_cli(self):
         """Returns None with no proxy URL and no CLI credentials."""
-        result = get_proxy_auth(None, None, None)
+        result = get_proxy_auth_header(None, None, None)
         assert result is None
 
 
