@@ -4,6 +4,7 @@ version = "0.0.0"  # placeholder — CI injects from git tag
 description = "Windows tray application for NetBridge SOCKS proxy"
 requires-python = ">=3.14"
 dependencies = [
+    "aiohttp>=3.14.3",
     "netbridge-socks",
     "packaging>=24.0",
     "Pillow>=12.3.0",
@@ -24,4 +25,8 @@ constraint-dependencies = ["setuptools>=83.0.0"]
 dev = [
     "pyinstaller>=6.18.0",
     "pytest>=9.0.3",
+    "pytest-asyncio>=0.24.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

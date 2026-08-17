@@ -85,6 +85,11 @@ class TrayIcon:
             self._icon.icon = self._icon_cache[status]
             self._icon.title = STATUS_TOOLTIPS[status]
 
+    def update_menu(self) -> None:
+        """Force menu refresh (e.g., after update becomes available)."""
+        if self._icon:
+            self._icon.update_menu()
+
     def show_notification(self, title: str, message: str) -> None:
         """Show a Windows notification."""
         if self._icon and self.app.config.show_notifications:
@@ -119,6 +124,14 @@ class TrayIcon:
 
         def on_view_logs(icon, item):
             self._open_logs()
+
+        def on_check_update(icon, item):
+            self.app.request_check_update()
+
+        def get_update_label(item):
+            if self.app._available_update:
+                return f"Update to v{self.app._available_update.version}"
+            return "Check for Updates"
 
         def on_install(icon, item):
             self.app.request_install()
@@ -169,6 +182,10 @@ class TrayIcon:
             pystray.MenuItem(
                 "View Logs",
                 on_view_logs,
+            ),
+            pystray.MenuItem(
+                get_update_label,
+                on_check_update,
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(

@@ -99,7 +99,7 @@ The tray icon shows connection status:
 
     # Handle import check (CI smoke test for bundled modules)
     if args.import_check:
-        from . import app, config, dialogs, installer, tray  # noqa: F401
+        from . import app, config, dialogs, installer, tray, updater  # noqa: F401
         from socks_proxy import socks5, http_proxy, tunnel, auth  # noqa: F401
         print(f"{APP_NAME} v{APP_VERSION}: all modules imported OK")
         dialogs.verify_bindings()

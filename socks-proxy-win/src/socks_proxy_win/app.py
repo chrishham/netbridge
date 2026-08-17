@@ -12,12 +12,18 @@ import asyncio
 import ctypes
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from .config import Config, ensure_app_dirs, get_log_path, APP_NAME, APP_VERSION
+import aiohttp
+
+if TYPE_CHECKING:
+    from .updater import UpdateInfo
+
+from .config import Config, ensure_app_dirs, get_log_path, get_app_dir, APP_NAME, APP_VERSION
 from .tray import TrayIcon, Status
 
 logger = logging.getLogger(__name__)
@@ -76,6 +82,9 @@ class NetBridgeSocksApp:
 
         # Pending requests from tray menu (thread-safe)
         self._pending_exit = threading.Event()
+
+        # Auto-update state
+        self._available_update: Optional["UpdateInfo"] = None
 
         logger.info(f"{APP_NAME} v{APP_VERSION} starting")
 
@@ -204,6 +213,103 @@ class NetBridgeSocksApp:
         if self.tray:
             self.tray.stop()
 
+    def request_restart(self) -> None:
+        """Restart the application by launching a new process and exiting."""
+        from .installer import get_exe_path
+
+        target_exe = get_exe_path()
+        logger.info(f"Restarting: {target_exe}")
+        try:
+            subprocess.Popen(
+                [str(target_exe), "--no-install"],
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+            )
+        except OSError:
+            logger.exception("Failed to launch new process")
+            return
+
+        self._pending_exit.set()
+        if self._async_loop and self._stop_event:
+            self._async_loop.call_soon_threadsafe(self._stop_event.set)
+
+        if self.tray:
+            self.tray.stop()
+
+    def request_check_update(self) -> None:
+        """Check for updates and apply if available (from tray menu)."""
+        if self._async_loop:
+            self._async_loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._do_update())
+            )
+
+    async def _check_for_update(self) -> None:
+        """Check GitHub for a newer version. Shows tray notification if found."""
+        from .updater import check_for_update
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                update = await check_for_update(session)
+        except Exception:
+            logger.debug("Update check failed", exc_info=True)
+            return
+
+        if update:
+            self._available_update = update
+            logger.info(f"Update available: v{update.version}")
+            if self.tray:
+                self.tray.show_notification(
+                    "Update Available",
+                    f"NetBridge Socks v{update.version} is available. Right-click tray → Check for Updates.",
+                )
+                self.tray.update_menu()
+
+    async def _do_update(self) -> None:
+        """Download and apply the update."""
+        from .updater import check_for_update, download_update
+        from .installer import Installer, get_installed_exe_path
+
+        if self.tray:
+            self.tray.show_notification("Updating", "Downloading update...")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                if not self._available_update:
+                    update = await check_for_update(session)
+                    if not update:
+                        if self.tray:
+                            self.tray.show_notification(
+                                "No Update",
+                                f"You're running the latest version (v{APP_VERSION}).",
+                            )
+                        return
+                    self._available_update = update
+
+                update = self._available_update
+                dest = get_app_dir() / "netbridge-socks-update.exe"
+                await download_update(session, update.download_url, dest)
+        except Exception as e:
+            logger.error(f"Update download failed: {e}")
+            if self.tray:
+                self.tray.show_notification("Update Failed", f"Download error: {e}")
+            return
+
+        try:
+            Installer.terminate_running_instances()
+            target = get_installed_exe_path()
+            temp = target.with_name(f"{target.name}.tmp")
+            shutil.copy2(dest, temp)
+            os.replace(temp, target)
+            Installer.save_installed_version(update.version)
+            dest.unlink(missing_ok=True)
+            logger.info(f"Updated to v{update.version}, restarting")
+        except Exception as e:
+            logger.error(f"Update apply failed: {e}")
+            if self.tray:
+                self.tray.show_notification("Update Failed", f"Install error: {e}")
+            return
+
+        self.request_restart()
+
     # --- Async proxy loop ---
 
     async def _run_proxy(self) -> None:
@@ -257,6 +363,8 @@ class NetBridgeSocksApp:
 
         if self.config.auto_connect:
             self._server_task = asyncio.create_task(self._run_proxy())
+
+        asyncio.create_task(self._check_for_update())
 
         await self._stop_event.wait()
 
