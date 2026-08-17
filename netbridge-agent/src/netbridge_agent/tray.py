@@ -236,6 +236,14 @@ class TrayIcon:
         def on_restart(icon, item):
             self.app.request_restart()
 
+        def on_check_update(icon, item):
+            self.app.request_check_update()
+
+        def get_update_label(item):
+            if self.app._available_update:
+                return f"Update to v{self.app._available_update.version}"
+            return "Check for Updates"
+
         def on_install(icon, item):
             self.app.request_install()
 
@@ -312,6 +320,10 @@ class TrayIcon:
             pystray.MenuItem(
                 "Restart",
                 on_restart,
+            ),
+            pystray.MenuItem(
+                get_update_label,
+                on_check_update,
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
