@@ -61,26 +61,34 @@ def _serve_with_tray(
     from logging.handlers import RotatingFileHandler
     from .tray import TrayIcon, Status, get_log_path
 
-    log_path = get_log_path()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(
-        log_path, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8",
-    )
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    logging.getLogger().addHandler(file_handler)
+    log_path = None
+    try:
+        log_path = get_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8",
+        )
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logging.getLogger().addHandler(file_handler)
+    except Exception:
+        logger.debug("Could not set up log file", exc_info=True)
 
     async_loop = None
     async_stop = None
     proxy_thread = None
-    tray = TrayIcon(socks_port=socks_port, http_port=http_port, log_path=log_path)
+    tray = TrayIcon(
+        host=host, socks_port=socks_port, http_port=http_port, log_path=log_path,
+    )
 
-    def on_status_change(connected, auth_required=False):
+    def on_status_change(connected, auth_required=False, permanent_failure=False):
         if auth_required:
             tray.set_status(Status.AUTH_REQUIRED)
         elif connected:
             tray.set_status(Status.CONNECTED)
+        elif permanent_failure:
+            tray.set_status(Status.DISCONNECTED)
         else:
             tray.set_status(Status.CONNECTING)
 
@@ -108,7 +116,8 @@ def _serve_with_tray(
         except Exception as e:
             logger.error(f"Proxy error: {e}")
         finally:
-            tray.set_status(Status.DISCONNECTED)
+            if tray.status != Status.AUTH_REQUIRED:
+                tray.set_status(Status.DISCONNECTED)
             loop.close()
 
     def on_tray_ready(icon):
@@ -116,16 +125,25 @@ def _serve_with_tray(
         proxy_thread = threading.Thread(target=run_proxy, daemon=True)
         proxy_thread.start()
 
+    def _stop_proxy():
+        if async_loop and async_stop:
+            try:
+                async_loop.call_soon_threadsafe(async_stop.set)
+            except RuntimeError:
+                pass
+        if proxy_thread:
+            proxy_thread.join(timeout=5.0)
+
     try:
         tray.run(setup_callback=on_tray_ready)
     except Exception:
         logger.warning("System tray unavailable, falling back to CLI mode")
+        _stop_proxy()
+        if proxy_thread and proxy_thread.is_alive():
+            return True
         return False
 
-    if async_loop and async_stop:
-        async_loop.call_soon_threadsafe(async_stop.set)
-    if proxy_thread:
-        proxy_thread.join(timeout=5.0)
+    _stop_proxy()
     return True
 
 
@@ -150,6 +168,7 @@ async def run_server(
         token_refresh_callback=token_refresh_callback,
         verify_ssl=verify_ssl,
         ca_bundle=ca_bundle,
+        on_status_change=on_status_change,
     )
 
     try:
@@ -158,7 +177,9 @@ async def run_server(
         logger.error(f"Failed to connect to relay: {e}")
         logger.info("Make sure the relay is running and your bridge agent is connected")
         if on_status_change:
-            on_status_change(connected=False)
+            error_str = str(e)
+            auth_required = "(401)" in error_str or "Token invalid" in error_str
+            on_status_change(connected=False, auth_required=auth_required)
         return
 
     if on_status_change:

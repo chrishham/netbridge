@@ -9,7 +9,7 @@ import asyncio
 import base64
 import logging
 import secrets
-from typing import Optional
+from typing import Callable, Optional
 
 import aiohttp
 from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType
@@ -83,6 +83,7 @@ class TunnelManager:
         token_refresh_callback: Optional[TokenRefreshCallback] = None,
         verify_ssl: Optional[bool] = None,
         ca_bundle: Optional[str] = None,
+        on_status_change: Optional[Callable] = None,
     ):
         """
         Initialize tunnel manager.
@@ -96,12 +97,15 @@ class TunnelManager:
                         a TLS-intercepting proxy — this weakens connection security.
             ca_bundle: Path to a custom CA certificate file. Use this instead of
                        disabling verification when behind a TLS-intercepting proxy.
+            on_status_change: Optional callback(connected: bool, auth_required: bool)
+                              called when tunnel connectivity changes.
         """
         self.relay_url = normalize_relay_url(relay_url)
         self.auth_token = auth_token
         self._token_refresh_callback = token_refresh_callback
         self._verify_ssl = verify_ssl
         self._ca_bundle = ca_bundle
+        self._on_status_change = on_status_change
         self.session_id = get_session_id()
         self.session: Optional[ClientSession] = None
         self.ws: Optional[ClientWebSocketResponse] = None
@@ -122,6 +126,17 @@ class TunnelManager:
         if not handler.semaphore_released:
             handler.semaphore_released = True
             self._stream_semaphore.release()
+
+    def _notify_status(self, connected: bool, auth_required: bool = False,
+                       permanent_failure: bool = False) -> None:
+        if self._on_status_change:
+            try:
+                self._on_status_change(
+                    connected=connected, auth_required=auth_required,
+                    permanent_failure=permanent_failure,
+                )
+            except Exception:
+                pass
 
     async def start(self) -> None:
         """Connect to the relay and start the connection manager."""
@@ -231,6 +246,7 @@ class TunnelManager:
 
             # Connection lost - clean up and reconnect
             self._connected.clear()
+            self._notify_status(connected=False)
             if self.ws and not self.ws.closed:
                 await self.ws.close()
             self.ws = None
@@ -240,6 +256,7 @@ class TunnelManager:
 
             try:
                 await self._connect()
+                self._notify_status(connected=True)
             except ConnectionError as e:
                 error_str = str(e)
                 logger.error(f"Reconnection failed: {e}")
@@ -247,6 +264,7 @@ class TunnelManager:
                 # Handle auth errors (401)
                 if "(401)" in error_str or "Token invalid" in error_str:
                     self._auth_failure_count += 1
+                    self._notify_status(connected=False, auth_required=True)
                     if self._auth_failure_count >= MAX_AUTH_FAILURES:
                         logger.error(f"{MAX_AUTH_FAILURES} consecutive auth failures. Giving up.")
                         logger.error("Run 'az login' to re-authenticate, then restart.")
@@ -272,6 +290,7 @@ class TunnelManager:
                 elif "(403)" in error_str:
                     logger.error("Access forbidden. Your account may not have permission.")
                     self._permanent_failure = True
+                    self._notify_status(connected=False, permanent_failure=True)
                     break
 
     async def _cleanup_loop(self) -> None:

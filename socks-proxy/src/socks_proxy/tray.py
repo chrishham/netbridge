@@ -96,8 +96,9 @@ def _open_login_terminal() -> None:
 
 class TrayIcon:
 
-    def __init__(self, socks_port: int, http_port: int | None,
-                 log_path: Path | None = None):
+    def __init__(self, host: str = "127.0.0.1", socks_port: int = 1080,
+                 http_port: int | None = 3128, log_path: Path | None = None):
+        self._host = host
         self._socks_port = socks_port
         self._http_port = http_port
         self._log_path = log_path
@@ -147,10 +148,10 @@ class TrayIcon:
             return f"Status: {labels[self._status]}"
 
         def get_socks_text(item):
-            return f"SOCKS5: 127.0.0.1:{self._socks_port}"
+            return f"SOCKS5: {self._host}:{self._socks_port}"
 
         def get_http_text(item):
-            return f"HTTP: 127.0.0.1:{self._http_port}"
+            return f"HTTP: {self._host}:{self._http_port}"
 
         items = [
             pystray.MenuItem(
