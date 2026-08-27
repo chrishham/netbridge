@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from typing import Callable
 
 from . import __version__
@@ -39,6 +40,93 @@ logger = logging.getLogger(__name__)
 def _is_loopback(host: str) -> bool:
     """Check if a bind address is loopback-only."""
     return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _tray_available() -> bool:
+    try:
+        import pystray  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        return False
+    if sys.platform == "linux":
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
+
+
+def _serve_with_tray(
+    host, socks_port, http_port, relay_url,
+    auth_token, token_refresh,
+    verify_ssl=None, proxy_credentials=None, ca_bundle=None,
+):
+    from logging.handlers import RotatingFileHandler
+    from .tray import TrayIcon, Status, get_log_path
+
+    log_path = get_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        log_path, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.getLogger().addHandler(file_handler)
+
+    async_loop = None
+    async_stop = None
+    proxy_thread = None
+    tray = TrayIcon(socks_port=socks_port, http_port=http_port, log_path=log_path)
+
+    def on_status_change(connected, auth_required=False):
+        if auth_required:
+            tray.set_status(Status.AUTH_REQUIRED)
+        elif connected:
+            tray.set_status(Status.CONNECTED)
+        else:
+            tray.set_status(Status.CONNECTING)
+
+    def run_proxy():
+        nonlocal async_loop, async_stop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        async_loop = loop
+        async_stop = asyncio.Event()
+        tray.set_status(Status.CONNECTING)
+        try:
+            loop.run_until_complete(run_server(
+                host=host,
+                socks_port=socks_port,
+                http_port=http_port,
+                relay_url=relay_url,
+                auth_token=auth_token,
+                token_refresh_callback=token_refresh,
+                verify_ssl=verify_ssl,
+                proxy_credentials=proxy_credentials,
+                ca_bundle=ca_bundle,
+                stop_event=async_stop,
+                on_status_change=on_status_change,
+            ))
+        except Exception as e:
+            logger.error(f"Proxy error: {e}")
+        finally:
+            tray.set_status(Status.DISCONNECTED)
+            loop.close()
+
+    def on_tray_ready(icon):
+        nonlocal proxy_thread
+        proxy_thread = threading.Thread(target=run_proxy, daemon=True)
+        proxy_thread.start()
+
+    try:
+        tray.run(setup_callback=on_tray_ready)
+    except Exception:
+        logger.warning("System tray unavailable, falling back to CLI mode")
+        return False
+
+    if async_loop and async_stop:
+        async_loop.call_soon_threadsafe(async_stop.set)
+    if proxy_thread:
+        proxy_thread.join(timeout=5.0)
+    return True
 
 
 async def run_server(
@@ -229,6 +317,11 @@ def _add_serve_args(parser):
         help="Path to a custom CA certificate file for SSL verification. "
              "Use this instead of --no-verify-ssl when behind a TLS-intercepting proxy.",
     )
+    parser.add_argument(
+        "--no-tray",
+        action="store_true",
+        help="Disable system tray icon (CLI-only mode)",
+    )
 
 
 def serve_main(args):
@@ -357,6 +450,19 @@ def serve_main(args):
 
     # Determine SSL verification (None = use env var default)
     verify_ssl = False if args.no_verify_ssl else None
+
+    use_tray = not args.no_tray and _tray_available()
+
+    if use_tray:
+        if _serve_with_tray(
+            args.host, args.port, http_port, args.relay,
+            auth_token, token_refresh,
+            verify_ssl=verify_ssl,
+            proxy_credentials=proxy_credentials,
+            ca_bundle=args.ca_bundle,
+        ):
+            logger.info("Goodbye!")
+            return
 
     try:
         asyncio.run(run_server(
