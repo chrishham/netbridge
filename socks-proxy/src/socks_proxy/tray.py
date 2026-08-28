@@ -96,12 +96,23 @@ def _open_login_terminal() -> None:
 
 class TrayIcon:
 
-    def __init__(self, host: str = "127.0.0.1", socks_port: int = 1080,
-                 http_port: int | None = 3128, log_path: Path | None = None):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        socks_port: int = 1080,
+        http_port: int | None = 3128,
+        log_path: Path | None = None,
+        show_notifications: bool = True,
+        on_reconnect: Optional[Callable] = None,
+        on_change_relay: Optional[Callable] = None,
+    ):
         self._host = host
         self._socks_port = socks_port
         self._http_port = http_port
         self._log_path = log_path
+        self._show_notifications = show_notifications
+        self._on_reconnect = on_reconnect
+        self._on_change_relay = on_change_relay
         self._status = Status.DISCONNECTED
         self._icon: Optional[pystray.Icon] = None
 
@@ -131,7 +142,7 @@ class TrayIcon:
                                  "Authentication expired - run 'az login'")
 
     def _notify(self, title: str, message: str) -> None:
-        if self._icon:
+        if self._icon and self._show_notifications:
             try:
                 self._icon.notify(message, title)
             except Exception:
@@ -167,6 +178,19 @@ class TrayIcon:
             )
 
         items.append(pystray.Menu.SEPARATOR)
+
+        if self._on_reconnect:
+            items.append(pystray.MenuItem(
+                "Reconnect",
+                lambda icon, item: self._on_reconnect(),
+            ))
+
+        if self._on_change_relay:
+            items.append(pystray.MenuItem(
+                "Change Relay URL",
+                lambda icon, item: self._on_change_relay(),
+            ))
+
         items.append(pystray.MenuItem(
             "Login (az login)",
             lambda icon, item: _open_login_terminal(),

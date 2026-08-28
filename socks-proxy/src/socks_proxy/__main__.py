@@ -57,6 +57,7 @@ def _serve_with_tray(
     host, socks_port, http_port, relay_url,
     auth_token, token_refresh,
     verify_ssl=None, proxy_credentials=None, ca_bundle=None,
+    config=None, show_notifications=True,
 ):
     from logging.handlers import RotatingFileHandler
     from .tray import TrayIcon, Status, get_log_path
@@ -78,9 +79,6 @@ def _serve_with_tray(
     async_loop = None
     async_stop = None
     proxy_thread = None
-    tray = TrayIcon(
-        host=host, socks_port=socks_port, http_port=http_port, log_path=log_path,
-    )
 
     def on_status_change(connected, auth_required=False, permanent_failure=False):
         if auth_required:
@@ -120,11 +118,6 @@ def _serve_with_tray(
                 tray.set_status(Status.DISCONNECTED)
             loop.close()
 
-    def on_tray_ready(icon):
-        nonlocal proxy_thread
-        proxy_thread = threading.Thread(target=run_proxy, daemon=True)
-        proxy_thread.start()
-
     def _stop_proxy():
         if async_loop and async_stop:
             try:
@@ -133,6 +126,66 @@ def _serve_with_tray(
                 pass
         if proxy_thread:
             proxy_thread.join(timeout=5.0)
+
+    def _start_proxy():
+        nonlocal proxy_thread
+        proxy_thread = threading.Thread(target=run_proxy, daemon=True)
+        proxy_thread.start()
+
+    def on_reconnect():
+        nonlocal async_loop, async_stop, proxy_thread
+        logger.info("Reconnect requested")
+        _stop_proxy()
+        if proxy_thread and proxy_thread.is_alive():
+            logger.warning("Old proxy thread still alive after timeout, waiting...")
+            proxy_thread.join(timeout=10.0)
+            if proxy_thread.is_alive():
+                logger.error("Old proxy thread did not exit, skipping reconnect")
+                return
+        async_loop = None
+        async_stop = None
+        proxy_thread = None
+        _start_proxy()
+
+    def on_change_relay():
+        from .dialogs import prompt_relay_url
+        logger.info("Change relay URL requested")
+        url = prompt_relay_url(relay_url)
+        if url is None or url == relay_url:
+            logger.info("Relay URL change cancelled or unchanged")
+            return
+        if config:
+            config.relay_url = url
+            config.save()
+            logger.info(f"Relay URL saved: {url}")
+        logger.info("Relaunching with new relay URL")
+        tray.stop()
+        _stop_proxy()
+        # Use sys.orig_argv to preserve -m invocations, strip --relay
+        base_argv = sys.orig_argv
+        new_argv = []
+        skip_next = False
+        for arg in base_argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--relay":
+                skip_next = True
+                continue
+            if arg.startswith("--relay="):
+                continue
+            new_argv.append(arg)
+        os.execv(new_argv[0], new_argv)
+
+    tray = TrayIcon(
+        host=host, socks_port=socks_port, http_port=http_port, log_path=log_path,
+        show_notifications=show_notifications,
+        on_reconnect=on_reconnect,
+        on_change_relay=on_change_relay,
+    )
+
+    def on_tray_ready(icon):
+        _start_proxy()
 
     try:
         tray.run(setup_callback=on_tray_ready)
@@ -282,19 +335,19 @@ def _add_serve_args(parser):
     """Add all serve subcommand arguments to the given parser."""
     parser.add_argument(
         "--host",
-        default=DEFAULT_HOST,
+        default=None,
         help=f"Host to bind to (default: {DEFAULT_HOST})",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_SOCKS_PORT,
+        default=None,
         help=f"SOCKS5 port to bind to (default: {DEFAULT_SOCKS_PORT})",
     )
     parser.add_argument(
         "--http-port",
         type=int,
-        default=DEFAULT_HTTP_PORT,
+        default=None,
         help=f"HTTP proxy port to bind to (default: {DEFAULT_HTTP_PORT})",
     )
     parser.add_argument(
@@ -304,7 +357,7 @@ def _add_serve_args(parser):
     )
     parser.add_argument(
         "--relay",
-        default=DEFAULT_RELAY_URL,
+        default=None,
         help=f"Relay hostname or WebSocket URL (default: {DEFAULT_RELAY_URL})",
     )
     parser.add_argument(
@@ -347,6 +400,20 @@ def _add_serve_args(parser):
 
 def serve_main(args):
     """Run the SOCKS5 & HTTP proxy server with the given arguments."""
+    from .config import Config
+
+    config = Config.load()
+
+    # CLI args (non-None) win over config, which wins over hardcoded defaults
+    if args.relay is None:
+        args.relay = config.relay_url or DEFAULT_RELAY_URL
+    if args.port is None:
+        args.port = config.socks_port or DEFAULT_SOCKS_PORT
+    if args.http_port is None:
+        args.http_port = config.http_port or DEFAULT_HTTP_PORT
+    if args.host is None:
+        args.host = DEFAULT_HOST
+
     # Enforce loopback-only binding unless --allow-remote is set
     if not _is_loopback(args.host) and not args.allow_remote:
         logger.error(
@@ -481,6 +548,8 @@ def serve_main(args):
             verify_ssl=verify_ssl,
             proxy_credentials=proxy_credentials,
             ca_bundle=args.ca_bundle,
+            config=config,
+            show_notifications=config.show_notifications,
         ):
             logger.info("Goodbye!")
             return
