@@ -1,11 +1,18 @@
 """Tests for socks_proxy.tray — Status, icon creation, TrayIcon callbacks."""
 
+import pytest
 from unittest.mock import MagicMock, patch
 
-from socks_proxy.tray import (
-    Status, STATUS_COLORS, STATUS_TOOLTIPS,
-    create_icon_image, TrayIcon, APP_NAME,
-)
+try:
+    from socks_proxy.tray import (
+        Status, STATUS_COLORS, STATUS_TOOLTIPS,
+        create_icon_image, TrayIcon, APP_NAME,
+    )
+    _TRAY_AVAILABLE = True
+except (ImportError, ValueError):
+    _TRAY_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(not _TRAY_AVAILABLE, reason="pystray/GTK not available")
 
 
 class TestStatus:
