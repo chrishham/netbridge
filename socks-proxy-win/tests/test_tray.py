@@ -17,9 +17,10 @@ class TestStatus:
         assert Status.CONNECTING.value == "connecting"
         assert Status.CONNECTED.value == "connected"
         assert Status.AUTH_REQUIRED.value == "auth_required"
+        assert Status.NO_AGENT.value == "no_agent"
 
     def test_member_count(self):
-        assert len(Status) == 4
+        assert len(Status) == 5
 
 
 class TestStatusMappings:

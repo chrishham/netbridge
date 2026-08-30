@@ -57,7 +57,7 @@ def _serve_with_tray(
     host, socks_port, http_port, relay_url,
     auth_token, token_refresh,
     verify_ssl=None, proxy_credentials=None, ca_bundle=None,
-    config=None, show_notifications=True,
+    config=None, show_notifications=True, probe_target=None,
 ):
     from logging.handlers import RotatingFileHandler
     from .tray import TrayIcon, Status, get_log_path
@@ -79,12 +79,19 @@ def _serve_with_tray(
     async_loop = None
     async_stop = None
     proxy_thread = None
+    tunnel_ref: dict = {"tunnel": None}
 
-    def on_status_change(connected, auth_required=False, permanent_failure=False):
+    def on_status_change(connected, auth_required=False, permanent_failure=False,
+                         agent_available=None):
         if auth_required:
             tray.set_status(Status.AUTH_REQUIRED)
         elif connected:
-            tray.set_status(Status.CONNECTED)
+            # Connected to the relay is not the same as a usable tunnel: the
+            # bridge agent on the VDI has to be there too
+            if agent_available is False:
+                tray.set_status(Status.NO_AGENT)
+            else:
+                tray.set_status(Status.CONNECTED)
         elif permanent_failure:
             tray.set_status(Status.DISCONNECTED)
         else:
@@ -110,6 +117,8 @@ def _serve_with_tray(
                 ca_bundle=ca_bundle,
                 stop_event=async_stop,
                 on_status_change=on_status_change,
+                on_tunnel_ready=lambda t: tunnel_ref.update(tunnel=t),
+                probe_target=probe_target,
             ))
         except Exception as e:
             logger.error(f"Proxy error: {e}")
@@ -147,6 +156,18 @@ def _serve_with_tray(
         proxy_thread = None
         _start_proxy()
 
+    def on_check_connection():
+        """Re-run the end-to-end check on demand (from the tray thread)."""
+        tunnel = tunnel_ref.get("tunnel")
+        if not tunnel or not async_loop:
+            logger.info("Not connected yet, nothing to check")
+            return
+        logger.info("Connection check requested")
+        try:
+            asyncio.run_coroutine_threadsafe(tunnel.probe_agent(), async_loop)
+        except RuntimeError:
+            logger.debug("Event loop is gone, skipping connection check")
+
     def on_change_relay():
         from .dialogs import prompt_relay_url
         logger.info("Change relay URL requested")
@@ -182,6 +203,7 @@ def _serve_with_tray(
         show_notifications=show_notifications,
         on_reconnect=on_reconnect,
         on_change_relay=on_change_relay,
+        on_check_connection=on_check_connection,
     )
 
     def on_tray_ready(icon):
@@ -212,6 +234,8 @@ async def run_server(
     ca_bundle: str | None = None,
     stop_event: asyncio.Event | None = None,
     on_status_change: Callable | None = None,
+    on_tunnel_ready: Callable | None = None,
+    probe_target: tuple[str, int] | None = None,
 ) -> None:
     """Run the SOCKS5 and HTTP proxy servers."""
     # Create and start tunnel manager with auth token
@@ -222,7 +246,11 @@ async def run_server(
         verify_ssl=verify_ssl,
         ca_bundle=ca_bundle,
         on_status_change=on_status_change,
+        probe_target=probe_target,
     )
+
+    if on_tunnel_ready:
+        on_tunnel_ready(tunnel)
 
     try:
         await tunnel.start()
@@ -550,6 +578,7 @@ def serve_main(args):
             ca_bundle=args.ca_bundle,
             config=config,
             show_notifications=config.show_notifications,
+            probe_target=config.parsed_probe_target(),
         ):
             logger.info("Goodbye!")
             return
@@ -565,6 +594,7 @@ def serve_main(args):
             verify_ssl=verify_ssl,
             proxy_credentials=proxy_credentials,
             ca_bundle=args.ca_bundle,
+            probe_target=config.parsed_probe_target(),
         ))
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

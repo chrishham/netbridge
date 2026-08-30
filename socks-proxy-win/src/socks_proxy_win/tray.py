@@ -26,6 +26,9 @@ class Status(Enum):
     CONNECTING = "connecting"
     CONNECTED = "connected"
     AUTH_REQUIRED = "auth_required"
+    # Relay connection is fine but the VDI agent is not reachable, so nothing
+    # can actually be tunnelled
+    NO_AGENT = "no_agent"
 
 
 # Status to color mapping
@@ -34,28 +37,49 @@ STATUS_COLORS = {
     Status.CONNECTING: "#F1C40F",       # Yellow
     Status.CONNECTED: "#2ECC71",        # Green
     Status.AUTH_REQUIRED: "#E67E22",    # Orange
+    Status.NO_AGENT: "#9B59B6",         # Purple
+}
+
+# Drawn as a ring instead of a filled dot, so the state is still obvious in
+# a monochrome tray or to a colour blind user
+STATUS_HOLLOW = {Status.NO_AGENT}
+
+# Status to menu label mapping
+STATUS_LABELS = {
+    Status.DISCONNECTED: "Disconnected",
+    Status.CONNECTING: "Connecting...",
+    Status.CONNECTED: "Connected",
+    Status.AUTH_REQUIRED: "Login Required",
+    Status.NO_AGENT: "VDI Unreachable",
 }
 
 # Status to tooltip mapping
 STATUS_TOOLTIPS = {
     Status.DISCONNECTED: f"{APP_NAME} - Disconnected",
     Status.CONNECTING: f"{APP_NAME} - Connecting...",
-    Status.CONNECTED: f"{APP_NAME} - Connected",
+    Status.CONNECTED: f"{APP_NAME} - Connected (tunnel working)",
     Status.AUTH_REQUIRED: f"{APP_NAME} - Login Required",
+    Status.NO_AGENT: f"{APP_NAME} - Relay OK, VDI agent unreachable",
 }
 
 
-def create_icon_image(color: str, size: int = 64) -> Image.Image:
-    """Create a simple circle icon with the given color."""
+def create_icon_image(
+    color: str, size: int = 64, hollow: bool = False,
+) -> Image.Image:
+    """Create a simple circle icon with the given color.
+
+    A hollow icon is drawn as a ring so states stay distinguishable without
+    relying on colour alone.
+    """
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
 
     padding = size // 8
-    draw.ellipse(
-        [padding, padding, size - padding, size - padding],
-        fill=color,
-        outline=color,
-    )
+    box = [padding, padding, size - padding, size - padding]
+    if hollow:
+        draw.ellipse(box, fill=None, outline=color, width=max(2, size // 8))
+    else:
+        draw.ellipse(box, fill=color, outline=color)
 
     return image
 
@@ -71,7 +95,9 @@ class TrayIcon:
         # Cache generated icons
         self._icon_cache: dict[Status, Image.Image] = {}
         for status in Status:
-            self._icon_cache[status] = create_icon_image(STATUS_COLORS[status])
+            self._icon_cache[status] = create_icon_image(
+                STATUS_COLORS[status], hollow=status in STATUS_HOLLOW,
+            )
 
     @property
     def status(self) -> Status:
@@ -102,13 +128,26 @@ class TrayIcon:
         """Create the context menu."""
 
         def get_status_text(item):
-            status_map = {
-                Status.DISCONNECTED: "Disconnected",
-                Status.CONNECTING: "Connecting...",
-                Status.CONNECTED: "Connected",
-                Status.AUTH_REQUIRED: "Login Required",
-            }
-            return f"Status: {status_map[self._status]}"
+            return f"Status: {STATUS_LABELS[self._status]}"
+
+        def get_relay_text(item):
+            if self._status in (Status.CONNECTED, Status.NO_AGENT):
+                return "  Relay: connected"
+            if self._status == Status.CONNECTING:
+                return "  Relay: connecting..."
+            if self._status == Status.AUTH_REQUIRED:
+                return "  Relay: login required"
+            return "  Relay: disconnected"
+
+        def get_agent_text(item):
+            if self._status == Status.CONNECTED:
+                return "  VDI agent: reachable"
+            if self._status == Status.NO_AGENT:
+                return "  VDI agent: NOT reachable"
+            return "  VDI agent: unknown"
+
+        def on_check_connection(icon, item):
+            self.app.request_check_connection()
 
         def get_socks_text(item):
             return f"SOCKS5: 127.0.0.1:{self.app.config.socks_port}"
@@ -160,6 +199,16 @@ class TrayIcon:
                 enabled=False,
             ),
             pystray.MenuItem(
+                get_relay_text,
+                None,
+                enabled=False,
+            ),
+            pystray.MenuItem(
+                get_agent_text,
+                None,
+                enabled=False,
+            ),
+            pystray.MenuItem(
                 get_socks_text,
                 None,
                 enabled=False,
@@ -170,6 +219,10 @@ class TrayIcon:
                 enabled=False,
             ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Check Connection Now",
+                on_check_connection,
+            ),
             pystray.MenuItem(
                 "Change Relay URL",
                 on_change_relay_url,

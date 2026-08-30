@@ -30,6 +30,9 @@ class Config:
     http_port: int = 3128
     show_notifications: bool = True
     log_level: str = "INFO"
+    # Optional "host:port" used to verify the tunnel works end to end. Only
+    # needed when the relay's destination allow list rejects the default.
+    probe_target: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -38,7 +41,23 @@ class Config:
             "http_port": self.http_port,
             "show_notifications": self.show_notifications,
             "log_level": self.log_level,
+            "probe_target": self.probe_target,
         }
+
+    def parsed_probe_target(self) -> Optional[tuple[str, int]]:
+        """Return probe_target as (host, port), or None if unset/invalid."""
+        if not self.probe_target or ":" not in self.probe_target:
+            return None
+        host, _, port = self.probe_target.rpartition(":")
+        if not host:
+            return None
+        try:
+            port_num = int(port)
+        except ValueError:
+            return None
+        if not 1 <= port_num <= 65535:
+            return None
+        return host, port_num
 
     @classmethod
     def from_dict(cls, data) -> "Config":
@@ -62,6 +81,7 @@ class Config:
             http_port=_port(data.get("http_port"), 3128),
             show_notifications=_bool(data.get("show_notifications"), True),
             log_level=_str(data.get("log_level"), "INFO"),
+            probe_target=_str(data.get("probe_target"), ""),
         )
 
     def save(self, path: Optional[Path] = None) -> None:

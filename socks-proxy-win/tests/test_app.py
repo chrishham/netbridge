@@ -82,7 +82,7 @@ class TestNetBridgeSocksApp:
     def test_set_status_notifies_on_connected(self, tmp_path, monkeypatch):
         app = self._make_app(tmp_path, monkeypatch)
         app.set_status(Status.CONNECTED)
-        app.tray.show_notification.assert_called_once_with("Connected", "Connected to relay server")
+        app.tray.show_notification.assert_called_once_with("Connected", "Tunnel is working end to end")
 
     def test_set_status_notifies_on_disconnect_from_connected(self, tmp_path, monkeypatch):
         app = self._make_app(tmp_path, monkeypatch)
@@ -194,3 +194,59 @@ class TestNetBridgeSocksApp:
 
         assert not app._pending_exit.is_set()
         app.tray.stop.assert_not_called()
+
+
+class TestNoAgentStatus:
+    """Relay connected but VDI agent missing is reported separately."""
+
+    def _make_app(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        app = NetBridgeSocksApp()
+        app.tray = MagicMock()
+        return app
+
+    def test_notifies_when_agent_missing(self, tmp_path, monkeypatch):
+        app = self._make_app(tmp_path, monkeypatch)
+        app._status = Status.CONNECTED
+
+        app.set_status(Status.NO_AGENT)
+
+        title, message = app.tray.show_notification.call_args[0]
+        assert title == "VDI Unreachable"
+        assert "agent" in message.lower()
+
+    def test_notifies_on_recovery(self, tmp_path, monkeypatch):
+        app = self._make_app(tmp_path, monkeypatch)
+        app._status = Status.NO_AGENT
+
+        app.set_status(Status.CONNECTED)
+
+        title, _ = app.tray.show_notification.call_args[0]
+        assert title == "Tunnel Restored"
+
+    def test_disconnect_from_no_agent_notifies(self, tmp_path, monkeypatch):
+        app = self._make_app(tmp_path, monkeypatch)
+        app._status = Status.NO_AGENT
+
+        app.set_status(Status.DISCONNECTED)
+
+        app.tray.show_notification.assert_called_once_with(
+            "Disconnected", "Connection lost, reconnecting..."
+        )
+
+    def test_check_connection_without_tunnel_is_safe(self, tmp_path, monkeypatch):
+        app = self._make_app(tmp_path, monkeypatch)
+        app.request_check_connection()  # must not raise
+
+    def test_check_connection_schedules_probe(self, tmp_path, monkeypatch):
+        app = self._make_app(tmp_path, monkeypatch)
+        tunnel = MagicMock()
+        probe = MagicMock()
+        tunnel.probe_agent.return_value = probe
+        app._set_tunnel(tunnel)
+        app._async_loop = MagicMock()
+
+        with patch("asyncio.run_coroutine_threadsafe") as run_threadsafe:
+            app.request_check_connection()
+
+        run_threadsafe.assert_called_once_with(probe, app._async_loop)

@@ -79,6 +79,7 @@ class NetBridgeSocksApp:
         self._async_thread: Optional[threading.Thread] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._server_task: Optional[asyncio.Task] = None
+        self._tunnel = None
 
         # Pending requests from tray menu (thread-safe)
         self._pending_exit = threading.Event()
@@ -103,8 +104,17 @@ class NetBridgeSocksApp:
 
             if notify and old_status != status:
                 if status == Status.CONNECTED:
-                    self.tray.show_notification("Connected", "Connected to relay server")
-                elif status == Status.DISCONNECTED and old_status == Status.CONNECTED:
+                    if old_status == Status.NO_AGENT:
+                        self.tray.show_notification("Tunnel Restored", "VDI agent is reachable again")
+                    else:
+                        self.tray.show_notification("Connected", "Tunnel is working end to end")
+                elif status == Status.NO_AGENT:
+                    self.tray.show_notification(
+                        "VDI Unreachable",
+                        "Connected to the relay, but no bridge agent is available. "
+                        "Check that the agent is running on your VDI.",
+                    )
+                elif status == Status.DISCONNECTED and old_status in (Status.CONNECTED, Status.NO_AGENT):
                     self.tray.show_notification("Disconnected", "Connection lost, reconnecting...")
                 elif status == Status.AUTH_REQUIRED:
                     self.tray.show_notification("Login Required", "Authentication expired - click to login")
@@ -235,6 +245,24 @@ class NetBridgeSocksApp:
         if self.tray:
             self.tray.stop()
 
+    def _set_tunnel(self, tunnel) -> None:
+        """Remember the tunnel manager so the tray can trigger a health check."""
+        self._tunnel = tunnel
+
+    def request_check_connection(self) -> None:
+        """Re-check end-to-end tunnel health now (from tray menu)."""
+        if not self._tunnel or not self._async_loop:
+            logger.info("Not connected yet, nothing to check")
+            return
+
+        logger.info("Connection check requested")
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._tunnel.probe_agent(), self._async_loop
+            )
+        except RuntimeError:
+            logger.debug("Event loop is gone, skipping connection check")
+
     def request_check_update(self) -> None:
         """Check for updates and apply if available (from tray menu)."""
         if self._async_loop:
@@ -334,11 +362,21 @@ class NetBridgeSocksApp:
 
             self._stop_event = asyncio.Event()
 
-            def on_status_change(connected: bool, auth_required: bool = False):
+            def on_status_change(
+                connected: bool,
+                auth_required: bool = False,
+                permanent_failure: bool = False,
+                agent_available: Optional[bool] = None,
+            ):
                 if auth_required:
                     self.set_status(Status.AUTH_REQUIRED)
                 elif connected:
-                    self.set_status(Status.CONNECTED)
+                    # Reaching the relay is only half the path: without the
+                    # bridge agent on the VDI nothing can be tunnelled
+                    if agent_available is False:
+                        self.set_status(Status.NO_AGENT)
+                    else:
+                        self.set_status(Status.CONNECTED)
                 else:
                     self.set_status(Status.CONNECTING)
 
@@ -351,6 +389,8 @@ class NetBridgeSocksApp:
                 token_refresh_callback=token_refresh,
                 stop_event=self._stop_event,
                 on_status_change=on_status_change,
+                on_tunnel_ready=self._set_tunnel,
+                probe_target=self.config.parsed_probe_target(),
             )
         except Exception as e:
             logger.error(f"Proxy error: {e}")

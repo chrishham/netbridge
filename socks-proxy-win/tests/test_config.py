@@ -77,6 +77,7 @@ class TestConfigToDict:
             "auto_connect": True,
             "show_notifications": True,
             "log_level": "INFO",
+            "probe_target": "",
         }
 
     def test_to_dict_custom(self):

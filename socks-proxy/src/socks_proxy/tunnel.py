@@ -7,6 +7,7 @@ TCP streams over it.
 
 import asyncio
 import base64
+import inspect
 import logging
 import secrets
 from typing import Callable, Optional
@@ -49,6 +50,35 @@ def normalize_relay_url(relay: str, path: str = "/tunnel") -> str:
 READ_BUFFER_SIZE = 65536  # 64KB - matches typical TCP window size
 WRITE_BUFFER_HIGH_WATER = 65536  # Drain when write buffer exceeds this
 
+# Relay error text returned when the user's bridge agent (VDI) is not connected.
+# The WebSocket to the relay is healthy in this case, but the tunnel is not
+# usable end to end, so we surface it as a distinct status.
+NO_AGENT_ERROR_MARKER = "no bridge agent"
+
+# Errors the relay produces on its own, before a request ever reaches the
+# agent. These say nothing about whether the VDI is reachable.
+RELAY_SIDE_ERROR_MARKERS = (
+    "is not allowed",
+    "rate limit",
+    "maximum stream limit",
+    "stream id collision",
+    "invalid",
+    "too many concurrent streams",
+)
+
+# Probe destination used to verify the VDI end of the tunnel. This is a magic
+# hostname the agent answers itself, so a probe never opens a connection to a
+# real internal service. Overridable via config for relays whose destination
+# allow list rejects it.
+DEFAULT_PROBE_TARGET = ("netbridge-exec", 80)
+
+# How often to re-probe the agent while it is down, with backoff (seconds)
+AGENT_PROBE_INTERVAL = 15
+AGENT_PROBE_INTERVAL_MAX = 120
+AGENT_PROBE_BACKOFF_FACTOR = 2
+AGENT_PROBE_TIMEOUT = 10.0
+
+
 from .stream import StreamHandler
 from .auth import (
     check_token_expiration,
@@ -73,6 +103,55 @@ from .auth import (
 )
 
 
+class TunnelConnectError(ConnectionError):
+    """A connect failure reported by the relay, carrying the relay's message.
+
+    Distinct from local failures (socket closed, no relay connection) so that
+    health checks only draw conclusions from answers that actually came back
+    through the tunnel.
+    """
+
+
+def _accepted_kwargs(callback: Callable) -> Optional[set[str]]:
+    """Keyword arguments *callback* accepts, or None if it takes anything."""
+    try:
+        params = inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return None  # Not introspectable, pass everything and let it decide
+
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+        return None
+
+    return {
+        p.name for p in params
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+
+
+def classify_connect_error(error: str) -> Optional[bool]:
+    """Decide what a failed tunnel connect says about the bridge agent.
+
+    Returns:
+        False if the relay told us no agent is connected,
+        True if the answer could only have come from the agent itself,
+        None if the relay rejected the request before involving the agent.
+    """
+    lowered = error.lower()
+
+    if NO_AGENT_ERROR_MARKER in lowered:
+        return False
+
+    if any(marker in lowered for marker in RELAY_SIDE_ERROR_MARKERS):
+        return None
+
+    # Anything else (connection refused, DNS failure, timeouts at the far end)
+    # means the agent processed the request, so the VDI is reachable.
+    return True
+
+
 class TunnelManager:
     """Manages WebSocket tunnel to relay for TCP stream multiplexing."""
 
@@ -84,6 +163,7 @@ class TunnelManager:
         verify_ssl: Optional[bool] = None,
         ca_bundle: Optional[str] = None,
         on_status_change: Optional[Callable] = None,
+        probe_target: Optional[tuple[str, int]] = None,
     ):
         """
         Initialize tunnel manager.
@@ -97,8 +177,14 @@ class TunnelManager:
                         a TLS-intercepting proxy — this weakens connection security.
             ca_bundle: Path to a custom CA certificate file. Use this instead of
                        disabling verification when behind a TLS-intercepting proxy.
-            on_status_change: Optional callback(connected: bool, auth_required: bool)
-                              called when tunnel connectivity changes.
+            on_status_change: Optional callback(connected, auth_required,
+                              permanent_failure, agent_available) called when
+                              tunnel connectivity changes. agent_available is
+                              True/False once we know whether the bridge agent
+                              (VDI) is reachable, None while unknown.
+            probe_target: Optional (host, port) used to check that the tunnel
+                          works end to end. Defaults to a magic hostname the
+                          agent answers itself.
         """
         self.relay_url = normalize_relay_url(relay_url)
         self.auth_token = auth_token
@@ -106,6 +192,8 @@ class TunnelManager:
         self._verify_ssl = verify_ssl
         self._ca_bundle = ca_bundle
         self._on_status_change = on_status_change
+        self._status_callback_kwargs: Optional[set[str]] = None
+        self._status_callback_seen: Optional[Callable] = None
         self.session_id = get_session_id()
         self.session: Optional[ClientSession] = None
         self.ws: Optional[ClientWebSocketResponse] = None
@@ -120,6 +208,13 @@ class TunnelManager:
         self._permanent_failure = False  # Set when we should stop retrying
         self._lock = asyncio.Lock()
         self._stream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
+        # End-to-end health: None = unknown (nothing tried yet), True/False =
+        # observed from real connect attempts through the tunnel.
+        self._agent_available: Optional[bool] = None
+        self._probe_target: Optional[tuple[str, int]] = None
+        self._probe_target_override = probe_target
+        self._agent_probe_task: Optional[asyncio.Task] = None
+        self._probe_now = asyncio.Event()
 
     def _release_semaphore_for_stream(self, handler: StreamHandler) -> None:
         """Safely release semaphore slot for a stream, preventing double-release."""
@@ -127,16 +222,57 @@ class TunnelManager:
             handler.semaphore_released = True
             self._stream_semaphore.release()
 
+    @property
+    def agent_available(self) -> Optional[bool]:
+        """Whether the bridge agent (VDI) is reachable, None if not yet known."""
+        return self._agent_available
+
     def _notify_status(self, connected: bool, auth_required: bool = False,
                        permanent_failure: bool = False) -> None:
-        if self._on_status_change:
-            try:
-                self._on_status_change(
-                    connected=connected, auth_required=auth_required,
-                    permanent_failure=permanent_failure,
-                )
-            except Exception:
-                pass
+        callback = self._on_status_change
+        if not callback:
+            return
+
+        if callback is not self._status_callback_seen:
+            self._status_callback_seen = callback
+            self._status_callback_kwargs = _accepted_kwargs(callback)
+
+        kwargs = {
+            "connected": connected,
+            "auth_required": auth_required,
+            "permanent_failure": permanent_failure,
+            "agent_available": self._agent_available,
+        }
+        # Drop anything the callback cannot accept, so a caller written against
+        # an older signature still gets its status updates
+        if self._status_callback_kwargs is not None:
+            kwargs = {
+                k: v for k, v in kwargs.items()
+                if k in self._status_callback_kwargs
+            }
+
+        try:
+            callback(**kwargs)
+        except Exception:
+            logger.debug("Status callback failed", exc_info=True)
+
+    def _set_agent_available(self, available: bool, reason: str = "") -> None:
+        """Record observed end-to-end health and notify on change."""
+        if self._agent_available == available:
+            return
+
+        self._agent_available = available
+        if available:
+            logger.info("Bridge agent reachable - tunnel is working end to end")
+        else:
+            logger.warning(
+                f"Bridge agent not reachable{f' ({reason})' if reason else ''} - "
+                "connections through the tunnel will fail"
+            )
+            # Start watching for it to come back
+            self._probe_now.set()
+
+        self._notify_status(connected=self._connected.is_set())
 
     async def start(self) -> None:
         """Connect to the relay and start the connection manager."""
@@ -184,6 +320,11 @@ class TunnelManager:
 
         # Start cleanup task for stalled/idle streams
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+        # Probes the VDI immediately, then watches for it coming back if it
+        # goes away. Runs as a task because probe results are only delivered
+        # once the receive loop above is running.
+        self._agent_probe_task = asyncio.create_task(self._agent_probe_loop())
 
         # Start proactive token refresh task (if using az cli)
         if self._token_refresh_callback:
@@ -257,6 +398,9 @@ class TunnelManager:
             try:
                 await self._connect()
                 self._notify_status(connected=True)
+                # The VDI may have changed state while we were away. The probe
+                # loop does the work: this loop has to get back to receiving.
+                self._probe_now.set()
             except ConnectionError as e:
                 error_str = str(e)
                 logger.error(f"Reconnection failed: {e}")
@@ -292,6 +436,106 @@ class TunnelManager:
                     self._permanent_failure = True
                     self._notify_status(connected=False, permanent_failure=True)
                     break
+
+    def _probe_candidates(self) -> list[tuple[str, int]]:
+        """Destinations to try when probing the agent, best first."""
+        candidates: list[tuple[str, int]] = []
+        if self._probe_target_override:
+            candidates.append(self._probe_target_override)
+        candidates.append(DEFAULT_PROBE_TARGET)
+        # A destination we have already exchanged results for is guaranteed to
+        # pass the relay's checks, so it is the most reliable fallback.
+        if self._probe_target and self._probe_target not in candidates:
+            candidates.append(self._probe_target)
+        return candidates
+
+    async def _attempt_probe(self, host: str, port: int) -> Optional[bool]:
+        """Probe one destination. Returns the same evidence as the classifier."""
+        stream_id = None
+        try:
+            stream_id = await self.connect(host, port, timeout=AGENT_PROBE_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            logger.debug(f"Agent probe to {host}:{port} timed out")
+            return None
+        except TunnelConnectError as e:
+            return classify_connect_error(str(e))
+        except ConnectionError as e:
+            # Local failure (no relay connection, send failed): tells us
+            # nothing about the far end
+            logger.debug(f"Agent probe could not be sent: {e}")
+            return None
+        finally:
+            if stream_id:
+                # We only wanted the connect result, not the data path
+                await self.close_stream(stream_id)
+
+    async def probe_agent(self) -> Optional[bool]:
+        """Check whether the VDI end of the tunnel is reachable.
+
+        Tries probe destinations until one gives a conclusive answer, so a
+        relay that rejects the default probe target does not leave us guessing.
+        """
+        if not self._connected.is_set() or self._stopping:
+            return None
+
+        for host, port in self._probe_candidates():
+            evidence = await self._attempt_probe(host, port)
+            if evidence is not None:
+                self._set_agent_available(evidence, reason=f"probe {host}:{port}")
+                return evidence
+
+        logger.debug("Agent probe inconclusive, leaving status unchanged")
+        return None
+
+    async def _wait_before_next_probe(self, timeout: Optional[float]) -> None:
+        """Sleep until the next probe is due, waking early if one is requested."""
+        self._probe_now.clear()
+        try:
+            await asyncio.wait_for(self._probe_now.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _agent_probe_loop(self) -> None:
+        """Keep the reported status in step with real end-to-end reachability.
+
+        Probes once as soon as the tunnel is up, then only works when there is
+        something to find out: while the agent is down (to notice it return),
+        or when a reconnect or a failed connection asks for a recheck.
+        """
+        wait: Optional[float] = 0.0
+        backoff = AGENT_PROBE_INTERVAL
+
+        while not self._stopping and not self._permanent_failure:
+            try:
+                if wait != 0.0:
+                    await self._wait_before_next_probe(wait)
+
+                if self._stopping:
+                    break
+
+                if not self._connected.is_set():
+                    wait = AGENT_PROBE_INTERVAL
+                    continue
+
+                await self.probe_agent()
+
+                if self._agent_available is False:
+                    wait = backoff
+                    backoff = min(
+                        backoff * AGENT_PROBE_BACKOFF_FACTOR,
+                        AGENT_PROBE_INTERVAL_MAX,
+                    )
+                else:
+                    # Healthy or unknown: nothing to poll for, wait to be woken
+                    backoff = AGENT_PROBE_INTERVAL
+                    wait = None
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Agent probe loop error: {type(e).__name__}: {e}")
+                wait = AGENT_PROBE_INTERVAL
 
     async def _cleanup_loop(self) -> None:
         """Periodically clean up stalled and idle streams."""
@@ -379,7 +623,8 @@ class TunnelManager:
 
         # Cancel background tasks with timeout
         tasks_to_cancel = [
-            t for t in [self._cleanup_task, self._connection_task, self._receive_task, self._token_refresh_task]
+            t for t in [self._cleanup_task, self._connection_task, self._receive_task,
+                        self._token_refresh_task, self._agent_probe_task]
             if t is not None
         ]
         for task in tasks_to_cancel:
@@ -392,6 +637,7 @@ class TunnelManager:
         self._connection_task = None
         self._receive_task = None
         self._token_refresh_task = None
+        self._agent_probe_task = None
 
         # Close all streams - collect under lock, close outside to avoid deadlock
         async with self._lock:
@@ -481,7 +727,16 @@ class TunnelManager:
                 self.streams.pop(stream_id, None)
             self._release_semaphore_for_stream(handler)
             error = result.get("error", "Unknown error")
-            raise ConnectionError(error)
+            evidence = classify_connect_error(error)
+            if evidence is not None:
+                # This destination got past every relay-side check, so it is a
+                # usable target for future probes.
+                self._probe_target = (host, port)
+                self._set_agent_available(evidence, reason=error)
+            raise TunnelConnectError(error)
+
+        # A completed connect means the agent handled it end to end
+        self._set_agent_available(True)
 
         return stream_id
 

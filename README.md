@@ -50,14 +50,17 @@ Continue with these instructions: [homebrew-tap README](https://github.com/chris
 
 Download [`netbridge-socks.exe`](https://github.com/chrishham/netbridge/releases/latest/download/netbridge-socks.exe) and run it. On first launch a dialog will prompt for your relay hostname. The executable installs itself to `%LOCALAPPDATA%\NetBridgeSocks\`, registers for Windows Startup, and launches automatically.
 
-The tray icon shows proxy status: green (connected), yellow (connecting), red (disconnected), orange (login required). Right-click the tray icon for options:
+The tray icon shows proxy status: green (connected, tunnel working end to end), purple ring (relay reached but the VDI agent is unreachable), yellow (connecting), red (disconnected), orange (login required). The proxy checks the full path to the VDI as soon as it connects, and keeps checking while the agent is missing, so the icon reflects whether traffic can actually flow — not just whether the relay accepted the connection. Right-click the tray icon for options:
 
+- **Check Connection Now** — re-run the end-to-end check immediately
 - **Change Relay URL** — switch to a different relay and restart
 - **Login (az login)** — re-authenticate with Azure
 - **View Logs** — open the current log file
 - **Uninstall** — remove the app from your system
 
 Configuration is stored in `%LOCALAPPDATA%\NetBridgeSocks\config.json` and logs in `%LOCALAPPDATA%\NetBridgeSocks\logs\`.
+
+If your relay restricts destinations and rejects the default health-check target, set `"probe_target": "host:port"` in `config.json` to a destination the relay allows.
 
 ## Proxy Usage
 

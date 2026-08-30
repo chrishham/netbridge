@@ -308,3 +308,300 @@ class TestHandleMessage:
             "stream_id": "nonexistent",
             "data": base64.b64encode(b"x").decode(),
         })
+
+
+# ---------------------------------------------------------------------------
+# End-to-end (agent reachability) status
+# ---------------------------------------------------------------------------
+class TestClassifyConnectError:
+    """Tests for classify_connect_error()."""
+
+    def test_no_agent_is_conclusive_down(self):
+        from socks_proxy.tunnel import classify_connect_error
+        assert classify_connect_error("No bridge agent available") is False
+
+    def test_case_insensitive(self):
+        from socks_proxy.tunnel import classify_connect_error
+        assert classify_connect_error("no BRIDGE AGENT available") is False
+
+    def test_relay_side_rejection_is_inconclusive(self):
+        from socks_proxy.tunnel import classify_connect_error
+        assert classify_connect_error("Destination foo is not allowed") is None
+        assert classify_connect_error("Port 22 is not allowed") is None
+        assert classify_connect_error("Rate limit exceeded for stream creation") is None
+        assert classify_connect_error("Maximum stream limit reached") is None
+
+    def test_agent_error_means_agent_is_alive(self):
+        from socks_proxy.tunnel import classify_connect_error
+        assert classify_connect_error("Connection refused") is True
+        assert classify_connect_error("Name or service not known") is True
+
+
+def _tunnel_with_reply(reply):
+    """Build a connected TunnelManager whose relay answers with *reply*."""
+    import json
+
+    with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+        tm = TunnelManager("relay.com")
+    tm._connected.set()
+    tm.ws = AsyncMock()
+
+    async def fake_send(msg):
+        data = json.loads(msg)
+        handler = tm.streams.get(data["stream_id"])
+        if handler and not handler.connect_future.done():
+            handler.connect_future.set_result(reply)
+
+    tm.ws.send_str.side_effect = fake_send
+    return tm
+
+
+class TestAgentAvailability:
+    """The tray needs to know the tunnel works end to end, not just to the relay."""
+
+    @pytest.mark.asyncio
+    async def test_starts_unknown(self):
+        tm = _tunnel_with_reply({"success": True})
+        assert tm.agent_available is None
+
+    @pytest.mark.asyncio
+    async def test_successful_connect_marks_agent_available(self):
+        tm = _tunnel_with_reply({"success": True})
+        await tm.connect("example.com", 443)
+        assert tm.agent_available is True
+
+    @pytest.mark.asyncio
+    async def test_no_agent_error_marks_unavailable(self):
+        tm = _tunnel_with_reply({"success": False, "error": "No bridge agent available"})
+        with pytest.raises(ConnectionError):
+            await tm.connect("netbridge-gauth", 80)
+        assert tm.agent_available is False
+
+    @pytest.mark.asyncio
+    async def test_no_agent_error_records_probe_target(self):
+        tm = _tunnel_with_reply({"success": False, "error": "No bridge agent available"})
+        with pytest.raises(ConnectionError):
+            await tm.connect("netbridge-gauth", 80)
+        assert tm._probe_target == ("netbridge-gauth", 80)
+
+    @pytest.mark.asyncio
+    async def test_relay_rejection_leaves_status_unknown(self):
+        tm = _tunnel_with_reply({"success": False, "error": "Destination x is not allowed"})
+        with pytest.raises(ConnectionError):
+            await tm.connect("x", 80)
+        assert tm.agent_available is None
+
+    @pytest.mark.asyncio
+    async def test_status_callback_receives_agent_state(self):
+        calls = []
+        tm = _tunnel_with_reply({"success": False, "error": "No bridge agent available"})
+        tm._on_status_change = lambda **kw: calls.append(kw)
+
+        with pytest.raises(ConnectionError):
+            await tm.connect("host", 80)
+
+        assert calls and calls[-1]["agent_available"] is False
+        assert calls[-1]["connected"] is True
+
+    @pytest.mark.asyncio
+    async def test_legacy_status_callback_still_called(self):
+        """Callbacks without the newer keyword args must not be dropped."""
+        calls = []
+
+        def legacy_callback(connected, auth_required=False):
+            calls.append((connected, auth_required))
+
+        tm = _tunnel_with_reply({"success": False, "error": "No bridge agent available"})
+        tm._on_status_change = legacy_callback
+
+        with pytest.raises(ConnectionError):
+            await tm.connect("host", 80)
+
+        assert calls == [(True, False)]
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_notifications(self):
+        calls = []
+        tm = _tunnel_with_reply({"success": True})
+        tm._on_status_change = lambda **kw: calls.append(kw)
+
+        await tm.connect("example.com", 443)
+        await tm.connect("example.com", 443)
+
+        assert len(calls) == 1
+
+
+class TestProbeAgent:
+    """probe_agent() checks the VDI end without waiting for user traffic."""
+
+    @pytest.mark.asyncio
+    async def test_probe_detects_missing_agent(self):
+        tm = _tunnel_with_reply({"success": False, "error": "No bridge agent available"})
+        result = await tm.probe_agent()
+        assert result is False
+        assert tm.agent_available is False
+
+    @pytest.mark.asyncio
+    async def test_probe_uses_default_target(self):
+        import json
+        from socks_proxy.tunnel import DEFAULT_PROBE_TARGET
+
+        tm = _tunnel_with_reply({"success": False, "error": "No bridge agent available"})
+        await tm.probe_agent()
+
+        sent = json.loads(tm.ws.send_str.call_args_list[0][0][0])
+        assert (sent["host"], sent["port"]) == DEFAULT_PROBE_TARGET
+
+    @pytest.mark.asyncio
+    async def test_probe_prefers_configured_target(self):
+        import json
+
+        with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+            tm = TunnelManager("relay.com", probe_target=("probe.internal", 8443))
+        tm._connected.set()
+        tm.ws = AsyncMock()
+
+        async def fake_send(msg):
+            data = json.loads(msg)
+            handler = tm.streams.get(data["stream_id"])
+            if handler and not handler.connect_future.done():
+                handler.connect_future.set_result(
+                    {"success": False, "error": "No bridge agent available"}
+                )
+
+        tm.ws.send_str.side_effect = fake_send
+        await tm.probe_agent()
+
+        sent = json.loads(tm.ws.send_str.call_args_list[0][0][0])
+        assert (sent["host"], sent["port"]) == ("probe.internal", 8443)
+
+    @pytest.mark.asyncio
+    async def test_probe_success_closes_the_stream(self):
+        """A probe must not leave a live stream behind."""
+        tm = _tunnel_with_reply({"success": True})
+        await tm.probe_agent()
+        assert tm.streams == {}
+        assert tm.agent_available is True
+
+    @pytest.mark.asyncio
+    async def test_probe_falls_through_to_next_candidate(self):
+        """An inconclusive answer moves on to the next probe destination."""
+        import json
+
+        tm = _tunnel_with_reply({"success": True})
+        tm._probe_target = ("known-good.internal", 443)
+        replies = [
+            {"success": False, "error": "Destination is not allowed"},
+            {"success": False, "error": "No bridge agent available"},
+        ]
+
+        async def fake_send(msg):
+            data = json.loads(msg)
+            handler = tm.streams.get(data["stream_id"])
+            if handler and not handler.connect_future.done():
+                handler.connect_future.set_result(replies.pop(0))
+
+        tm.ws.send_str.side_effect = fake_send
+
+        assert await tm.probe_agent() is False
+        assert tm.ws.send_str.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_probe_skipped_when_not_connected(self):
+        tm = _tunnel_with_reply({"success": True})
+        tm._connected.clear()
+        assert await tm.probe_agent() is None
+        tm.ws.send_str.assert_not_called()
+
+
+class TestProbeIgnoresLocalErrors:
+    """A local failure must never be read as 'the VDI is fine'."""
+
+    @pytest.mark.asyncio
+    async def test_disconnected_mid_probe_is_inconclusive(self):
+        from socks_proxy.tunnel import TunnelConnectError
+
+        with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+            tm = TunnelManager("relay.com")
+        tm._connected.set()
+        tm.ws = AsyncMock()
+        tm.ws.send_str.side_effect = Exception("socket gone")
+
+        assert await tm._attempt_probe("host", 80) is None
+        assert tm.agent_available is None
+
+    @pytest.mark.asyncio
+    async def test_relay_errors_are_still_classified(self):
+        tm = _tunnel_with_reply({"success": False, "error": "Connection refused"})
+        assert await tm._attempt_probe("host", 80) is True
+
+
+class TestProbeLoop:
+    """The loop checks immediately, then only when there is something to learn."""
+
+    @pytest.mark.asyncio
+    async def test_probes_immediately_without_waiting(self):
+        with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+            tm = TunnelManager("relay.com")
+        tm._connected.set()
+
+        probed = asyncio.Event()
+
+        async def fake_probe():
+            probed.set()
+            return True
+
+        tm.probe_agent = fake_probe
+        task = asyncio.create_task(tm._agent_probe_loop())
+        try:
+            await asyncio.wait_for(probed.wait(), timeout=1.0)
+        finally:
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_idles_while_healthy_and_wakes_on_request(self):
+        with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+            tm = TunnelManager("relay.com")
+        tm._connected.set()
+
+        calls = []
+
+        async def fake_probe():
+            calls.append(1)
+            tm._agent_available = True
+            return True
+
+        tm.probe_agent = fake_probe
+        task = asyncio.create_task(tm._agent_probe_loop())
+        try:
+            await asyncio.sleep(0.05)
+            assert len(calls) == 1  # idle, not polling
+
+            tm._probe_now.set()  # e.g. a reconnect happened
+            await asyncio.sleep(0.05)
+            assert len(calls) == 2
+        finally:
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_keeps_polling_while_agent_is_down(self):
+        with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+            tm = TunnelManager("relay.com")
+        tm._connected.set()
+
+        calls = []
+
+        async def fake_probe():
+            calls.append(1)
+            tm._agent_available = False
+            return False
+
+        tm.probe_agent = fake_probe
+        with patch("socks_proxy.tunnel.AGENT_PROBE_INTERVAL", 0.01), \
+             patch("socks_proxy.tunnel.AGENT_PROBE_INTERVAL_MAX", 0.01):
+            task = asyncio.create_task(tm._agent_probe_loop())
+            try:
+                await asyncio.sleep(0.1)
+                assert len(calls) > 2
+            finally:
+                task.cancel()

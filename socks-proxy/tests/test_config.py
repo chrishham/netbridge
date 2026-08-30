@@ -45,7 +45,8 @@ class TestConfig:
         assert d["relay_url"] == "test.com"
         assert d["show_notifications"] is False
         assert set(d.keys()) == {"relay_url", "socks_port", "http_port",
-                                  "show_notifications", "log_level"}
+                                  "show_notifications", "log_level",
+                                  "probe_target"}
 
     def test_from_dict_non_dict(self):
         c = Config.from_dict([1, 2, 3])
