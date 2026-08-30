@@ -65,7 +65,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 The tray icon shows connection status:
-  Green   - Connected
+  Green   - Connected (tunnel working end to end)
+  Purple  - Relay reached, but the VDI agent is not available
   Yellow  - Connecting
   Red     - Disconnected
   Orange  - Login required (run 'az login')
