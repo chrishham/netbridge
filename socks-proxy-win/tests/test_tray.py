@@ -1,11 +1,22 @@
 """Tests for socks_proxy_win.tray."""
 
+import pytest
+
 from socks_proxy_win.config import APP_NAME
-from socks_proxy_win.tray import (
-    STATUS_COLORS,
-    STATUS_TOOLTIPS,
-    Status,
-    create_icon_image,
+
+try:
+    from socks_proxy_win.tray import (
+        STATUS_COLORS,
+        STATUS_TOOLTIPS,
+        Status,
+        create_icon_image,
+    )
+    _TRAY_AVAILABLE = True
+except (ImportError, ValueError):
+    _TRAY_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not _TRAY_AVAILABLE, reason="pystray/GTK not available"
 )
 
 
@@ -76,3 +87,51 @@ class TestCreateIconImage:
         # All icons should be different (different colors)
         pixel_sets = {s: img.getpixel((32, 32))[:3] for s, img in icons.items()}
         assert len(set(pixel_sets.values())) == len(Status)
+
+
+class TestMenuRefresh:
+    """Dynamic menu labels only re-render when update_menu() is called.
+
+    pystray caches the menu; the icon image updates but the text does not,
+    so a status change must explicitly ask for a refresh.
+    """
+
+    def _make_tray(self):
+        from unittest.mock import MagicMock
+
+        from socks_proxy_win.tray import TrayIcon
+
+        tray = TrayIcon(MagicMock())
+        tray._icon = MagicMock()
+        return tray
+
+    def test_status_change_refreshes_menu(self):
+        tray = self._make_tray()
+
+        tray.set_status(Status.NO_AGENT)
+
+        tray._icon.update_menu.assert_called_once()
+
+    def test_recovery_refreshes_menu(self):
+        tray = self._make_tray()
+        tray.set_status(Status.NO_AGENT)
+        tray._icon.update_menu.reset_mock()
+
+        tray.set_status(Status.CONNECTED)
+
+        tray._icon.update_menu.assert_called_once()
+
+    def test_refresh_failure_does_not_break_status(self):
+        tray = self._make_tray()
+        tray._icon.update_menu.side_effect = RuntimeError("no menu support")
+
+        tray.set_status(Status.CONNECTED)
+
+        assert tray.status == Status.CONNECTED
+
+    def test_update_menu_without_icon_is_safe(self):
+        from unittest.mock import MagicMock
+
+        from socks_proxy_win.tray import TrayIcon
+
+        TrayIcon(MagicMock()).update_menu()  # must not raise

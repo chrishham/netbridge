@@ -142,3 +142,57 @@ class TestNoAgentStatus:
             if getattr(item, "text", None)
         ]
         assert not any("Check Connection" in label for label in labels)
+
+
+class TestMenuRefresh:
+    """Dynamic menu labels only re-render when update_menu() is called.
+
+    pystray caches the menu; the icon image updates cross-thread but the
+    text does not, so a status change must explicitly ask for a refresh.
+    """
+
+    def test_status_change_refreshes_menu(self):
+        tray = TrayIcon()
+        tray._icon = MagicMock()
+
+        tray.set_status(Status.NO_AGENT)
+
+        tray._icon.update_menu.assert_called_once()
+
+    def test_recovery_refreshes_menu(self):
+        tray = TrayIcon()
+        tray._icon = MagicMock()
+        tray.set_status(Status.NO_AGENT)
+        tray._icon.update_menu.reset_mock()
+
+        tray.set_status(Status.CONNECTED)
+
+        tray._icon.update_menu.assert_called_once()
+
+    def test_refresh_failure_does_not_break_status(self):
+        """Some backends have no menu support; status must still update."""
+        tray = TrayIcon()
+        tray._icon = MagicMock()
+        tray._icon.update_menu.side_effect = RuntimeError("no menu support")
+
+        tray.set_status(Status.CONNECTED)
+
+        assert tray.status == Status.CONNECTED
+
+    def test_menu_labels_follow_status(self):
+        tray = TrayIcon(on_check_connection=lambda: None)
+        tray._icon = MagicMock()
+
+        tray.set_status(Status.NO_AGENT)
+        down = [
+            item.text for item in tray._create_menu().items
+            if getattr(item, "text", None)
+        ]
+        tray.set_status(Status.CONNECTED)
+        up = [
+            item.text for item in tray._create_menu().items
+            if getattr(item, "text", None)
+        ]
+
+        assert any("NOT reachable" in label for label in down)
+        assert not any("NOT reachable" in label for label in up)

@@ -110,11 +110,18 @@ class TrayIcon:
         if self._icon:
             self._icon.icon = self._icon_cache[status]
             self._icon.title = STATUS_TOOLTIPS[status]
+            # The menu labels are dynamic; pystray caches them and only
+            # re-evaluates on update_menu(). Without this the "Status:",
+            # "Relay:" and "VDI agent:" lines keep the previous status.
+            self.update_menu()
 
     def update_menu(self) -> None:
         """Force menu refresh (e.g., after update becomes available)."""
         if self._icon:
-            self._icon.update_menu()
+            try:
+                self._icon.update_menu()
+            except Exception:
+                pass
 
     def show_notification(self, title: str, message: str) -> None:
         """Show a Windows notification."""

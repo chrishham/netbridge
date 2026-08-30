@@ -153,6 +153,13 @@ class TrayIcon:
         if self._icon:
             self._icon.icon = self._icon_cache[status]
             self._icon.title = STATUS_TOOLTIPS[status]
+            # The menu labels are dynamic; pystray caches them and only
+            # re-evaluates on update_menu(). Without this the "Status:",
+            # "Relay:" and "VDI agent:" lines keep the previous status.
+            try:
+                self._icon.update_menu()
+            except Exception:
+                pass
 
             if old != status:
                 if status == Status.CONNECTED:
