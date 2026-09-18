@@ -59,6 +59,24 @@ class TestTrayIcon:
         tray.set_status(Status.CONNECTED)
         tray._icon.notify.assert_called_once()
 
+    def test_status_update_goes_through_ui_thread(self):
+        """Icon, tooltip and menu must be refreshed via _on_ui_thread.
+
+        Touching the status item directly from the proxy threads trips an
+        AppKit main-thread assertion on macOS and kills the process.
+        """
+        tray = TrayIcon()
+        tray._icon = MagicMock()
+        with patch("socks_proxy.tray._on_ui_thread") as on_ui:
+            tray.set_status(Status.CONNECTED)
+            on_ui.assert_called_once()
+            tray._icon.update_menu.assert_not_called()
+            # The deferred callable does the actual widget work
+            on_ui.call_args[0][0]()
+        tray._icon.update_menu.assert_called_once()
+        assert tray._icon.icon is tray._icon_cache[Status.CONNECTED]
+        assert tray._icon.title == STATUS_TOOLTIPS[Status.CONNECTED]
+
     def test_reconnect_callback_stored(self):
         cb = MagicMock()
         tray = TrayIcon(on_reconnect=cb)
@@ -196,3 +214,51 @@ class TestMenuRefresh:
 
         assert any("NOT reachable" in label for label in down)
         assert not any("NOT reachable" in label for label in up)
+
+
+class TestOnUiThread:
+    """_on_ui_thread must hand AppKit work to the macOS main run loop."""
+
+    def _fake_appkit(self, is_main):
+        import sys as _sys
+        from types import SimpleNamespace, ModuleType
+        foundation = ModuleType("Foundation")
+        foundation.NSThread = SimpleNamespace(isMainThread=lambda: is_main)
+        app_helper = ModuleType("PyObjCTools.AppHelper")
+        app_helper.callAfter = MagicMock()
+        pkg = ModuleType("PyObjCTools")
+        pkg.AppHelper = app_helper
+        return {
+            "Foundation": foundation,
+            "PyObjCTools": pkg,
+            "PyObjCTools.AppHelper": app_helper,
+        }, app_helper
+
+    def test_runs_inline_off_darwin(self):
+        from socks_proxy.tray import _on_ui_thread
+        called = []
+        with patch("socks_proxy.tray.sys.platform", "linux"):
+            _on_ui_thread(lambda: called.append(True))
+        assert called == [True]
+
+    def test_defers_to_main_loop_on_darwin_worker_thread(self):
+        import sys as _sys
+        from socks_proxy.tray import _on_ui_thread
+        modules, app_helper = self._fake_appkit(is_main=False)
+        called = []
+        with patch.dict(_sys.modules, modules), \
+                patch("socks_proxy.tray.sys.platform", "darwin"):
+            _on_ui_thread(lambda: called.append(True))
+        assert called == []
+        app_helper.callAfter.assert_called_once()
+
+    def test_runs_inline_on_darwin_main_thread(self):
+        import sys as _sys
+        from socks_proxy.tray import _on_ui_thread
+        modules, app_helper = self._fake_appkit(is_main=True)
+        called = []
+        with patch.dict(_sys.modules, modules), \
+                patch("socks_proxy.tray.sys.platform", "darwin"):
+            _on_ui_thread(lambda: called.append(True))
+        assert called == [True]
+        app_helper.callAfter.assert_not_called()
