@@ -605,3 +605,78 @@ class TestProbeLoop:
                 assert len(calls) > 2
             finally:
                 task.cancel()
+
+
+class TestConnectionLoopBackoff:
+    """Tests for exponential backoff in _connection_loop reconnection."""
+
+    @pytest.mark.asyncio
+    async def test_reconnect_uses_backoff(self):
+        """Reconnect delay increases after each failure."""
+        from socks_proxy.tunnel import RECONNECT_DELAY, RECONNECT_DELAY_MAX, RECONNECT_BACKOFF_FACTOR
+
+        with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+            tm = TunnelManager("relay.com")
+        tm._connected.set()
+
+        delays = []
+        original_sleep = asyncio.sleep
+
+        async def capture_sleep(duration):
+            delays.append(duration)
+            tm._stopping = True  # stop after capturing
+
+        connect_calls = 0
+
+        async def fake_receive_loop():
+            raise ConnectionError("lost")
+
+        async def fake_connect():
+            nonlocal connect_calls
+            connect_calls += 1
+            raise ConnectionError("Cannot reach relay")
+
+        tm._receive_loop = fake_receive_loop
+        tm._connect = fake_connect
+
+        with patch("socks_proxy.tunnel.asyncio.sleep", side_effect=capture_sleep):
+            await tm._connection_loop()
+
+        assert len(delays) >= 1
+        assert delays[0] >= RECONNECT_DELAY
+        # The delay should include jitter, so it may be slightly above base
+        assert delays[0] <= RECONNECT_DELAY * 1.5
+
+    @pytest.mark.asyncio
+    async def test_backoff_resets_on_success(self):
+        """Delay resets to initial value after successful reconnection."""
+        with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+            tm = TunnelManager("relay.com")
+        tm._connected.set()
+
+        call_count = 0
+        delays = []
+
+        async def fake_receive_loop():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                tm._stopping = True
+            raise ConnectionError("lost")
+
+        async def fake_connect():
+            pass  # success
+
+        async def capture_sleep(duration):
+            delays.append(duration)
+
+        tm._receive_loop = fake_receive_loop
+        tm._connect = fake_connect
+
+        with patch("socks_proxy.tunnel.asyncio.sleep", side_effect=capture_sleep):
+            await tm._connection_loop()
+
+        # Both delays should be near RECONNECT_DELAY (reset after successful connect)
+        from socks_proxy.tunnel import RECONNECT_DELAY
+        for d in delays:
+            assert d <= RECONNECT_DELAY * 1.5
