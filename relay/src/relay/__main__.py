@@ -110,8 +110,8 @@ STREAM_CLEANUP_INTERVAL = _get_int_env("RELAY_CLEANUP_INTERVAL", 30)  # seconds 
 
 # Rate limiting constants - configurable via environment variables
 RATE_LIMIT_CONNECTIONS_PER_MIN = _get_int_env("RELAY_RATE_CONNECTIONS_PER_MIN", 10)
-RATE_LIMIT_MESSAGES_PER_SEC = _get_int_env("RELAY_RATE_MESSAGES_PER_SEC", 100)
-RATE_LIMIT_STREAMS_PER_MIN = _get_int_env("RELAY_RATE_STREAMS_PER_MIN", 50)
+RATE_LIMIT_MESSAGES_PER_SEC = _get_int_env("RELAY_RATE_MESSAGES_PER_SEC", 500)
+RATE_LIMIT_STREAMS_PER_MIN = _get_int_env("RELAY_RATE_STREAMS_PER_MIN", 300)
 
 # Maximum active streams across all users
 MAX_ACTIVE_STREAMS = _get_int_env("RELAY_MAX_ACTIVE_STREAMS", 500)

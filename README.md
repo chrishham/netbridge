@@ -152,8 +152,8 @@ The relay is configured entirely through environment variables.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RELAY_RATE_CONNECTIONS_PER_MIN` | Max WebSocket connections per user per minute | `10` |
-| `RELAY_RATE_MESSAGES_PER_SEC` | Max messages per user per second | `100` |
-| `RELAY_RATE_STREAMS_PER_MIN` | Max new TCP streams per user per minute | `50` |
+| `RELAY_RATE_MESSAGES_PER_SEC` | Max messages per user per second | `500` |
+| `RELAY_RATE_STREAMS_PER_MIN` | Max new TCP streams per user per minute | `300` |
 | `RELAY_RATE_IP_CONNECTIONS_PER_MIN` | Max connections per IP per minute (pre-auth) | `30` |
 | `RELAY_MAX_ACTIVE_STREAMS` | Global maximum concurrent TCP streams | `500` |
 | `RELAY_GLOBAL_BANDWIDTH_LIMIT_MBPS` | Global bandwidth cap in Mbps (`0` = unlimited) | `0` |

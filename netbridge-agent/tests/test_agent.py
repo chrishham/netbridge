@@ -453,3 +453,60 @@ class TestHandleMessage:
         ws = MagicMock()
         msg = json.dumps({"type": "unknown_type"})
         await handle_message(state, ws, msg)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Reconnect delay reset
+# ---------------------------------------------------------------------------
+
+
+class TestReconnectDelayReset:
+    """Agent should reset backoff delay after a healthy connection."""
+
+    @pytest.mark.asyncio
+    async def test_delay_resets_after_long_connection(self):
+        """When a connection lasts > HEALTHY_THRESHOLD, delay resets to initial."""
+        from netbridge_agent.agent import run_agent, RECONNECT_DELAY
+
+        delays = []
+        call_count = 0
+        stop = asyncio.Event()
+
+        async def fake_connect_and_run(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First connection: simulate a healthy 120-second connection
+                # that was closed by the server (not intentional stop)
+                return False, 120.0
+            elif call_count == 2:
+                # Second connection: another healthy connection
+                return False, 90.0
+            else:
+                # Third connection: stop
+                stop.set()
+                return True, 5.0
+
+        async def capture_wait(coro, timeout):
+            delays.append(timeout)
+            if stop.is_set():
+                return
+            raise asyncio.TimeoutError
+
+        with patch("netbridge_agent.agent.connect_and_run", side_effect=fake_connect_and_run), \
+             patch("netbridge_agent.agent.check_az_login", return_value=(True, "ok")), \
+             patch("netbridge_agent.agent.get_arm_token", return_value="tok"), \
+             patch("netbridge_agent.agent.check_token_expiration", return_value=(True, "ok")), \
+             patch("netbridge_agent.agent.get_user_identity", return_value="user@test"), \
+             patch("netbridge_agent.agent.cleanup_idle_streams", new_callable=AsyncMock), \
+             patch("netbridge_agent.agent.token_refresh_loop", new_callable=AsyncMock), \
+             patch("asyncio.wait_for", side_effect=capture_wait):
+            await run_agent("relay.com", stop)
+
+        # After healthy long connections, delay should reset to RECONNECT_DELAY
+        # We should see initial delay (RECONNECT_DELAY) after first healthy disconnect
+        assert len(delays) >= 2
+        # First delay after 120s connection should be RECONNECT_DELAY (not escalated)
+        assert delays[0] == RECONNECT_DELAY
+        # Second delay after 90s connection should also be RECONNECT_DELAY
+        assert delays[1] == RECONNECT_DELAY

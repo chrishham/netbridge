@@ -9,6 +9,7 @@ import asyncio
 import base64
 import inspect
 import logging
+import random
 import secrets
 from typing import Callable, Optional
 
@@ -93,6 +94,7 @@ from .auth import (
     RECONNECT_DELAY_MAX,
     RECONNECT_BACKOFF_FACTOR,
     HEARTBEAT_INTERVAL,
+    CLIENT_HEARTBEAT_INTERVAL,
     IDLE_STREAM_TIMEOUT,
     STALLED_STREAM_CLEANUP_INTERVAL,
     MAX_CONCURRENT_STREAMS,
@@ -345,7 +347,7 @@ class TunnelManager:
             self.ws = await self.session.ws_connect(
                 self.relay_url,
                 headers=headers,
-                heartbeat=HEARTBEAT_INTERVAL,
+                heartbeat=CLIENT_HEARTBEAT_INTERVAL,
             )
             self._connected.set()
             self._auth_failure_count = 0  # Reset on successful connection
@@ -373,10 +375,16 @@ class TunnelManager:
 
     async def _connection_loop(self) -> None:
         """Manage connection lifecycle with automatic reconnection."""
+        current_delay = RECONNECT_DELAY
         while not self._stopping and not self._permanent_failure:
             try:
                 # Run receive loop until disconnected
                 await self._receive_loop()
+                # Only reset backoff if we actually had a live connection
+                # (ws=None means _receive_loop returned immediately after
+                # a failed reconnect — not a healthy session)
+                if self._connected.is_set():
+                    current_delay = RECONNECT_DELAY
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -392,18 +400,22 @@ class TunnelManager:
                 await self.ws.close()
             self.ws = None
 
-            logger.info(f"Reconnecting in {RECONNECT_DELAY}s...")
-            await asyncio.sleep(RECONNECT_DELAY)
+            jitter = random.uniform(0, current_delay * 0.3)
+            sleep_time = current_delay + jitter
+            logger.info(f"Reconnecting in {sleep_time:.0f}s...")
+            await asyncio.sleep(sleep_time)
 
             try:
                 await self._connect()
                 self._notify_status(connected=True)
-                # The VDI may have changed state while we were away. The probe
-                # loop does the work: this loop has to get back to receiving.
                 self._probe_now.set()
+                # Successful connect — reset backoff
+                current_delay = RECONNECT_DELAY
             except ConnectionError as e:
                 error_str = str(e)
                 logger.error(f"Reconnection failed: {e}")
+                # Increase backoff for next attempt
+                current_delay = min(current_delay * RECONNECT_BACKOFF_FACTOR, RECONNECT_DELAY_MAX)
 
                 # Handle auth errors (401)
                 if "(401)" in error_str or "Token invalid" in error_str:
@@ -415,7 +427,6 @@ class TunnelManager:
                         self._permanent_failure = True
                         break
 
-                    # Try to refresh token
                     if self._token_refresh_callback:
                         try:
                             logger.info("Refreshing auth token...")
@@ -430,7 +441,6 @@ class TunnelManager:
                         self._permanent_failure = True
                         break
 
-                # Handle forbidden errors (403) - no point retrying
                 elif "(403)" in error_str:
                     logger.error("Access forbidden. Your account may not have permission.")
                     self._permanent_failure = True
