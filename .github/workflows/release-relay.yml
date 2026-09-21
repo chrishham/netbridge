@@ -58,6 +58,7 @@ jobs:
           exit-code: "1"
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          trivyignores: deploy/.trivyignore
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v6

@@ -1,0 +1,2 @@
+# msgpack is in the python:3.14-slim base image, not used by the relay
+GHSA-6v7p-g79w-8964

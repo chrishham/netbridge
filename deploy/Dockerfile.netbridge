@@ -13,8 +13,7 @@ COPY relay/pyproject.toml relay/uv.lock* ./
 COPY relay/src ./src
 
 # Install dependencies
-RUN uv sync --frozen --no-dev && \
-    pip install --no-cache-dir --upgrade 'msgpack>=1.2.1' 2>/dev/null; true
+RUN uv sync --frozen --no-dev
 
 # Run as non-root
 USER 65534

@@ -400,7 +400,7 @@ class TunnelManager:
                 await self.ws.close()
             self.ws = None
 
-            jitter = random.uniform(0, current_delay * 0.3)
+            jitter = random.uniform(0, current_delay * 0.3)  # nosec B311
             sleep_time = current_delay + jitter
             logger.info(f"Reconnecting in {sleep_time:.0f}s...")
             await asyncio.sleep(sleep_time)
