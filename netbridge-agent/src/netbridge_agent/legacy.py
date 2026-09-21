@@ -37,6 +37,7 @@ from .auth import (
     RECONNECT_DELAY_MAX,
     RECONNECT_BACKOFF_FACTOR,
     HEARTBEAT_INTERVAL,
+    CLIENT_HEARTBEAT_INTERVAL,
     IDLE_STREAM_TIMEOUT,
     STALLED_STREAM_CLEANUP_INTERVAL,
     MAX_ACTIVE_STREAMS,
@@ -547,7 +548,7 @@ async def connect_and_run(
             relay_url,
             proxy=proxy,
             proxy_headers=proxy_headers,
-            heartbeat=HEARTBEAT_INTERVAL,
+            heartbeat=CLIENT_HEARTBEAT_INTERVAL,
             headers=headers,
         ) as ws:
             try:
