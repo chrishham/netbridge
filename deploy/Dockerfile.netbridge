@@ -2,8 +2,8 @@ FROM python:3.14-slim
 
 WORKDIR /app
 
-# Install uv
-RUN pip install --no-cache-dir uv
+# Install uv via standalone installer (avoids pip transitive deps like msgpack)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Copy shared auth library (relay depends on it via path = "../shared")
 COPY shared /shared
