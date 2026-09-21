@@ -113,6 +113,32 @@ def _open_login_terminal() -> None:
         logger.error(f"Failed to open login terminal: {e}")
 
 
+def _on_ui_thread(func: Callable[[], None]) -> None:
+    """Run a callable that touches the tray widget on the UI thread.
+
+    On macOS the status item belongs to the main run loop: calling
+    ``setMenu_``/``setImage_`` from the proxy or asyncio threads trips an
+    AppKit main-thread assertion and kills the process with SIGTRAP. Hand
+    the work to the main run loop instead. On every other platform pystray
+    is happy to be driven from any thread, so the call is direct.
+    """
+    if sys.platform != "darwin":
+        func()
+        return
+
+    try:
+        from Foundation import NSThread
+        from PyObjCTools import AppHelper
+    except ImportError:
+        func()
+        return
+
+    if NSThread.isMainThread():
+        func()
+    else:
+        AppHelper.callAfter(func)
+
+
 class TrayIcon:
 
     def __init__(
@@ -151,15 +177,20 @@ class TrayIcon:
         old = self._status
         self._status = status
         if self._icon:
-            self._icon.icon = self._icon_cache[status]
-            self._icon.title = STATUS_TOOLTIPS[status]
-            # The menu labels are dynamic; pystray caches them and only
-            # re-evaluates on update_menu(). Without this the "Status:",
-            # "Relay:" and "VDI agent:" lines keep the previous status.
-            try:
-                self._icon.update_menu()
-            except Exception:
-                pass
+            icon = self._icon
+
+            def apply_status() -> None:
+                try:
+                    icon.icon = self._icon_cache[status]
+                    icon.title = STATUS_TOOLTIPS[status]
+                    # The menu labels are dynamic; pystray caches them and only
+                    # re-evaluates on update_menu(). Without this the "Status:",
+                    # "Relay:" and "VDI agent:" lines keep the previous status.
+                    icon.update_menu()
+                except Exception:
+                    logger.debug("Tray status update failed", exc_info=True)
+
+            _on_ui_thread(apply_status)
 
             if old != status:
                 if status == Status.CONNECTED:
