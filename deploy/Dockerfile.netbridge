@@ -14,7 +14,7 @@ COPY relay/src ./src
 
 # Install dependencies
 RUN uv sync --frozen --no-dev && \
-    pip uninstall -y msgpack 2>/dev/null; true
+    pip install --no-cache-dir --upgrade 'msgpack>=1.2.1' 2>/dev/null; true
 
 # Run as non-root
 USER 65534
