@@ -94,6 +94,7 @@ from .auth import (
     RECONNECT_DELAY_MAX,
     RECONNECT_BACKOFF_FACTOR,
     HEARTBEAT_INTERVAL,
+    CLIENT_HEARTBEAT_INTERVAL,
     IDLE_STREAM_TIMEOUT,
     STALLED_STREAM_CLEANUP_INTERVAL,
     MAX_CONCURRENT_STREAMS,
@@ -346,7 +347,7 @@ class TunnelManager:
             self.ws = await self.session.ws_connect(
                 self.relay_url,
                 headers=headers,
-                heartbeat=HEARTBEAT_INTERVAL,
+                heartbeat=CLIENT_HEARTBEAT_INTERVAL,
             )
             self._connected.set()
             self._auth_failure_count = 0  # Reset on successful connection

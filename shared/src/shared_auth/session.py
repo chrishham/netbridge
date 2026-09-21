@@ -31,10 +31,11 @@ RECONNECT_DELAY = 5  # seconds - initial delay between reconnection attempts
 RECONNECT_DELAY_MAX = 60  # seconds - maximum backoff delay
 RECONNECT_BACKOFF_FACTOR = 2  # multiplier for each failed attempt
 HEARTBEAT_INTERVAL = get_int_env("NETBRIDGE_HEARTBEAT_INTERVAL", 30)  # seconds - ping interval
+CLIENT_HEARTBEAT_INTERVAL = get_int_env("NETBRIDGE_CLIENT_HEARTBEAT_INTERVAL", 45)  # seconds - client-side ping (more tolerant)
 WS_CONNECT_TIMEOUT = get_int_env("NETBRIDGE_WS_CONNECT_TIMEOUT", 30)  # seconds - connection timeout
 MAX_AUTH_FAILURES = 3  # consecutive auth failures before giving up
 TOKEN_REFRESH_CHECK_INTERVAL = 60  # seconds - how often to check token expiration
-TOKEN_REFRESH_THRESHOLD = 600  # seconds - refresh when less than 10 minutes remaining
+TOKEN_REFRESH_THRESHOLD = 300  # seconds - refresh when less than 5 minutes remaining
 
 # Stream management constants - configurable via environment variables
 IDLE_STREAM_TIMEOUT = get_int_env("NETBRIDGE_IDLE_STREAM_TIMEOUT", 120)  # seconds - idle timeout

@@ -39,6 +39,7 @@ from .auth import (
     RECONNECT_DELAY_MAX,
     RECONNECT_BACKOFF_FACTOR,
     HEARTBEAT_INTERVAL,
+    CLIENT_HEARTBEAT_INTERVAL,
     IDLE_STREAM_TIMEOUT,
     STALLED_STREAM_CLEANUP_INTERVAL,
     MAX_ACTIVE_STREAMS,
@@ -52,12 +53,12 @@ from .auth import (
 logger = logging.getLogger(__name__)
 
 # Constants
-TCP_BUFFER_SIZE = 8192
+TCP_BUFFER_SIZE = 65536
 CLEANUP_INTERVAL = STALLED_STREAM_CLEANUP_INTERVAL
 STATS_INTERVAL = 60
 READ_TIMEOUT = 300
 WRITE_TIMEOUT = 30
-CONNECTION_LIVENESS_TIMEOUT = 90
+CONNECTION_LIVENESS_TIMEOUT = 135
 APP_HEARTBEAT_INTERVAL = 30
 MAX_CONCURRENT_CONNECTIONS = 50
 HEALTHY_CONNECTION_THRESHOLD = 60  # seconds — reset backoff if connection lasted this long
@@ -720,7 +721,7 @@ async def connect_and_run(
             relay_url,
             proxy=proxy,
             proxy_headers=proxy_headers,
-            heartbeat=HEARTBEAT_INTERVAL,
+            heartbeat=CLIENT_HEARTBEAT_INTERVAL,
             headers=headers,
         ) as ws:
             # Wait for registration
