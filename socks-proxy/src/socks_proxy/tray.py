@@ -178,19 +178,16 @@ class TrayIcon:
         self._status = status
         if self._icon:
             icon = self._icon
+            icon.icon = self._icon_cache[status]
+            icon.title = STATUS_TOOLTIPS[status]
 
-            def apply_status() -> None:
+            def apply_menu() -> None:
                 try:
-                    icon.icon = self._icon_cache[status]
-                    icon.title = STATUS_TOOLTIPS[status]
-                    # The menu labels are dynamic; pystray caches them and only
-                    # re-evaluates on update_menu(). Without this the "Status:",
-                    # "Relay:" and "VDI agent:" lines keep the previous status.
                     icon.update_menu()
                 except Exception:
-                    logger.debug("Tray status update failed", exc_info=True)
+                    logger.debug("Tray menu update failed", exc_info=True)
 
-            _on_ui_thread(apply_status)
+            _on_ui_thread(apply_menu)
 
             if old != status:
                 if status == Status.CONNECTED:
@@ -216,10 +213,15 @@ class TrayIcon:
 
     def _notify(self, title: str, message: str) -> None:
         if self._icon and self._show_notifications:
-            try:
-                self._icon.notify(message, title)
-            except Exception:
-                pass
+            icon = self._icon
+
+            def send_notification() -> None:
+                try:
+                    icon.notify(message, title)
+                except Exception:
+                    pass
+
+            _on_ui_thread(send_notification)
 
     def _create_menu(self) -> pystray.Menu:
         def get_status_text(item):
@@ -316,4 +318,5 @@ class TrayIcon:
 
     def stop(self) -> None:
         if self._icon:
-            self._icon.stop()
+            icon = self._icon
+            _on_ui_thread(icon.stop)

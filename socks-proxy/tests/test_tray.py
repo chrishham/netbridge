@@ -57,10 +57,12 @@ class TestTrayIcon:
         tray = TrayIcon(show_notifications=True)
         tray._icon = MagicMock()
         tray.set_status(Status.CONNECTED)
+        # notify is deferred via _on_ui_thread; inline call lands immediately
+        # on non-darwin (tests run on Linux)
         tray._icon.notify.assert_called_once()
 
     def test_status_update_goes_through_ui_thread(self):
-        """Icon, tooltip and menu must be refreshed via _on_ui_thread.
+        """Menu refresh and notification must go via _on_ui_thread.
 
         Touching the status item directly from the proxy threads trips an
         AppKit main-thread assertion on macOS and kills the process.
@@ -69,11 +71,13 @@ class TestTrayIcon:
         tray._icon = MagicMock()
         with patch("socks_proxy.tray._on_ui_thread") as on_ui:
             tray.set_status(Status.CONNECTED)
-            on_ui.assert_called_once()
+            # Two calls: one for menu update, one for notification
+            assert on_ui.call_count == 2
             tray._icon.update_menu.assert_not_called()
-            # The deferred callable does the actual widget work
-            on_ui.call_args[0][0]()
+            # First deferred callable is the menu update
+            on_ui.call_args_list[0][0][0]()
         tray._icon.update_menu.assert_called_once()
+        # icon and title are set inline (not AppKit-sensitive)
         assert tray._icon.icon is tray._icon_cache[Status.CONNECTED]
         assert tray._icon.title == STATUS_TOOLTIPS[Status.CONNECTED]
 
@@ -91,7 +95,10 @@ class TestTrayIcon:
     def test_stop(self, mock_pystray):
         tray = TrayIcon()
         tray._icon = MagicMock()
-        tray.stop()
+        with patch("socks_proxy.tray._on_ui_thread") as on_ui:
+            tray.stop()
+            on_ui.assert_called_once()
+            on_ui.call_args[0][0]()
         tray._icon.stop.assert_called_once()
 
 
@@ -220,7 +227,6 @@ class TestOnUiThread:
     """_on_ui_thread must hand AppKit work to the macOS main run loop."""
 
     def _fake_appkit(self, is_main):
-        import sys as _sys
         from types import SimpleNamespace, ModuleType
         foundation = ModuleType("Foundation")
         foundation.NSThread = SimpleNamespace(isMainThread=lambda: is_main)
