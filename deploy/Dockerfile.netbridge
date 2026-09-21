@@ -13,7 +13,8 @@ COPY relay/pyproject.toml relay/uv.lock* ./
 COPY relay/src ./src
 
 # Install dependencies
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev && \
+    pip uninstall -y msgpack 2>/dev/null; true
 
 # Run as non-root
 USER 65534
