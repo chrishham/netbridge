@@ -60,6 +60,7 @@ WRITE_TIMEOUT = 30
 CONNECTION_LIVENESS_TIMEOUT = 90
 APP_HEARTBEAT_INTERVAL = 30
 MAX_CONCURRENT_CONNECTIONS = 50
+HEALTHY_CONNECTION_THRESHOLD = 60  # seconds — reset backoff if connection lasted this long
 
 # Maximum size for incoming tcp_data payloads (1MB decoded)
 MAX_TCP_DATA_SIZE = 1 * 1024 * 1024
@@ -703,10 +704,10 @@ async def connect_and_run(
     stop_event: asyncio.Event,
     on_status_change: Optional[StatusCallback],
     on_session_info: Optional[SessionInfoCallback],
-) -> bool:
+) -> tuple[bool, float]:
     """Establish WebSocket connection and process messages.
 
-    Returns True if connection was successful and ended normally.
+    Returns (intentional_stop, connection_duration_seconds).
     """
     connector = create_tunnel_connector()
     session_id = get_session_id()
@@ -729,19 +730,20 @@ async def connect_and_run(
                     data = json.loads(msg.data)
                     if data.get("type") == "registered":
                         logger.info(f"Connected to relay (session: {session_id})")
+                        connected_at = time.monotonic()
                         if on_status_change:
                             on_status_change(True, False)
                         if on_session_info:
                             on_session_info(session_id)
                     else:
                         logger.warning(f"Unexpected first message: {data.get('type')}")
-                        return False
+                        return False, 0.0
                 else:
                     logger.warning(f"Unexpected message type: {msg.type}")
-                    return False
+                    return False, 0.0
             except asyncio.TimeoutError:
                 logger.warning("Timeout waiting for registration")
-                return False
+                return False, 0.0
 
             liveness_tracker = {"last_message_time": time.monotonic()}
             heartbeat_task = asyncio.create_task(
@@ -776,7 +778,7 @@ async def connect_and_run(
                         logger.info("Connection closed by server")
                         break
 
-                return stop_event.is_set()  # True if we stopped intentionally
+                return stop_event.is_set(), time.monotonic() - connected_at
 
             finally:
                 heartbeat_task.cancel()
@@ -906,7 +908,7 @@ async def run_agent(
                 if on_status_change:
                     on_status_change(False, False)  # Connecting
 
-                success = await connect_and_run(
+                intentional_stop, duration = await connect_and_run(
                     state, relay_url, proxy, proxy_auth_header,
                     token_holder.get(), stop_event,
                     on_status_change, on_session_info,
@@ -915,8 +917,11 @@ async def run_agent(
                 if stop_event.is_set():
                     break
 
-                if success:
+                if intentional_stop:
                     token_holder.failure_count = 0
+                    current_delay = RECONNECT_DELAY
+                elif duration >= HEALTHY_CONNECTION_THRESHOLD:
+                    # Connection was alive long enough — not a connect failure
                     current_delay = RECONNECT_DELAY
 
             except aiohttp.WSServerHandshakeError as e:
