@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 import aiohttp
@@ -324,19 +325,40 @@ class NetBridgeSocksApp:
         try:
             Installer.terminate_running_instances()
             target = get_installed_exe_path()
-            temp = target.with_name(f"{target.name}.tmp")
-            shutil.copy2(dest, temp)
-            os.replace(temp, target)
             Installer.save_installed_version(update.version)
-            dest.unlink(missing_ok=True)
-            logger.info(f"Updated to v{update.version}, restarting")
+            logger.info(f"Updated to v{update.version}, launching updater script")
         except Exception as e:
             logger.error(f"Update apply failed: {e}")
             if self.tray:
                 self.tray.show_notification("Update Failed", f"Install error: {e}")
             return
 
-        self.request_restart()
+        self._launch_update_script(dest, target)
+
+    def _launch_update_script(self, source: Path, target: Path) -> None:
+        """Write and launch a batch script that swaps the exe after we exit."""
+        script = target.with_name("_update.cmd")
+        pid = os.getpid()
+        script.write_text(
+            f'@echo off\r\n'
+            f':wait\r\n'
+            f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
+            f'if not errorlevel 1 (\r\n'
+            f'    timeout /T 1 /NOBREAK >nul\r\n'
+            f'    goto wait\r\n'
+            f')\r\n'
+            f'move /Y "{source}" "{target}" >nul\r\n'
+            f'del "{target.with_name(target.name + ".tmp")}" 2>nul\r\n'
+            f'start "" "{target}" --no-install\r\n'
+            f'del "%~f0"\r\n',
+            encoding="utf-8",
+        )
+        logger.info(f"Launching update script: {script}")
+        subprocess.Popen(
+            ["cmd", "/C", str(script)],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+        )
+        self.request_exit()
 
     # --- Async proxy loop ---
 
