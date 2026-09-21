@@ -380,8 +380,11 @@ class TunnelManager:
             try:
                 # Run receive loop until disconnected
                 await self._receive_loop()
-                # Connection was healthy — reset backoff
-                current_delay = RECONNECT_DELAY
+                # Only reset backoff if we actually had a live connection
+                # (ws=None means _receive_loop returned immediately after
+                # a failed reconnect — not a healthy session)
+                if self._connected.is_set():
+                    current_delay = RECONNECT_DELAY
             except asyncio.CancelledError:
                 break
             except Exception as e:
