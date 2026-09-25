@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directories:
+      - "/netbridge-agent"
+      - "/relay"
+      - "/security-tests"
+      - "/shared"
+      - "/socks-proxy"
+      - "/socks-proxy-win"
+    schedule:
+      interval: "weekly"
+    groups:
+      uv:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
