@@ -682,7 +682,7 @@ async def token_refresh_loop(token_holder: TokenHolder, stop_event: asyncio.Even
 
         if remaining < TOKEN_REFRESH_THRESHOLD:
             logger.info(f"Token expires in {int(remaining)}s, refreshing...")
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             try:
                 success = await asyncio.wait_for(
                     loop.run_in_executor(None, token_holder.refresh),
@@ -872,7 +872,7 @@ async def run_agent(
     auth_token = None
     token_refresh = get_arm_token
     auth_delay = RECONNECT_DELAY
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     while not stop_event.is_set():
         logger.info("Authenticating with Azure CLI...")

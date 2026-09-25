@@ -162,7 +162,7 @@ class NetBridgeApp:
                 elif status == Status.DISCONNECTED and old_status == Status.CONNECTED:
                     self.tray.show_notification("Disconnected", "Connection lost, reconnecting...")
                 elif status == Status.AUTH_REQUIRED:
-                    self.tray.show_notification("Login Required", "Authentication expired - click to login")
+                    self.tray.show_notification("Login Required", "Azure authentication failed - click to login")
 
         logger.info(f"Status changed: {old_status.value} -> {status.value}")
 
