@@ -797,6 +797,30 @@ async def connect_and_run(
                 await close_all_streams(state)
 
 
+def _initial_auth() -> tuple[Optional[str], Optional[str]]:
+    """Check az login and fetch an ARM token.
+
+    Returns:
+        (token, None) on success, (None, error_message) on failure.
+    """
+    logged_in, message = check_az_login()
+    if not logged_in:
+        return None, message
+    logger.info(message)
+
+    try:
+        auth_token = get_arm_token()
+        is_valid, token_msg = check_token_expiration(auth_token)
+        if not is_valid:
+            return None, token_msg
+
+        user = get_user_identity() or "unknown"
+        logger.info(f"Authenticated as: {user}")
+        return auth_token, None
+    except RuntimeError as e:
+        return None, str(e)
+
+
 async def run_agent(
     relay_url: str,
     stop_event: asyncio.Event,
@@ -840,36 +864,35 @@ async def run_agent(
     except Exception as e:
         logger.warning(f"Failed to load passthrough proxy creds: {e}")
 
-    # Get authentication
+    # Get authentication. Retry with backoff rather than giving up: a failure
+    # here is often transient (az CLI timing out on a slow host, network not
+    # up yet at logon), and returning would leave the process alive but
+    # permanently disconnected. Once the user runs 'az login', the next
+    # attempt picks it up.
     auth_token = None
-    token_refresh = None
+    token_refresh = get_arm_token
+    auth_delay = RECONNECT_DELAY
+    loop = asyncio.get_event_loop()
 
-    logger.info("Authenticating with Azure CLI...")
-    logged_in, message = check_az_login()
-    if not logged_in:
-        logger.error(f"Auth failed: {message}")
+    while not stop_event.is_set():
+        logger.info("Authenticating with Azure CLI...")
+        # az CLI calls block for up to AZ_CLI_TIMEOUT; keep them off the
+        # event loop so the intercept server stays responsive.
+        auth_token, error = await loop.run_in_executor(None, _initial_auth)
+        if auth_token:
+            break
+
+        logger.error(f"Auth failed: {error}")
         if on_status_change:
             on_status_change(False, True)
-        return
+        logger.info(f"Retrying authentication in {auth_delay}s...")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=auth_delay)
+        except asyncio.TimeoutError:
+            pass
+        auth_delay = min(auth_delay * RECONNECT_BACKOFF_FACTOR, RECONNECT_DELAY_MAX)
 
-    logger.info(message)
-
-    try:
-        auth_token = get_arm_token()
-        is_valid, token_msg = check_token_expiration(auth_token)
-        if not is_valid:
-            logger.error(token_msg)
-            if on_status_change:
-                on_status_change(False, True)
-            return
-
-        user = get_user_identity() or "unknown"
-        logger.info(f"Authenticated as: {user}")
-        token_refresh = get_arm_token
-    except RuntimeError as e:
-        logger.error(f"Auth failed: {e}")
-        if on_status_change:
-            on_status_change(False, True)
+    if not auth_token:
         return
 
     # Get proxy settings
