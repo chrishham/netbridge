@@ -670,11 +670,13 @@ class NetBridgeApp:
 
     async def _run_agent(self) -> None:
         """Run the agent connection loop."""
-        from .agent import run_agent
-
         self.set_status(Status.CONNECTING)
 
         try:
+            # Import inside the try: this runs as a fire-and-forget task, so
+            # an exception raised outside it would kill the agent silently.
+            from .agent import run_agent
+
             # Create new stop event for this connection
             self._stop_event = asyncio.Event()
 
@@ -687,7 +689,7 @@ class NetBridgeApp:
                 get_intercept_server=lambda: self._intercept_server,
             )
         except Exception as e:
-            logger.error(f"Agent error: {e}")
+            logger.exception(f"Agent error: {e}")
         finally:
             self.set_status(Status.DISCONNECTED)
 

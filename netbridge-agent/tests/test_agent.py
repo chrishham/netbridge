@@ -510,3 +510,66 @@ class TestReconnectDelayReset:
         assert delays[0] == RECONNECT_DELAY
         # Second delay after 90s connection should also be RECONNECT_DELAY
         assert delays[1] == RECONNECT_DELAY
+
+
+# ---------------------------------------------------------------------------
+# Initial auth retry
+# ---------------------------------------------------------------------------
+
+
+class TestInitialAuthRetry:
+    """A failed initial auth must be retried, not leave the agent dead."""
+
+    @pytest.mark.asyncio
+    async def test_retries_after_transient_auth_failure(self):
+        """az CLI timeout on first attempt -> agent retries and then connects."""
+        from netbridge_agent.agent import run_agent, RECONNECT_DELAY
+
+        stop = asyncio.Event()
+        statuses = []
+        delays = []
+        login_results = iter([
+            (False, "Azure CLI timed out after 30s."),
+            (True, "ok"),
+        ])
+
+        async def fake_connect_and_run(*args, **kwargs):
+            stop.set()
+            return True, 5.0
+
+        async def capture_wait(coro, timeout):
+            coro.close()
+            delays.append(timeout)
+            raise asyncio.TimeoutError
+
+        with patch("netbridge_agent.agent.connect_and_run", side_effect=fake_connect_and_run) as mock_connect, \
+             patch("netbridge_agent.agent.check_az_login", side_effect=lambda: next(login_results)), \
+             patch("netbridge_agent.agent.get_arm_token", return_value="tok"), \
+             patch("netbridge_agent.agent.check_token_expiration", return_value=(True, "ok")), \
+             patch("netbridge_agent.agent.get_user_identity", return_value="user@test"), \
+             patch("netbridge_agent.agent.cleanup_idle_streams", new_callable=AsyncMock), \
+             patch("netbridge_agent.agent.token_refresh_loop", new_callable=AsyncMock), \
+             patch("asyncio.wait_for", side_effect=capture_wait):
+            await run_agent("relay.com", stop, on_status_change=lambda c, a: statuses.append((c, a)))
+
+        assert statuses[0] == (False, True)  # auth_required reported while retrying
+        assert delays[0] == RECONNECT_DELAY
+        mock_connect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_during_auth_retry_returns(self):
+        """Stopping while waiting to retry auth exits cleanly without connecting."""
+        from netbridge_agent.agent import run_agent
+
+        stop = asyncio.Event()
+
+        async def stop_on_wait(coro, timeout):
+            coro.close()
+            stop.set()
+
+        with patch("netbridge_agent.agent.connect_and_run", new_callable=AsyncMock) as mock_connect, \
+             patch("netbridge_agent.agent.check_az_login", return_value=(False, "Not logged in")), \
+             patch("asyncio.wait_for", side_effect=stop_on_wait):
+            await run_agent("relay.com", stop)
+
+        mock_connect.assert_not_called()
