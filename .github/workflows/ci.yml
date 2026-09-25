@@ -13,13 +13,13 @@ jobs:
       NETBRIDGE_ALLOWED_TENANTS: "11111111-1111-1111-1111-111111111111"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       - name: Install system dependencies for socks-proxy tray
         run: sudo apt-get update && sudo apt-get install -y libgirepository-2.0-dev libcairo2-dev
@@ -52,13 +52,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       - name: Install system dependencies for socks-proxy tray
         run: sudo apt-get update && sudo apt-get install -y libgirepository-2.0-dev libcairo2-dev
