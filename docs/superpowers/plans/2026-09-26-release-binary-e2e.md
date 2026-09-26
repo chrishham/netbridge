@@ -18,7 +18,9 @@
 - Relay: `--no-auth --host 127.0.0.1`, env `NETBRIDGE_ALLOW_NO_AUTH=true`, `NETBRIDGE_ALLOWED_TENANTS=11111111-1111-1111-1111-111111111111`.
 - Default ports: relay `18080`, SOCKS5 `11080`, HTTP proxy `13128` (never the user-facing 1080/3128 — a developer's real proxy may be running).
 - Every process the driver launches gets `NO_PROXY`/`no_proxy` = `127.0.0.1,localhost,<target ip>`; the driver's own HTTP calls use no proxy.
-- Connected marker, both apps: log line matching `Status changed: \S+ -> connected`.
+- Log markers (verified against the source): agent connected = `Status changed: \S+ -> connected` (`NetBridgeApp.set_status`, console and tray); proxy end-to-end ready = `Bridge agent reachable - tunnel is working end to end` (`socks_proxy.tunnel`, shared by `serve` and the Windows app; logged only on change); relay session (re)established, both apps = `Connected to relay \(session: \w+\)`.
+- Proxy runs with its **default** probe target (`netbridge-exec:80`, answered by the agent itself) in both modes — the configuration users run.
+- Target hostname for the remote-DNS check: `netbridge-e2e-target`, mapped to the target IPv4 in the hosts file by CI (`--target-hostname`).
 - Exe mode install dirs: `%LOCALAPPDATA%\NetBridge\netbridge.exe` and `%LOCALAPPDATA%\NetBridgeSocks\netbridge-socks.exe`; Run values `NetBridge` / `NetBridgeSocks` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; uninstall MessageBox titles `Uninstall NetBridge` / `Uninstall NetBridgeSocks`.
 - Commit messages: plain human style, no AI attribution lines.
 
@@ -30,10 +32,14 @@
 4. **`--agent-console`** exe-mode flag: fallback if pystray cannot run in the hosted runner session (spec risk). Proxy has no such fallback without a product change.
 5. **Exe mode refuses to run when an install dir already exists** unless `--allow-existing-install` — protects a developer's real installation.
 6. **Traffic clients are exercised by unit tests against in-test fake proxies**; the real proxies are exercised by the source-mode journey itself.
+7. **Proxy readiness = "Bridge agent reachable"**, not a status-change line: `netbridge-socks serve --no-tray` has no status callback, and the Windows app reports CONNECTED before the probe answers (`agent_available=None`). The spec's `probe_target` = HTTP target is dropped in favour of the default probe (review round 1).
+8. **`ports_free` step first**: a stale relay or proxy from an earlier run on 18080/11080/13128 would otherwise answer for the new one and produce a false pass.
+9. **Remote DNS** is exercised with a hosts-file name (`netbridge-e2e-target`) written by the CI workflows; without `--target-hostname` the `socks5_dns` step reports "skipped" (still ok) so local runs need no admin rights.
+10. **Reconnect budget = 60 s after the restarted relay is ready** (the spec's promise), relay start-up itself gets its own 60 s.
 
 ## Review Focus
 
-- **A previous run left a relay/proxy bound to the port** → `relay_up`/`proxy_started` must fail fast with the log tail, not wait out the full timeout. Test: `Relay.wait_ready` returns `False` promptly once the process dies (Task 5).
+- **A previous run left a relay/proxy bound to a port** → the gate must fail up front instead of testing the stale process. Tests: `netinfo.port_in_use` detects a listener (Task 2); `Relay.start` refuses a busy port (Task 5).
 - **Developer shell has `HTTP_PROXY`/`HTTPS_PROXY` set** → driver's `/status` polling must not go through it. Test: `Relay.status()` works with `HTTP_PROXY=http://127.0.0.1:9` (Task 5).
 - **Proxy hangs instead of refusing** (e.g. blocked port) → every client call is bounded by a timeout and reports failure. Test: `socks5_connect` against a silent server raises `TimeoutError` (Task 3).
 - **A real Azure CLI is already on PATH** (hosted runners have one) → the fake must win. Test: `env_with_fake_az` resolves `az` to the fake even when another `az` dir is on PATH (Task 1).
@@ -305,7 +311,7 @@ git commit -m "Add e2e driver project with a fake Azure CLI"
 - Test: `e2e/tests/test_targets.py`
 
 **Interfaces:**
-- Produces: `targets.PAGE: bytes`, `targets.PAYLOAD: bytes`, `targets.PAYLOAD_SHA256: str`, `targets.Targets(host: str)` with attributes `host, http_port, echo_port, blocked_port: int`, `close()`, context manager; `netinfo.private_ipv4() -> str`.
+- Produces: `targets.PAGE: bytes`, `targets.PAYLOAD: bytes`, `targets.PAYLOAD_SHA256: str`, `targets.Targets(host: str)` with attributes `host, http_port, echo_port, blocked_port: int`, `close()`, context manager; `netinfo.private_ipv4() -> str`, `netinfo.port_in_use(port: int, host: str = "127.0.0.1") -> bool`; `python -m netbridge_e2e.netinfo` prints the IPv4.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -358,6 +364,15 @@ def test_private_ipv4_is_not_loopback_or_link_local():
     ip = ipaddress.ip_address(netinfo.private_ipv4())
     assert ip.version == 4
     assert not ip.is_loopback and not ip.is_link_local
+
+
+def test_port_in_use_detects_a_listener():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen()
+        port = s.getsockname()[1]
+        assert netinfo.port_in_use(port)
+    assert not netinfo.port_in_use(port)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -388,6 +403,18 @@ def private_ipv4() -> str:
     if addr.is_loopback or addr.is_link_local or addr.is_unspecified:
         raise RuntimeError(f"no usable non-loopback IPv4 (default route source is {ip})")
     return ip
+
+
+def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """True if something already accepts connections on host:port."""
+    with socket.socket() as s:
+        s.settimeout(1)
+        return s.connect_ex((host, port)) == 0
+
+
+if __name__ == "__main__":
+    # CI maps --target-hostname to this address in the hosts file
+    print(private_ipv4())
 ```
 
 `e2e/src/netbridge_e2e/targets.py`:
@@ -459,7 +486,7 @@ class Targets:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd e2e && uv run pytest tests/test_targets.py -v`
-Expected: 4 passed.
+Expected: 5 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -898,9 +925,22 @@ def test_proc_stop_kills_grandchildren(tmp_path):
         time.sleep(0.1)
     child = int(pidfile.read_text())
     p.stop()
-    time.sleep(0.5)
-    with pytest.raises(ProcessLookupError):
-        os.kill(child, 0)
+    deadline = time.monotonic() + 5
+    while not _gone(child) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert _gone(child)
+
+
+def _gone(pid):
+    """Dead or a zombie waiting for its (re)parent to reap it."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        return open(f"/proc/{pid}/stat").read().split(")")[-1].split()[0] == "Z"
+    except OSError:
+        return True
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1051,12 +1091,12 @@ git commit -m "Add process-tree and log-polling helpers for the e2e driver"
 **Interfaces:**
 - Consumes: `procs.Proc`, `procs.LogWatch`, `procs.kill_image`, `procs.IS_WINDOWS`.
 - Produces:
-  - `stack.REPO: Path`, `stack.CONNECTED = r"Status changed: \S+ -> connected"`
-  - `stack.Relay(logs_dir: Path, port: int, blocked_port: int, env: dict)` — `.url -> str`, `.logs: LogWatch`, `start()`, `stop()`, `alive() -> bool`, `status() -> dict | None`, `wait_ready(timeout: float) -> bool`, `wait_paired(timeout: float) -> dict | None`
+  - `stack.REPO: Path`, `stack.CONNECTED = r"Status changed: \S+ -> connected"`, `stack.PROXY_READY = r"Bridge agent reachable - tunnel is working end to end"`, `stack.RELAY_SESSION = r"Connected to relay \(session: \w+\)"`
+  - `stack.Relay(logs_dir: Path, port: int, blocked_port: int, env: dict)` — `.url -> str`, `.logs: LogWatch`, `start()` (raises `RuntimeError` if the port is already in use), `stop()`, `alive() -> bool`, `status() -> dict | None`, `wait_ready(timeout: float) -> bool`, `wait_paired(timeout: float) -> dict | None`
   - Component protocol (all of `SourceAgent`, `SourceProxy`, `ExeComponent`): `.name: str`, `.logs: LogWatch`, `install() -> str` (detail; raises `RuntimeError` on unusable environment), `start()`, `alive() -> bool`, `stop()`, `cleanup()`, `collect_logs(dest: Path)`; `ExeComponent` also `uninstall() -> tuple[bool, str]`
   - `stack.SourceAgent(work: Path, relay_url: str, env: dict)`, `stack.SourceProxy(work: Path, relay_url: str, socks_port: int, http_port: int, env: dict)`
   - `stack.make_exe_agent(exe: Path, relay_url: str, env: dict, work: Path, console: bool, allow_existing: bool) -> ExeComponent`
-  - `stack.make_exe_proxy(exe: Path, relay_url: str, socks_port: int, http_port: int, probe_target: str, env: dict, work: Path, allow_existing: bool) -> ExeComponent`
+  - `stack.make_exe_proxy(exe: Path, relay_url: str, socks_port: int, http_port: int, env: dict, work: Path, allow_existing: bool) -> ExeComponent`
   - `winsys.set_run_value(name: str, value: str)`, `winsys.delete_run_value(name: str)`, `winsys.run_value_exists(name: str) -> bool`, `winsys.click_messagebox_yes(title: str, timeout: float) -> bool`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1095,18 +1135,40 @@ def test_relay_starts_in_no_auth_mode_even_with_a_bogus_http_proxy_env(relay):
     assert relay.wait_paired(1) is None
 
 
-def test_relay_wait_ready_fails_fast_when_port_is_taken(tmp_path):
+def test_relay_refuses_a_busy_port(tmp_path):
     with socket.socket() as busy:
         busy.bind(("127.0.0.1", 0))
         busy.listen()
         r = stack.Relay(tmp_path, busy.getsockname()[1], blocked_port=1, env=dict(os.environ))
-        r.start()
-        try:
-            start = time.monotonic()
-            assert r.wait_ready(120) is False
-            assert time.monotonic() - start < 60
-        finally:
-            r.stop()
+        with pytest.raises(RuntimeError, match="already in use"):
+            r.start()
+        assert r.proc is None
+
+
+def test_relay_wait_ready_fails_fast_when_the_process_dies(tmp_path):
+    r = stack.Relay(tmp_path, free_port(), blocked_port=1, env=dict(os.environ))
+    r.start()
+    r.proc.stop()  # simulate a crash right after launch
+    start = time.monotonic()
+    assert r.wait_ready(120) is False
+    assert time.monotonic() - start < 5
+
+
+def test_exe_stop_and_logs_leave_foreign_installations_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    logs = tmp_path / "NetBridge" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "netbridge.log").write_text("someone else's log")
+    killed = []
+    monkeypatch.setattr(stack, "kill_image", killed.append)
+    comp = stack.make_exe_agent(tmp_path / "x.exe", "ws://127.0.0.1:1", {}, tmp_path / "work", console=False, allow_existing=False)
+    with pytest.raises(RuntimeError):
+        comp.install()
+    comp.collect_logs(tmp_path / "out")
+    comp.cleanup()
+    assert killed == []
+    assert not (tmp_path / "out").exists()
+    assert (logs / "netbridge.log").exists()
 
 
 def test_source_agent_install_writes_isolated_config(tmp_path):
@@ -1203,11 +1265,14 @@ import time
 import urllib.request
 from pathlib import Path
 
+from .netinfo import port_in_use
 from .procs import LogWatch, Proc, kill_image
 
 REPO = Path(__file__).resolve().parents[3]
 TEST_TENANT = "11111111-1111-1111-1111-111111111111"
 CONNECTED = r"Status changed: \S+ -> connected"
+PROXY_READY = r"Bridge agent reachable - tunnel is working end to end"
+RELAY_SESSION = r"Connected to relay \(session: \w+\)"
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -1241,6 +1306,8 @@ class Relay:
         return f"ws://127.0.0.1:{self.port}"
 
     def start(self) -> None:
+        if port_in_use(self.port):
+            raise RuntimeError(f"relay port {self.port} is already in use (stale process from an earlier run?)")
         self._runs += 1
         argv = _uv("relay", "python", "-m", "relay", "--no-auth", "--host", "127.0.0.1", "--port", str(self.port))
         self.proc = Proc("relay", argv, self._logs_dir / f"relay-{self._runs}.log", env=self._env).start()
@@ -1260,7 +1327,8 @@ class Relay:
             return None
 
     def wait_ready(self, timeout: float) -> bool:
-        return _poll(self.status, timeout, alive=self.alive) is not None
+        # the port was free before start(), so an answer can only come from our process
+        return _poll(self.status, timeout, alive=self.alive) is not None and self.alive()
 
     def wait_paired(self, timeout: float) -> dict | None:
         def paired():
@@ -1348,6 +1416,7 @@ class ExeComponent(_Component):
         self._stdout = work / "logs" / f"{name}-stdout.log"
         self._allow_existing = allow_existing
         self._installed = False
+        self._started = False
         self._uninstalled = False
         self.logs = LogWatch(self.install_dir / "logs" / "*.log")
 
@@ -1363,11 +1432,18 @@ class ExeComponent(_Component):
         return f"{self.installed_exe}"
 
     def start(self) -> None:
+        self._started = True
         self.proc = Proc(self.name, [str(self.installed_exe), *self._args], self._stdout, env=self._env).start()
 
     def stop(self) -> None:
+        # never touch processes or files this run did not create (a developer's real install)
         super().stop()
-        kill_image(self.installed_exe.name)
+        if self._started:
+            kill_image(self.installed_exe.name)
+
+    def collect_logs(self, dest: Path) -> None:
+        if self._installed:
+            super().collect_logs(dest)
 
     def uninstall(self) -> tuple[bool, str]:
         from . import winsys
@@ -1403,12 +1479,12 @@ def make_exe_agent(exe: Path, relay_url: str, env: dict, work: Path, console: bo
     )
 
 
-def make_exe_proxy(exe: Path, relay_url: str, socks_port: int, http_port: int, probe_target: str,
+def make_exe_proxy(exe: Path, relay_url: str, socks_port: int, http_port: int,
                    env: dict, work: Path, allow_existing: bool) -> ExeComponent:
     return ExeComponent(
         name="proxy", source_exe=exe, app_name="NetBridgeSocks", exe_name="netbridge-socks.exe",
-        config={"relay_url": relay_url, "socks_port": socks_port, "http_port": http_port,
-                "auto_connect": True, "probe_target": probe_target},
+        # no probe_target: the default probe (netbridge-exec, answered by the agent) is what users run
+        config={"relay_url": relay_url, "socks_port": socks_port, "http_port": http_port, "auto_connect": True},
         args=[], env=env, work=work, allow_existing=allow_existing,
     )
 ```
@@ -1416,7 +1492,7 @@ def make_exe_proxy(exe: Path, relay_url: str, socks_port: int, http_port: int, p
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cd e2e && uv run pytest tests/test_stack.py -v`
-Expected: 4 passed. (`winsys` is not imported on Linux: the refuse test raises before the lazy import.)
+Expected: 6 passed. (`winsys` is not imported on Linux: the refuse test raises before the lazy import.)
 
 - [ ] **Step 6: Commit**
 
@@ -1531,15 +1607,17 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import clients, fakeaz, netinfo
 from .procs import IS_WINDOWS
-from .stack import CONNECTED, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
+from .stack import CONNECTED, PROXY_READY, RELAY_SESSION, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
 from .targets import PAGE, PAYLOAD_SHA256, Targets
 
 
@@ -1610,6 +1688,9 @@ class Journey:
         env.update(NO_PROXY=no_proxy, no_proxy=no_proxy)
 
         self.check("fake_az", lambda: self._check_fake_az(env))
+        busy = [p for p in (a.relay_port, a.socks_port, a.http_port) if netinfo.port_in_use(p)]
+        # a stale relay/proxy would answer for the ones we start: false pass
+        self.step("ports_free", not busy, f"busy: {busy}" if busy else f"{a.relay_port}, {a.socks_port}, {a.http_port} free")
 
         targets = Targets(ip)
         self.cleanups.append(targets.close)
@@ -1631,8 +1712,9 @@ class Journey:
             comp.start()
             time.sleep(10)
             self.step(f"{comp.name}_started", comp.alive(), "running" if comp.alive() else comp.logs.tail())
-        for comp in (agent, proxy):
-            m = comp.logs.wait_for(CONNECTED, 120, alive=comp.alive)
+        # agent: its app status; proxy: the end-to-end probe through the agent answered
+        for comp, marker in ((agent, CONNECTED), (proxy, PROXY_READY)):
+            m = comp.logs.wait_for(marker, 120, alive=comp.alive)
             self.step(f"{comp.name}_connected", m is not None, m.group(0) if m else comp.logs.tail())
         paired = relay.wait_paired(30)
         self.step("relay_paired", paired is not None, json.dumps(paired or relay.status()))
@@ -1642,7 +1724,7 @@ class Journey:
         n = calls.count("account get-access-token")
         self.step("az_called", n >= 2, f"{n} token requests went through the fake az")
 
-        self._traffic(ip, targets)
+        self._traffic(ip, targets, relay)
         self._filter(ip, targets, relay)
         self._reconnect(relay, agent, proxy, ip, targets)
 
@@ -1671,16 +1753,26 @@ class Journey:
         return (make_exe_agent(Path(a.agent_exe), relay_url, env, self.work,
                                console=a.agent_console, allow_existing=a.allow_existing_install),
                 make_exe_proxy(Path(a.proxy_exe), relay_url, a.socks_port, a.http_port,
-                               f"{ip}:{targets.http_port}", env, self.work, allow_existing=a.allow_existing_install))
+                               env, self.work, allow_existing=a.allow_existing_install))
 
-    def _socks_get(self, ip: str, targets: Targets, path: str = "/", timeout: float = 15.0) -> tuple[int, bytes]:
-        with clients.socks5_connect(self.socks, ip, targets.http_port, timeout=timeout) as s:
-            return clients.http_get(s, f"{ip}:{targets.http_port}", path)
+    def _socks_get(self, host: str, targets: Targets, path: str = "/", timeout: float = 15.0) -> tuple[int, bytes]:
+        with clients.socks5_connect(self.socks, host, targets.http_port, timeout=timeout) as s:
+            return clients.http_get(s, f"{host}:{targets.http_port}", path)
 
-    def _traffic(self, ip: str, targets: Targets) -> None:
+    def _traffic(self, ip: str, targets: Targets, relay: Relay) -> None:
         def socks5_http():
             status, body = self._socks_get(ip, targets)
             return status == 200 and body == PAGE, f"HTTP {status}, {len(body)} bytes"
+
+        def socks5_dns():
+            name = self.args.target_hostname
+            if not name:
+                return True, "skipped: no --target-hostname (IP literal only)"
+            resolved = socket.gethostbyname(name)
+            if resolved != ip:
+                return False, f"{name} resolves to {resolved} here, expected {ip} (hosts entry missing?)"
+            status, body = self._socks_get(name, targets)  # the agent resolves the name
+            return status == 200 and body == PAGE, f"{name} via remote DNS: HTTP {status}, {len(body)} bytes"
 
         def http_connect():
             data = b"netbridge-e2e-echo\n" * 1000
@@ -1698,15 +1790,24 @@ class Journey:
             return status == 200 and digest == PAYLOAD_SHA256, f"HTTP {status}, {len(body)} bytes, sha256 {digest[:16]}"
 
         def concurrency():
+            peak: list[dict | None] = []
+            # every stream is open before any data moves, and the relay confirms it
+            barrier = threading.Barrier(20, action=lambda: peak.append(relay.status()), timeout=60)
+
             def one(i: int) -> bool:
                 data = hashlib.sha256(str(i).encode()).digest() * 2048  # 64 KiB, distinct per stream
                 with clients.socks5_connect(self.socks, ip, targets.echo_port, timeout=60) as s:
+                    barrier.wait()
                     return clients.echo_roundtrip(s, data) == data
+
             with ThreadPoolExecutor(20) as pool:
                 results = list(pool.map(one, range(20)))
-            return all(results), f"{sum(results)}/20 parallel streams round-tripped"
+            active = (peak[0] or {}).get("active_streams", 0) if peak else 0
+            return all(results) and active >= 20, (f"{sum(results)}/20 streams round-tripped, "
+                                                   f"relay saw {active} active streams at once")
 
         self.check("socks5_http", socks5_http)
+        self.check("socks5_dns", socks5_dns)
         self.check("http_connect", http_connect)
         self.check("http_forward", http_forward)
         self.check("bulk_payload", bulk_payload)
@@ -1734,7 +1835,7 @@ class Journey:
         self.step("relay_restarted", relay.wait_ready(60), relay.url)
         start = time.monotonic()
         last = "never paired"
-        while time.monotonic() - start < 150:
+        while time.monotonic() - start < 60:  # the spec's reconnect promise
             if relay.wait_paired(5):
                 try:
                     status, body = self._socks_get(ip, targets)
@@ -1745,10 +1846,10 @@ class Journey:
                     last = f"{type(e).__name__}: {e}"
             time.sleep(2)
         else:
-            self.step("reconnect", False, f"no working tunnel 150s after the restart ({last}; relay {relay.status()})")
-        self.step("reconnect", True, f"traffic flows again {time.monotonic() - start:.0f}s after the restart")
+            self.step("reconnect", False, f"no working tunnel 60s after the relay came back ({last}; relay {relay.status()})")
+        self.step("reconnect", True, f"traffic flows again {time.monotonic() - start:.0f}s after the relay came back")
         for comp in (agent, proxy):
-            m = comp.logs.wait_for(CONNECTED, 10, since=marks[comp.name])
+            m = comp.logs.wait_for(RELAY_SESSION, 10, since=marks[comp.name])
             self.step(f"{comp.name}_reconnected", m is not None, m.group(0) if m else comp.logs.tail())
 
 
@@ -1759,6 +1860,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--relay-port", type=int, default=18080)
     p.add_argument("--socks-port", type=int, default=11080)
     p.add_argument("--http-port", type=int, default=13128)
+    p.add_argument("--target-hostname",
+                   help="name mapped to this machine's IPv4 in the hosts file; enables the remote-DNS check")
     p.add_argument("--agent-exe", help="exe mode: built netbridge.exe")
     p.add_argument("--proxy-exe", help="exe mode: built netbridge-socks.exe")
     p.add_argument("--agent-console", action="store_true",
@@ -1802,7 +1905,7 @@ Expected: all tests in `tests/` pass (4 + 4 + 6 + 5 + 4 + 5 = 28).
 Precondition: nothing listening on 18080/11080/13128 (`ss -ltn | grep -E ':(18080|11080|13128)\b'` prints nothing). Pre-sync: `for p in relay netbridge-agent socks-proxy; do (cd $p && uv sync); done`.
 
 Run: `uv run --project e2e python -m netbridge_e2e --mode source --work /tmp/nb-e2e`
-Expected: exit 0; summary lists PASS for `fake_az, targets_up, relay_up, install_agent, install_proxy, agent_started, proxy_started, agent_connected, proxy_connected, relay_paired, az_called, socks5_http, http_connect, http_forward, bulk_payload, concurrency, relay_filter, relay_restarted, reconnect, agent_reconnected, proxy_reconnected`. Afterwards `pgrep -af 'relay --no-auth|netbridge_agent --console|netbridge-socks serve --relay ws://127.0.0.1:18080'` prints nothing (cleanup worked).
+Expected: exit 0; summary lists PASS for `fake_az, ports_free, targets_up, relay_up, install_agent, install_proxy, agent_started, proxy_started, agent_connected, proxy_connected, relay_paired, az_called, socks5_http, socks5_dns (skipped), http_connect, http_forward, bulk_payload, concurrency, relay_filter, relay_restarted, reconnect, agent_reconnected, proxy_reconnected`. Afterwards `pgrep -af 'relay --no-auth|netbridge_agent --console|netbridge-socks serve --relay ws://127.0.0.1:18080'` prints nothing (cleanup worked).
 
 If a marker or behaviour differs from the plan (e.g. the source proxy never logs `-> connected`), inspect `/tmp/nb-e2e/logs/` and fix the driver, not the product.
 
@@ -1853,8 +1956,13 @@ git commit -m "Add the e2e journey: connect, traffic, filter, reconnect, uninsta
           cd e2e
           uv run pytest
 
+      - name: Map the e2e target hostname (remote-DNS check)
+        run: echo "$(uv run --project e2e python -m netbridge_e2e.netinfo) netbridge-e2e-target" | sudo tee -a /etc/hosts
+
       - name: E2E journey (source mode)
-        run: uv run --project e2e python -m netbridge_e2e --mode source --work "$RUNNER_TEMP/e2e"
+        run: >
+          uv run --project e2e python -m netbridge_e2e --mode source
+          --target-hostname netbridge-e2e-target --work "$RUNNER_TEMP/e2e"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -1956,9 +2064,17 @@ jobs:
           cd e2e
           uv run pytest
 
+      - name: Map the e2e target hostname (remote-DNS check)
+        shell: pwsh
+        run: |
+          $ip = uv run --project e2e python -m netbridge_e2e.netinfo
+          if ($LASTEXITCODE -ne 0 -or -not $ip) { throw "could not determine the target IPv4" }
+          Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`r`n$ip netbridge-e2e-target"
+
       - name: E2E journey (installed exes)
         run: >
           uv run --project e2e python -m netbridge_e2e --mode exe
+          --target-hostname netbridge-e2e-target
           --agent-exe netbridge-agent/dist/netbridge.exe
           --proxy-exe socks-proxy-win/dist/netbridge-socks.exe
           --work "${{ runner.temp }}/e2e"
@@ -2175,11 +2291,11 @@ uv run --project e2e python -m netbridge_e2e --mode exe `
   --proxy-exe socks-proxy-win\dist\netbridge-socks.exe --work $env:TEMP\nb-e2e
 ```
 
-Ports: `--relay-port` (18080), `--socks-port` (11080), `--http-port` (13128). `--agent-console` runs the agent with `--console` instead of the tray.
+Ports: `--relay-port` (18080), `--socks-port` (11080), `--http-port` (13128); the run refuses to start if any is busy. `--agent-console` runs the agent with `--console` instead of the tray. `--target-hostname NAME` enables the remote-DNS check; map the name to `uv run --project e2e python -m netbridge_e2e.netinfo` in the hosts file first (CI does).
 
 ## Steps
 
-`fake_az` → `targets_up` → `relay_up` → `install_agent` / `install_proxy` → `*_started` → `*_connected` → `relay_paired` → `az_called` → `socks5_http` → `http_connect` → `http_forward` → `bulk_payload` (5 MiB, sha256) → `concurrency` (20 streams) → `relay_filter` (`RELAY_BLOCKED_PORTS`) → `relay_restarted` → `reconnect` → `*_reconnected` → `uninstall_*` (exe mode; the driver clicks "Yes" on the confirmation).
+`fake_az` → `ports_free` → `targets_up` → `relay_up` → `install_agent` / `install_proxy` → `*_started` → `*_connected` (agent status / proxy's end-to-end probe) → `relay_paired` → `az_called` → `socks5_http` → `socks5_dns` (with `--target-hostname`) → `http_connect` → `http_forward` → `bulk_payload` (5 MiB, sha256) → `concurrency` (20 simultaneous streams) → `relay_filter` (`RELAY_BLOCKED_PORTS`) → `relay_restarted` → `reconnect` → `*_reconnected` → `uninstall_*` (exe mode; the driver clicks "Yes" on the confirmation).
 
 Driver unit tests: `cd e2e && uv run pytest`.
 ````

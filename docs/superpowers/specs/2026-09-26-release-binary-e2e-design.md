@@ -45,15 +45,15 @@ two binaries of the same commit.
    unmodified auth path (including the frozen-exe subprocess call); the relay in `--no-auth` mode
    ignores the token. No secrets, no Azure, runs on pull requests.
 2. **Relay from the same commit, from source** (`uv run python -m relay --no-auth --host
-   127.0.0.1 --port 8080`, `NETBRIDGE_ALLOW_NO_AUTH=true`). Docker on Windows runners cannot run the
+   127.0.0.1 --port 18080`, `NETBRIDGE_ALLOW_NO_AUTH=true`). Docker on Windows runners cannot run the
    Linux relay image; the relay image itself stays covered by `release-relay.yml` + unit tests.
 3. **Target servers on the runner's non-loopback private IPv4** (discovered at runtime), so the
    agent runs with its **default** destination policy (no `allow_loopback`). Targets, all started
    by the driver: an HTTP server (small page + a deterministic 5 MB payload with known sha256), a
    raw TCP echo server, and a listener on a port the relay is told to block.
 4. **Real install layout.** The driver copies each exe to its install directory, writes
-   `config.json` (`relay_url = ws://127.0.0.1:8080`; proxy `probe_target` = the HTTP target so the
-   end-to-end probe exercises the real path), and launches the exe **from the install location**
+   `config.json` (`relay_url = ws://127.0.0.1:18080`; the proxy keeps its **default** probe target
+   `netbridge-exec:80`, which the agent answers itself — the configuration users run), and launches the exe **from the install location**
    in normal tray mode (the `is_running_installed()` branch — no install dialog).
 5. **Driver:** `e2e/netbridge_e2e.py`, run with `uv run` (stdlib only; `socket`/`urllib` for
    SOCKS5 and HTTP proxy clients so no curl-version surprises). Style follows `helper-e2e.py`:
@@ -76,23 +76,30 @@ two binaries of the same commit.
 | Step | Pass condition |
 |------|----------------|
 | `fake_az` | the fake `az.cmd` is what `where az.cmd` resolves first; `az account get-access-token` returns a JWT with future `exp` |
-| `relay_up` | relay answers on `127.0.0.1:8080` within 30 s |
+| `ports_free` | relay/SOCKS/HTTP ports (18080/11080/13128) are free — a stale process would otherwise answer |
+| `relay_up` | relay answers on `127.0.0.1:18080` and the new process is alive |
 | `targets_up` | HTTP, echo and blocked-port listeners bound on the private IPv4 |
 | `install_agent` / `install_proxy` | exe + `config.json` in place; process started from install dir and still alive after 10 s |
-| `agent_connected` | relay reports an agent for `anonymous@local` (relay log line / status endpoint) and the agent log shows connected |
-| `proxy_connected` | `:1080` and `:3128` listening; proxy log reports status CONNECTED (end-to-end probe passed, not `NO_AGENT`) |
-| `socks5_http` | GET via SOCKS5 with remote DNS (ATYP=domain) returns the expected page |
+| `agent_connected` | agent log `Status changed: … -> connected` |
+| `proxy_connected` | proxy log `Bridge agent reachable - tunnel is working end to end` (end-to-end probe through the agent answered) |
+| `relay_paired` | relay `/status` reports ≥1 agent and ≥1 tunnel client |
+| `socks5_http` | GET via SOCKS5 (ATYP=domain carrying the target IP) returns the expected page |
+| `socks5_dns` | GET via SOCKS5 to `netbridge-e2e-target` (hosts-file name, resolved by the agent) — CI only, skipped without `--target-hostname` |
 | `http_connect` | CONNECT via `:3128` to the echo server round-trips bytes |
 | `http_forward` | plain `GET http://…` via `:3128` returns the expected page |
 | `bulk_payload` | 5 MB download via SOCKS5, sha256 matches |
-| `concurrency` | 20 parallel SOCKS5 echo streams all round-trip |
+| `concurrency` | 20 SOCKS5 echo streams open at the same time (relay reports ≥20 active streams) all round-trip |
 | `relay_filter` | connection to the blocked port is refused by the proxy (SOCKS5 failure reply / HTTP error), no hang |
-| `reconnect` | relay killed and restarted; within 60 s both exes reconnect and `socks5_http` passes again |
-| `uninstall` | `--uninstall` on each exe exits 0; install dir and `HKCU\...\Run` entry removed |
+| `reconnect` | relay killed and restarted; within 60 s of it being back, traffic flows again and both apps log a new `Connected to relay (session: …)` |
+| `uninstall` | `--uninstall` on each exe (driver answers the Yes/No confirmation) exits 0; install dir and `HKCU\...\Run` entry removed |
 
-Stable log markers: the driver matches on log lines the apps already emit. The first plan task
-records the exact lines from a real run; if a needed signal has no log line, adding one log
-statement is the only permitted product change.
+Stable log markers: the driver matches on log lines the apps already emit (listed above, verified
+against the source). If a needed signal has no log line, adding one log statement is the only
+permitted product change.
+
+The journey also runs in a **source mode** (relay, agent `--console`, `netbridge-socks serve` from
+the checkout) on any OS; CI runs it on Linux for every push/PR, which also verifies the driver
+itself before the Windows job runs.
 
 ## Risks, verified first in the plan
 
