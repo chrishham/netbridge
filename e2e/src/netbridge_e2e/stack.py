@@ -174,6 +174,8 @@ class ExeComponent(_Component):
         if self.install_dir.exists() and not self._allow_existing:
             raise RuntimeError(f"{self.install_dir} already exists; use --allow-existing-install on a disposable machine")
         from . import winsys
+        if winsys.run_value_exists(self.app_name) and not self._allow_existing:
+            raise RuntimeError(f"HKCU Run value {self.app_name!r} already exists; use --allow-existing-install on a disposable machine")
         self.install_dir.mkdir(parents=True, exist_ok=True)
         self._installed = True
         shutil.copy2(self.source_exe, self.installed_exe)
@@ -201,7 +203,11 @@ class ExeComponent(_Component):
         self.stop()
         flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
         p = subprocess.Popen([str(self.installed_exe), "--uninstall"], env=self._env, creationflags=flags)
-        clicked = winsys.click_messagebox_yes(f"Uninstall {self.app_name}", timeout=30)
+        clicked = winsys.click_messagebox_yes(
+            f"Uninstall {self.app_name}",
+            timeout=30,
+            accept_pid=lambda pid: pid == p.pid or winsys.parent_pid(pid) == p.pid,
+        )
         try:
             code = p.wait(timeout=60)
         except subprocess.TimeoutExpired:

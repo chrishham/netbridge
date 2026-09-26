@@ -81,3 +81,31 @@ def test_exe_install_refuses_an_existing_installation(tmp_path, monkeypatch):
     comp = stack.make_exe_agent(exe, "ws://127.0.0.1:1", {}, tmp_path / "work", console=False, allow_existing=False)
     with pytest.raises(RuntimeError, match="already exists"):
         comp.install()
+
+
+def test_exe_install_refuses_an_existing_run_value(tmp_path, monkeypatch):
+    """Verify install() checks for existing Run value before writing anything."""
+    import sys
+    from types import SimpleNamespace
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    exe = tmp_path / "netbridge.exe"
+    exe.write_bytes(b"MZ")
+    # Inject a fake winsys module that reports the Run value exists
+    fake_winsys = SimpleNamespace(
+        run_value_exists=lambda name: True,
+        set_run_value=lambda name, value: None,
+        delete_run_value=lambda name: None,
+    )
+    monkeypatch.setitem(sys.modules, "netbridge_e2e.winsys", fake_winsys)
+    comp = stack.make_exe_agent(exe, "ws://127.0.0.1:1", {}, tmp_path / "work", console=False, allow_existing=False)
+    # The directory check happens first, passes (dir doesn't exist)
+    # Then the Run value check should fail
+    with pytest.raises(RuntimeError, match="HKCU Run value 'NetBridge' already exists"):
+        comp.install()
+    # Verify nothing was written
+    assert not (tmp_path / "NetBridge").exists()
+    # Cleanup should not delete the pre-existing Run value
+    assert not comp._installed
+    comp.cleanup()
+    # The fake module should be cleaned up after the test
+    monkeypatch.delitem(sys.modules, "netbridge_e2e.winsys", raising=False)
