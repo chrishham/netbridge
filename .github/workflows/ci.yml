@@ -104,3 +104,42 @@ jobs:
           cd netbridge-agent
           uv sync
           uv run pip-audit
+
+  e2e-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install system dependencies for socks-proxy tray
+        run: sudo apt-get update && sudo apt-get install -y libgirepository-2.0-dev libcairo2-dev
+
+      - name: Sync components
+        run: for p in relay netbridge-agent socks-proxy e2e; do (cd "$p" && uv sync); done
+
+      - name: Test the E2E driver
+        run: |
+          cd e2e
+          uv run pytest
+
+      - name: Map the e2e target hostname (remote-DNS check)
+        run: echo "$(uv run --project e2e python -m netbridge_e2e.netinfo) netbridge-e2e-target" | sudo tee -a /etc/hosts
+
+      - name: E2E journey (source mode)
+        run: >
+          uv run --project e2e python -m netbridge_e2e --mode source
+          --target-hostname netbridge-e2e-target --work "$RUNNER_TEMP/e2e"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-source-report
+          path: ${{ runner.temp }}/e2e
+          if-no-files-found: ignore
