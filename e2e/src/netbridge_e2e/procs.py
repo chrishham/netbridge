@@ -47,9 +47,11 @@ class Proc:
         try:
             self.popen.wait(timeout)
         except subprocess.TimeoutExpired:
-            if not IS_WINDOWS:
+            if IS_WINDOWS:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+            else:
                 _killpg(pid, signal.SIGKILL)
-            self.popen.wait(timeout)
+            self.popen.wait(5)
         if not IS_WINDOWS:
             _killpg(pid, signal.SIGKILL)  # stragglers left in the group
         if self._log:

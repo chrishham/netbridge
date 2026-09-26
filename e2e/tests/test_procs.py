@@ -71,6 +71,18 @@ def test_proc_stop_kills_grandchildren(tmp_path):
     assert _gone(child)
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="SIGTERM ignore test is POSIX specific")
+def test_proc_stop_respects_timeout_even_when_sigterm_ignored(tmp_path):
+    code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    p = Proc("stubborn", [sys.executable, "-c", code], tmp_path / "p.log").start()
+    time.sleep(0.2)  # let it start
+    start = time.monotonic()
+    p.stop(timeout=1)
+    elapsed = time.monotonic() - start
+    assert elapsed < 8, f"stop() took {elapsed:.1f}s, expected < 8s (1s timeout + 5s grace + margin)"
+    assert not p.alive()
+
+
 def _gone(pid):
     """Dead or a zombie waiting for its (re)parent to reap it."""
     try:
