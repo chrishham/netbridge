@@ -1,0 +1,5 @@
+#!/bin/sh
+# Get the directory of this script without using dirname
+script_dir="${0%/*}"
+[ "$script_dir" = "$0" ] && script_dir="."
+exec "${NETBRIDGE_E2E_PYTHON:-python3}" "$script_dir/az.py" "$@"
