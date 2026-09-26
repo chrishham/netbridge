@@ -9,6 +9,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 WM_COMMAND = 0x0111
 IDYES = 6
 TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
@@ -71,7 +72,7 @@ def run_value_exists(name: str) -> bool:
 def parent_pid(pid: int) -> int | None:
     """Return the parent process ID of the given PID, or None if not found."""
     snapshot = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot == -1:
+    if snapshot is None or snapshot == INVALID_HANDLE_VALUE:
         return None
     try:
         entry = PROCESSENTRY32W()
