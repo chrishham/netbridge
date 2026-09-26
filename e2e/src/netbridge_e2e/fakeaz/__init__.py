@@ -18,7 +18,10 @@ ENV_LOG = "NETBRIDGE_E2E_AZ_LOG"
 
 
 def env_with_fake_az(base: Mapping[str, str], python: str, log: Path) -> dict[str, str]:
-    """Copy of `base` with the fake az first on PATH."""
+    """Copy of `base` with the fake az first on PATH.
+
+    On Windows, preserves SystemRoot, ComSpec, and PATHEXT from the base env.
+    """
     env = dict(base)
     env["PATH"] = os.pathsep.join(p for p in (str(FAKE_AZ_DIR), base.get("PATH", "")) if p)
     env[ENV_PYTHON] = python

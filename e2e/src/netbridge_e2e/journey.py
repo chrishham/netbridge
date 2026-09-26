@@ -87,8 +87,19 @@ class Journey:
         a = self.args
         logs = self.work / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        ip = netinfo.private_ipv4()
-        env = fakeaz.env_with_fake_az(os.environ, sys.executable, self.work / "az-calls.log")
+        calls_log = self.work / "az-calls.log"
+        calls_log.write_text("")  # truncate stale data from reused --work dir
+
+        def get_ip():
+            ip = netinfo.private_ipv4()
+            return True, ip
+
+        self.check("network", get_ip)
+        ip = self.results[-1]["detail"]
+        env = fakeaz.env_with_fake_az(os.environ, sys.executable, calls_log)
+        # strip proxy vars that would route ws://127.0.0.1 through an external proxy
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            env.pop(var, None)
         no_proxy = f"127.0.0.1,localhost,{ip}"
         env.update(NO_PROXY=no_proxy, no_proxy=no_proxy)
 
@@ -97,9 +108,16 @@ class Journey:
         # a stale relay/proxy would answer for the ones we start: false pass
         self.step("ports_free", not busy, f"busy: {busy}" if busy else f"{a.relay_port}, {a.socks_port}, {a.http_port} free")
 
-        targets = Targets(ip)
-        self.cleanups.append(targets.close)
-        self.step("targets_up", True, f"http {ip}:{targets.http_port}, echo :{targets.echo_port}, blocked :{targets.blocked_port}")
+        # targets_up: create and register cleanup before first failure can occur
+        targets = None
+
+        def create_targets():
+            nonlocal targets
+            targets = Targets(ip)
+            self.cleanups.append(targets.close)
+            return True, f"http {ip}:{targets.http_port}, echo :{targets.echo_port}, blocked :{targets.blocked_port}"
+
+        self.check("targets_up", create_targets)
 
         relay = Relay(logs, a.relay_port, targets.blocked_port, env)
         self.cleanups.append(relay.stop)
@@ -110,8 +128,8 @@ class Journey:
         for comp in (agent, proxy):
             self.cleanups.append(comp.cleanup)
             self.cleanups.append(lambda c=comp: c.collect_logs(logs))  # runs before cleanup
-        self.step("install_agent", True, agent.install())
-        self.step("install_proxy", True, proxy.install())
+        self.check("install_agent", lambda: (True, agent.install()))
+        self.check("install_proxy", lambda: (True, proxy.install()))
 
         start_marks = {}
         for comp in (agent, proxy):

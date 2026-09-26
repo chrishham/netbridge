@@ -13,19 +13,20 @@ IS_WINDOWS = sys.platform == "win32"
 class Proc:
     """A process tree (uv run → python, PyInstaller bootloader → app) with its output in a file."""
 
-    def __init__(self, name: str, argv: list[str], log_path: Path, env: dict | None = None, cwd: Path | None = None):
+    def __init__(self, name: str, argv: list[str], log_path: Path, env: dict | None = None, cwd: Path | None = None, creationflags: int = 0):
         self.name = name
         self.argv = argv
         self.log_path = log_path
         self.env = env
         self.cwd = cwd
+        self.creationflags = creationflags
         self.popen: subprocess.Popen | None = None
         self._log = None
 
     def start(self) -> "Proc":
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = open(self.log_path, "ab")
-        group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS else {"start_new_session": True}
+        group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | self.creationflags} if IS_WINDOWS else {"start_new_session": True}
         self.popen = subprocess.Popen(
             self.argv, cwd=self.cwd, env=self.env,
             stdin=subprocess.DEVNULL, stdout=self._log, stderr=subprocess.STDOUT, **group,

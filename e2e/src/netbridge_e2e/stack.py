@@ -8,12 +8,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
 
 from .netinfo import port_in_use
 from .procs import LogWatch, Proc, kill_exe_path
+
+IS_WINDOWS = sys.platform == "win32"
 
 REPO = Path(__file__).resolve().parents[3]
 TEST_TENANT = "11111111-1111-1111-1111-111111111111"
@@ -180,7 +183,8 @@ class ExeComponent(_Component):
 
     def start(self) -> None:
         self._started = True
-        self.proc = Proc(self.name, [str(self.installed_exe), *self._args], self._stdout, env=self._env).start()
+        flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+        self.proc = Proc(self.name, [str(self.installed_exe), *self._args], self._stdout, env=self._env, creationflags=flags).start()
 
     def stop(self) -> None:
         # never touch processes or files this run did not create (a developer's real install)
@@ -195,7 +199,8 @@ class ExeComponent(_Component):
     def uninstall(self) -> tuple[bool, str]:
         from . import winsys
         self.stop()
-        p = subprocess.Popen([str(self.installed_exe), "--uninstall"], env=self._env)
+        flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+        p = subprocess.Popen([str(self.installed_exe), "--uninstall"], env=self._env, creationflags=flags)
         clicked = winsys.click_messagebox_yes(f"Uninstall {self.app_name}", timeout=30)
         try:
             code = p.wait(timeout=60)
