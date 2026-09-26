@@ -63,3 +63,37 @@ def test_cleanup_errors_do_not_mask_success(tmp_path):
 def test_exe_mode_requires_both_exes(tmp_path):
     with pytest.raises(SystemExit):
         journey.parse_args(["--mode", "exe", "--work", str(tmp_path)])
+
+
+def test_install_failure_becomes_named_step(tmp_path):
+    """Install raising RuntimeError surfaces as install_* step, not driver_error."""
+
+    class BadAgent:
+        name = "agent"
+
+        def install(self):
+            raise RuntimeError("existing installation")
+
+        def cleanup(self):
+            pass
+
+    class GoodProxy:
+        name = "proxy"
+
+        def install(self):
+            return "ok"
+
+        def cleanup(self):
+            pass
+
+    def body(j):
+        agent, proxy = BadAgent(), GoodProxy()
+        for comp in (agent, proxy):
+            j.cleanups.append(comp.cleanup)
+        j.check("install_agent", lambda: (True, agent.install()))
+        j.check("install_proxy", lambda: (True, proxy.install()))
+
+    j = make(tmp_path, body)
+    assert j.run() == 1
+    assert j.results[-1]["step"] == "install_agent"
+    assert "RuntimeError: existing installation" in j.results[-1]["detail"]

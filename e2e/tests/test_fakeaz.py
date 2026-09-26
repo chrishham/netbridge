@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -21,13 +22,13 @@ def test_fake_az_shadows_a_real_az_on_path(tmp_path):
     real.mkdir()
     (real / AZ_NAME).write_text("echo real")
     (real / AZ_NAME).chmod(0o755)
-    env = fakeaz.env_with_fake_az({"PATH": str(real)}, sys.executable, tmp_path / "calls.log")
+    env = fakeaz.env_with_fake_az({**os.environ, "PATH": str(real)}, sys.executable, tmp_path / "calls.log")
     resolved = Path(shutil.which(AZ_NAME, path=env["PATH"])).resolve()
     assert resolved.parent == fakeaz.FAKE_AZ_DIR
 
 
 def test_account_show_returns_a_user(tmp_path):
-    env = fakeaz.env_with_fake_az({"PATH": ""}, sys.executable, tmp_path / "calls.log")
+    env = fakeaz.env_with_fake_az({**os.environ, "PATH": ""}, sys.executable, tmp_path / "calls.log")
     out = run_az(env, "account", "show")
     assert out.returncode == 0, out.stderr
     data = json.loads(out.stdout)
@@ -36,7 +37,7 @@ def test_account_show_returns_a_user(tmp_path):
 
 
 def test_token_is_accepted_by_the_real_expiry_check(tmp_path):
-    env = fakeaz.env_with_fake_az({"PATH": ""}, sys.executable, tmp_path / "calls.log")
+    env = fakeaz.env_with_fake_az({**os.environ, "PATH": ""}, sys.executable, tmp_path / "calls.log")
     out = run_az(env, "account", "get-access-token", "--resource", "https://management.azure.com/")
     assert out.returncode == 0, out.stderr
     token = json.loads(out.stdout)["accessToken"]
@@ -47,7 +48,7 @@ def test_token_is_accepted_by_the_real_expiry_check(tmp_path):
 
 def test_calls_are_logged_and_unknown_commands_fail(tmp_path):
     log = tmp_path / "calls.log"
-    env = fakeaz.env_with_fake_az({"PATH": ""}, sys.executable, log)
+    env = fakeaz.env_with_fake_az({**os.environ, "PATH": ""}, sys.executable, log)
     run_az(env, "account", "show")
     bad = run_az(env, "login")
     assert bad.returncode == 2
