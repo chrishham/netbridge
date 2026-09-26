@@ -1,6 +1,7 @@
 """The relay and the two clients.
 
-source mode: everything from this checkout via `uv run` (any OS).
+source mode: everything from this checkout via `uv run` (any OS); the relay
+             can come from a built docker image instead (--relay-image, Linux).
 exe mode:    the PyInstaller exes, installed where their installers put
              them and launched from there in normal tray mode (Windows).
 """
@@ -42,11 +43,14 @@ def _poll(predicate, timeout: float, alive=None, interval: float = 0.5):
 
 
 class Relay:
-    def __init__(self, logs_dir: Path, port: int, blocked_port: int, env: dict):
+    def __init__(self, logs_dir: Path, port: int, blocked_port: int, env: dict, image: str | None = None):
         self.port = port
+        self.image = image
         self._logs_dir = logs_dir
-        self._env = dict(env, NETBRIDGE_ALLOW_NO_AUTH="true", NETBRIDGE_ALLOWED_TENANTS=TEST_TENANT,
-                         RELAY_BLOCKED_PORTS=str(blocked_port))
+        self._relay_env = dict(NETBRIDGE_ALLOW_NO_AUTH="true", NETBRIDGE_ALLOWED_TENANTS=TEST_TENANT,
+                               RELAY_BLOCKED_PORTS=str(blocked_port))
+        self._env = dict(env, **self._relay_env)
+        self._container = f"netbridge-e2e-relay-{port}"
         self._runs = 0
         self.proc: Proc | None = None
         self.logs = LogWatch(logs_dir / "relay-*.log")
@@ -59,13 +63,26 @@ class Relay:
         if port_in_use(self.port):
             raise RuntimeError(f"relay port {self.port} is already in use (stale process from an earlier run?)")
         self._runs += 1
-        argv = _uv("relay", "python", "-m", "relay", "--no-auth", "--host", "127.0.0.1", "--port", str(self.port))
+        relay_args = ["-m", "relay", "--no-auth", "--host", "127.0.0.1", "--port", str(self.port)]
+        if self.image:
+            self._remove_container()
+            # host network: --no-auth only binds loopback, which must be the runner's loopback
+            env_args = [a for k, v in self._relay_env.items() for a in ("-e", f"{k}={v}")]
+            argv = ["docker", "run", "--rm", "--name", self._container, "--network", "host", *env_args,
+                    self.image, ".venv/bin/python", *relay_args]
+        else:
+            argv = _uv("relay", "python", *relay_args)
         self.proc = Proc("relay", argv, self._logs_dir / f"relay-{self._runs}.log", env=self._env).start()
+
+    def _remove_container(self) -> None:
+        subprocess.run(["docker", "rm", "-f", self._container], capture_output=True, timeout=60)
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.alive()
 
     def stop(self) -> None:
+        if self.image and self.proc:
+            self._remove_container()  # killing the docker client alone can leave the container running
         if self.proc:
             self.proc.stop()
 

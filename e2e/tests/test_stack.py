@@ -1,5 +1,6 @@
 import os
 import socket
+import subprocess
 import time
 
 import pytest
@@ -28,6 +29,22 @@ def test_relay_starts_in_no_auth_mode_even_with_a_bogus_http_proxy_env(relay):
     assert status["auth_required"] is False
     assert status["agents"] == 0 and status["tunnel_clients"] == 0
     assert relay.wait_paired(1) is None
+
+
+@pytest.mark.skipif(not os.environ.get("NETBRIDGE_E2E_RELAY_IMAGE"), reason="set NETBRIDGE_E2E_RELAY_IMAGE to a built relay image")
+def test_relay_from_image_starts_restarts_and_leaves_no_container(tmp_path):
+    r = stack.Relay(tmp_path, free_port(), blocked_port=1, env=dict(os.environ), image=os.environ["NETBRIDGE_E2E_RELAY_IMAGE"])
+    try:
+        for _ in range(2):  # the journey's reconnect step restarts the relay under the same container name
+            r.start()
+            assert r.wait_ready(60), r.logs.tail()
+            assert r.status()["auth_required"] is False
+            r.stop()
+            assert not r.alive()
+    finally:
+        r.stop()
+    left = subprocess.run(["docker", "ps", "-aq", "--filter", f"name=^{r._container}$"], capture_output=True, text=True)
+    assert left.stdout.strip() == ""
 
 
 def test_relay_refuses_a_busy_port(tmp_path):

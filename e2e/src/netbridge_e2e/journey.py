@@ -119,7 +119,7 @@ class Journey:
 
         self.check("targets_up", create_targets)
 
-        relay = Relay(logs, a.relay_port, targets.blocked_port, env)
+        relay = Relay(logs, a.relay_port, targets.blocked_port, env, image=a.relay_image)
         self.cleanups.append(relay.stop)
         relay.start()
         self.step("relay_up", relay.wait_ready(180), f"{relay.url} {'' if relay.alive() else relay.logs.tail()}")
@@ -291,6 +291,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--http-port", type=int, default=13128)
     p.add_argument("--target-hostname",
                    help="name mapped to this machine's IPv4 in the hosts file; enables the remote-DNS check")
+    p.add_argument("--relay-image",
+                   help="run the relay from this docker image instead of the checkout (Linux: needs host networking)")
     p.add_argument("--agent-exe", help="exe mode: built netbridge.exe")
     p.add_argument("--proxy-exe", help="exe mode: built netbridge-socks.exe")
     p.add_argument("--agent-console", action="store_true",
@@ -298,6 +300,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--allow-existing-install", action="store_true",
                    help="exe mode: overwrite an existing installation (disposable machines only)")
     args = p.parse_args(argv)
+    if args.relay_image and args.mode != "source":
+        p.error("--relay-image works in source mode only (the image is a Linux container)")
     if args.mode == "exe":
         if not IS_WINDOWS:
             p.error("--mode exe runs on Windows only")
