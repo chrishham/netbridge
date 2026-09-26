@@ -130,7 +130,10 @@ jobs:
           uv run pytest
 
       - name: Map the e2e target hostname (remote-DNS check)
-        run: echo "$(uv run --project e2e python -m netbridge_e2e.netinfo) netbridge-e2e-target" | sudo tee -a /etc/hosts
+        run: |
+          set -euo pipefail
+          ip=$(uv run --project e2e python -m netbridge_e2e.netinfo)
+          [ -n "$ip" ] && echo "$ip netbridge-e2e-target" | sudo tee -a /etc/hosts
 
       - name: E2E journey (source mode)
         run: >

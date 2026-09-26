@@ -4,7 +4,7 @@ Drives the whole path — client → proxy (SOCKS5 `:11080`, HTTP `:13128`) → 
 
 | Mode | What runs | Where |
 |------|-----------|-------|
-| `source` | relay, agent (`--console`) and `netbridge-socks serve` from this checkout | any OS; CI job `e2e-source` on every push/PR |
+| `source` | relay, agent (`--console`) and `netbridge-socks serve` from this checkout | any OS; CI job `e2e-source` on pushes to main and pull requests |
 | `exe` | the PyInstaller `netbridge.exe` / `netbridge-socks.exe`, installed to `%LOCALAPPDATA%` and started from there in tray mode | Windows; workflow `e2e-windows.yml` on PRs and before every Windows release |
 
 No Azure is involved: the relay runs with `--no-auth` on loopback, and a fake `az` placed first on `PATH` hands the apps a dummy token, so their real auth code path still runs. Targets listen on the machine's default-route IPv4 because the agent always blocks loopback.
