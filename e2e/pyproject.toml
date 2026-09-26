@@ -1,0 +1,21 @@
+[project]
+name = "netbridge-e2e"
+version = "0.1.0"
+description = "End-to-end gate: relay + agent + proxy, from source or as installed Windows exes"
+requires-python = ">=3.14"
+dependencies = []
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+shared-auth = { path = "../shared" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "shared-auth",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

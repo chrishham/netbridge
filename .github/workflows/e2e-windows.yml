@@ -1,0 +1,122 @@
+name: E2E Windows
+
+# Builds both Windows exes from this commit, smoke-tests them, then drives
+# the INSTALLED exes (tray mode, fake az, local --no-auth relay) through the
+# e2e journey. Release workflows call it and publish the tested artifact.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to inject into both exes (empty = 0.0.0 dev build)
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - "relay/**"
+      - "shared/**"
+      - "socks-proxy/**"
+      - "socks-proxy-win/**"
+      - "netbridge-agent/**"
+      - "e2e/**"
+      - ".github/workflows/e2e-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Inject version
+        if: ${{ inputs.version }}
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version format: $VERSION"
+            exit 1
+          fi
+          for f in netbridge-agent/src/netbridge_agent/__init__.py socks-proxy/src/socks_proxy/__init__.py socks-proxy-win/src/socks_proxy_win/__init__.py; do
+            sed -i "s|__version__ = .*|__version__ = \"${VERSION}\"|" "$f"
+          done
+
+      - name: Build agent exe
+        run: |
+          cd netbridge-agent
+          uv sync
+          uv run pyinstaller netbridge-agent.spec --clean --noconfirm
+
+      - name: Build socks exe
+        run: |
+          cd socks-proxy-win
+          uv sync
+          uv run pyinstaller netbridge-socks.spec --clean --noconfirm
+
+      - name: Smoke test exes (--version, --import-check)
+        shell: pwsh
+        run: |
+          foreach ($exe in @("netbridge-agent/dist/netbridge.exe", "socks-proxy-win/dist/netbridge-socks.exe")) {
+            foreach ($flag in @("--version", "--import-check")) {
+              $output = & $exe $flag 2>&1
+              Write-Host "$exe $flag -> $output"
+              if ($LASTEXITCODE -ne 0) { throw "$exe $flag failed (exit code $LASTEXITCODE): $output" }
+            }
+          }
+
+      - name: Sync relay and driver
+        run: |
+          cd relay
+          uv sync
+          cd ../e2e
+          uv sync
+
+      - name: Test the E2E driver
+        run: |
+          cd e2e
+          uv run pytest
+
+      - name: Map the e2e target hostname (remote-DNS check)
+        shell: pwsh
+        run: |
+          $ip = uv run --project e2e python -m netbridge_e2e.netinfo
+          if ($LASTEXITCODE -ne 0 -or -not $ip) { throw "could not determine the target IPv4" }
+          Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`r`n$ip netbridge-e2e-target"
+
+      - name: E2E journey (installed exes)
+        run: >
+          uv run --project e2e python -m netbridge_e2e --mode exe
+          --target-hostname netbridge-e2e-target
+          --agent-exe netbridge-agent/dist/netbridge.exe
+          --proxy-exe socks-proxy-win/dist/netbridge-socks.exe
+          --work "${{ runner.temp }}/e2e"
+
+      - name: Stage tested exes
+        shell: bash
+        run: |
+          mkdir -p out
+          cp netbridge-agent/dist/netbridge.exe socks-proxy-win/dist/netbridge-socks.exe out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netbridge-exes
+          path: out/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-windows-report
+          path: ${{ runner.temp }}/e2e
+          if-no-files-found: ignore

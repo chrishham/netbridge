@@ -115,6 +115,10 @@ netbridge-socks --relay <URL> --host 0.0.0.0 --allow-remote --proxy-auth user:pa
 
 `--allow-remote` requires `--proxy-auth` to prevent open proxy abuse.
 
+## End-to-end tests
+
+`e2e/` drives the full client → proxy → relay → agent → target path. CI runs it from source on Linux for pushes to main and on pull requests, and against the installed Windows exes (`e2e-windows.yml`) on PRs and before every Windows release; releases publish exactly the exe that passed. See [e2e/README.md](e2e/README.md).
+
 ## Configuration
 
 ### Agent
