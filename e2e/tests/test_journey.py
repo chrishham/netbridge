@@ -65,6 +65,13 @@ def test_exe_mode_requires_both_exes(tmp_path):
         journey.parse_args(["--mode", "exe", "--work", str(tmp_path)])
 
 
+def test_relay_image_is_source_mode_only(tmp_path):
+    args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--relay-image", "img:tag"])
+    assert args.relay_image == "img:tag"
+    with pytest.raises(SystemExit):
+        journey.parse_args(["--mode", "exe", "--work", str(tmp_path), "--relay-image", "img:tag"])
+
+
 def test_install_failure_becomes_named_step(tmp_path):
     """Install raising RuntimeError surfaces as install_* step, not driver_error."""
 
