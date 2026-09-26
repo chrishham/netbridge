@@ -852,7 +852,7 @@ git commit -m "Add stdlib SOCKS5 and HTTP-proxy clients for the e2e driver"
 - Test: `e2e/tests/test_procs.py`
 
 **Interfaces:**
-- Produces: `procs.IS_WINDOWS: bool`; `procs.Proc(name: str, argv: list[str], log_path: Path, env: dict | None = None, cwd: Path | None = None)` with `start() -> Proc`, `alive() -> bool`, `stop(timeout: float = 10.0) -> None`, `.popen`; `procs.kill_image(image: str) -> None` (Windows only, no-op elsewhere); `procs.LogWatch(*patterns: Path)` with `files() -> list[Path]`, `mark() -> dict[Path, int]`, `text(since: dict[Path, int] | None = None) -> str`, `wait_for(pattern: str, timeout: float, since=None, alive=None) -> re.Match | None`, `tail(n: int = 1500) -> str`.
+- Produces: `procs.IS_WINDOWS: bool`; `procs.Proc(name: str, argv: list[str], log_path: Path, env: dict | None = None, cwd: Path | None = None)` with `start() -> Proc`, `alive() -> bool`, `stop(timeout: float = 10.0) -> None`, `.popen`; `procs.kill_exe_path(path: Path) -> None` (Windows only, no-op elsewhere: kills processes whose executable is exactly `path`); `procs.LogWatch(*patterns: Path)` with `files() -> list[Path]`, `mark() -> dict[Path, int]`, `text(since: dict[Path, int] | None = None) -> str`, `wait_for(pattern: str, timeout: float, since=None, alive=None) -> re.Match | None`, `tail(n: int = 1500) -> str`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1018,10 +1018,18 @@ def _killpg(pid: int, sig: int) -> None:
         pass
 
 
-def kill_image(image: str) -> None:
-    """Kill every process with this image name (Windows; PyInstaller onefile leftovers)."""
-    if IS_WINDOWS:
-        subprocess.run(["taskkill", "/F", "/T", "/IM", image], capture_output=True)
+def kill_exe_path(path: Path) -> None:
+    """Kill processes running exactly this executable (Windows; PyInstaller onefile leftovers).
+
+    Matches the full path, never the image name: another installation of the
+    same app elsewhere on the machine is left alone.
+    """
+    if not IS_WINDOWS:
+        return
+    script = ("Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $env:E2E_KILL_PATH } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                   env=dict(os.environ, E2E_KILL_PATH=str(path)), capture_output=True, timeout=60)
 
 
 class LogWatch:
@@ -1089,7 +1097,7 @@ git commit -m "Add process-tree and log-polling helpers for the e2e driver"
 - Test: `e2e/tests/test_stack.py`
 
 **Interfaces:**
-- Consumes: `procs.Proc`, `procs.LogWatch`, `procs.kill_image`, `procs.IS_WINDOWS`.
+- Consumes: `procs.Proc`, `procs.LogWatch`, `procs.kill_exe_path`, `procs.IS_WINDOWS`.
 - Produces:
   - `stack.REPO: Path`, `stack.CONNECTED = r"Status changed: \S+ -> connected"`, `stack.PROXY_READY = r"Bridge agent reachable - tunnel is working end to end"`, `stack.RELAY_SESSION = r"Connected to relay \(session: \w+\)"`
   - `stack.Relay(logs_dir: Path, port: int, blocked_port: int, env: dict)` — `.url -> str`, `.logs: LogWatch`, `start()` (raises `RuntimeError` if the port is already in use), `stop()`, `alive() -> bool`, `status() -> dict | None`, `wait_ready(timeout: float) -> bool`, `wait_paired(timeout: float) -> dict | None`
@@ -1160,7 +1168,7 @@ def test_exe_stop_and_logs_leave_foreign_installations_alone(tmp_path, monkeypat
     logs.mkdir(parents=True)
     (logs / "netbridge.log").write_text("someone else's log")
     killed = []
-    monkeypatch.setattr(stack, "kill_image", killed.append)
+    monkeypatch.setattr(stack, "kill_exe_path", killed.append)
     comp = stack.make_exe_agent(tmp_path / "x.exe", "ws://127.0.0.1:1", {}, tmp_path / "work", console=False, allow_existing=False)
     with pytest.raises(RuntimeError):
         comp.install()
@@ -1266,7 +1274,7 @@ import urllib.request
 from pathlib import Path
 
 from .netinfo import port_in_use
-from .procs import LogWatch, Proc, kill_image
+from .procs import LogWatch, Proc, kill_exe_path
 
 REPO = Path(__file__).resolve().parents[3]
 TEST_TENANT = "11111111-1111-1111-1111-111111111111"
@@ -1439,7 +1447,7 @@ class ExeComponent(_Component):
         # never touch processes or files this run did not create (a developer's real install)
         super().stop()
         if self._started:
-            kill_image(self.installed_exe.name)
+            kill_exe_path(self.installed_exe)
 
     def collect_logs(self, dest: Path) -> None:
         if self._installed:
@@ -1708,13 +1716,15 @@ class Journey:
         self.step("install_agent", True, agent.install())
         self.step("install_proxy", True, proxy.install())
 
+        start_marks = {}
         for comp in (agent, proxy):
+            start_marks[comp.name] = comp.logs.mark()  # a reused --work dir must not supply old markers
             comp.start()
             time.sleep(10)
             self.step(f"{comp.name}_started", comp.alive(), "running" if comp.alive() else comp.logs.tail())
         # agent: its app status; proxy: the end-to-end probe through the agent answered
         for comp, marker in ((agent, CONNECTED), (proxy, PROXY_READY)):
-            m = comp.logs.wait_for(marker, 120, alive=comp.alive)
+            m = comp.logs.wait_for(marker, 120, since=start_marks[comp.name], alive=comp.alive)
             self.step(f"{comp.name}_connected", m is not None, m.group(0) if m else comp.logs.tail())
         paired = relay.wait_paired(30)
         self.step("relay_paired", paired is not None, json.dumps(paired or relay.status()))
@@ -1834,20 +1844,24 @@ class Journey:
         relay.start()
         self.step("relay_restarted", relay.wait_ready(60), relay.url)
         start = time.monotonic()
+        deadline = start + 60  # the spec's reconnect promise
         last = "never paired"
-        while time.monotonic() - start < 60:  # the spec's reconnect promise
-            if relay.wait_paired(5):
+        recovered = False
+        while (left := deadline - time.monotonic()) > 0:
+            if relay.wait_paired(min(5, left)):
                 try:
-                    status, body = self._socks_get(ip, targets)
+                    status, body = self._socks_get(ip, targets, timeout=max(1.0, min(15.0, deadline - time.monotonic())))
                     if status == 200 and body == PAGE:
+                        recovered = time.monotonic() <= deadline
                         break
                     last = f"HTTP {status}"
                 except Exception as e:  # noqa: BLE001 — retried until the deadline
                     last = f"{type(e).__name__}: {e}"
-            time.sleep(2)
-        else:
-            self.step("reconnect", False, f"no working tunnel 60s after the relay came back ({last}; relay {relay.status()})")
-        self.step("reconnect", True, f"traffic flows again {time.monotonic() - start:.0f}s after the relay came back")
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+        took = time.monotonic() - start
+        self.step("reconnect", recovered,
+                  f"traffic flows again {took:.0f}s after the relay came back" if recovered
+                  else f"no working tunnel within 60s of the relay coming back ({last}; relay {relay.status()})")
         for comp in (agent, proxy):
             m = comp.logs.wait_for(RELAY_SESSION, 10, since=marks[comp.name])
             self.step(f"{comp.name}_reconnected", m is not None, m.group(0) if m else comp.logs.tail())
