@@ -82,13 +82,17 @@ class FaultProxy:
                                         #   (relay unreachable); existing connections unaffected
 ```
 
-- Each connection is two sockets pumped by two threads with `select`-free
-  blocking `recv`/`sendall`; a per-connection state flag (`open`, `blackholed`,
-  `closed`) decides whether received bytes are forwarded or dropped.
+- Each connection is two sockets pumped by two threads doing `recv` with a
+  short socket timeout (0.2 s) so they re-check a per-connection state flag
+  (`open`, `blackholed`, `closed`) that decides whether received bytes are
+  forwarded or dropped. Closing a socket from another thread does not wake a
+  blocked `recv` on POSIX, hence the timeout plus `shutdown`.
   Blackholed connections keep reading (so the kernel buffers never fill and
   the peer never sees backpressure) and discard the bytes.
-- `cut()` uses `SO_LINGER(1, 0)` before close so the peer sees a reset, like
-  a dropped NAT entry, rather than a graceful FIN.
+- `cut()` calls `shutdown(SHUT_RDWR)` then `close()` on both legs, so both
+  peers see the connection end at once and the pump threads exit within one
+  timeout tick. (A graceful FIN rather than an RST: both end the stream, and
+  RST via `SO_LINGER` needs platform-specific packing for no extra coverage.)
 - Thread-safe; `close()` is idempotent and joins its threads with a timeout.
 - Upstream connect failure (relay down) closes the client connection at once,
   so the existing relay-restart step behaves as before.
@@ -141,6 +145,9 @@ margin):
    (not succeed, not hang); every attempt must return within 10 s. Then
    `refuse(False)`; **`relay_reachable_recovers`**: traffic within 90 s
    (agent backoff may have grown to 20–40 s while refused).
+   Both fail-fast steps assert the SOCKS reply code is `0x04` (host
+   unreachable, what the proxy maps a missing relay/agent to), not just any
+   error.
 7. **`agent_down_fails_fast`** — stop the agent process. A SOCKS connect
    must fail with a `ProxyError` within 15 s of the stop, each attempt
    returning within 10 s. **`agent_restarted`** — start the agent again
@@ -150,7 +157,36 @@ margin):
 Each failing step includes the relevant evidence in its detail: elapsed
 time, relay `/status`, and the component log tail.
 
-### 4. Unit tests (deterministic fakes)
+### 4. Product bugs found by the design review (fix in B, test first)
+
+Reading the code for this design surfaced three defects in exactly the
+paths B exercises. Each gets a failing unit test, then the smallest fix, in
+its own commit:
+
+1. **Pending SOCKS CONNECT hangs on disconnect** (socks-proxy). When the
+   relay websocket drops, `_receive_loop`'s cleanup closes every
+   StreamHandler, but `StreamHandler.close()` does not resolve
+   `connect_future`, so a CONNECT admitted just before the drop waits for its
+   30 s timeout (and then answers `0x06`). Fix: closing a handler whose
+   connect is still pending fails the future with a `ConnectionError`, so the
+   client gets `0x04` immediately.
+2. **Replaced agent's cleanup deletes the new agent's streams** (relay). When
+   a second agent for the same user replaces the first, the old handler's
+   `finally` removes every stream of that user and notifies
+   `agent_disconnected`, including streams created through the new agent.
+   Fix: the old handler only performs the user-wide stream cleanup and
+   unregistration if it is still the registered agent for that user
+   (`bridge_agents.get(user) is ws`); otherwise it only closes itself.
+3. **Stale-stream sweep can close a stream that just became active**
+   (relay). `cleanup_stale_streams` collects stale ids under the lock,
+   releases it, then removes them without re-checking `last_activity`. Fix:
+   re-check staleness under the lock at removal time and skip streams that
+   saw traffic in between.
+
+If implementation shows a finding is not a real defect, the test that proves
+it stays and the fix is dropped, with the reason in the final report.
+
+### 5. Unit tests (deterministic fakes)
 
 Fakes live next to the tests that use them; no real timers (patch
 `asyncio.sleep`/constants), no real network (pytest-socket from A stays on).
@@ -161,9 +197,13 @@ Fakes live next to the tests that use them; no real timers (patch
     `tcp_close` with `reason=agent_disconnected` for its streams, and
     `/status` drops the agent;
   - tunnel client disconnect → the agent receives `tunnel_client_disconnected`;
-  - a second agent for the same user replaces the first (first is closed);
+  - a second agent for the same user replaces the first: the first is
+    closed, the replacement stays registered, and a stream created through
+    the replacement survives the first handler's cleanup (bug 2);
   - `cleanup_stale_streams` sends `idle_timeout` to both sides for a stream
-    idle longer than `RELAY_STREAM_TIMEOUT`, and leaves fresh streams alone.
+    idle longer than `RELAY_STREAM_TIMEOUT`, leaves fresh streams alone, and
+    does not close a stream whose activity is refreshed between the scan and
+    the removal (bug 3; interleaving forced with a hook/patched lock).
 - **agent** (`netbridge-agent/tests/test_agent_reconnect.py`):
   - a `FlakyConnector` fake (`fail_times=N`, then a fake websocket that
     closes after a configurable lifetime) proves the backoff sequence
@@ -174,7 +214,9 @@ Fakes live next to the tests that use them; no real timers (patch
   - disconnect calls `close_all_streams` (target sockets closed, pending
     connects cancelled).
 - **socks-proxy** (`socks-proxy/tests/test_tunnel_reconnect.py`):
-  - `_receive_loop` ending (closed websocket) closes every StreamHandler;
+  - `_receive_loop` ending (closed websocket) closes every StreamHandler,
+    and a handler with a pending connect fails it immediately with
+    `ConnectionError` (bug 1) — the SOCKS layer then answers `0x04`;
   - new SOCKS connects while disconnected map to reply `0x04`;
   - reconnect after `fail_times=N` failed handshakes, delays within the
     jittered bounds.
@@ -188,7 +230,7 @@ Fakes live next to the tests that use them; no real timers (patch
 If a unit test or journey step exposes a product bug, the fix goes in its own
 commit with a unit test, and the finding is listed in the final report.
 
-### 5. CI
+### 6. CI
 
 No new jobs. `ci.yml` `e2e-source`, `release-relay.yml` (image mode) and
 `e2e-windows.yml` (exe mode) already run the journey, so they gain the fault
