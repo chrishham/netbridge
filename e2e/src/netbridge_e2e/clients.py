@@ -109,9 +109,10 @@ def http_connect(proxy: Address, dest_host: str, dest_port: int, timeout: float 
     try:
         target = f"{dest_host}:{dest_port}"
         sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
-        status, _ = _read_head(sock)
+        status, _ = _read_head(sock, time.monotonic() + timeout)
         if status != 200:
             raise ProxyError(status, f"HTTP CONNECT {target} refused")
+        sock.settimeout(timeout)   # the deadline left a shrunken per-recv timeout behind
         return sock
     except BaseException:
         sock.close()

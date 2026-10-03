@@ -448,7 +448,8 @@ async def handle_tcp_close(request: dict) -> None:
     if pending and not pending.done():
         # a close during DNS/connect: stop the dial so it cannot register later
         pending.cancel()
-        await asyncio.gather(pending, return_exceptions=True)
+        # bounded: its cancel handler writes to the relay, and this blocks the receive loop
+        await asyncio.wait({pending}, timeout=2.0)
     await close_stream(stream_id)
 
 

@@ -740,9 +740,10 @@ class TunnelManager:
         # Wait for response
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
-        except (asyncio.TimeoutError, ConnectionError):
+        except (asyncio.TimeoutError, ConnectionError, asyncio.CancelledError):
             # also tells the relay: it may still hold the stream (timeout,
-            # malformed result) and would otherwise keep it until idle cleanup
+            # malformed result, caller gave up) and would otherwise keep it
+            # until idle cleanup
             await self.close_stream(stream_id)
             raise
 

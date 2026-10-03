@@ -388,3 +388,24 @@ async def test_legacy_finished_dial_keeps_an_entry_that_reused_the_id(legacy_dia
     release.set()
     await task
     assert legacy.pending_connections["s1"] is replacement
+
+
+async def test_legacy_close_does_not_wait_long_on_a_stuck_cancel(legacy_dial, monkeypatch):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    task = legacy.pending_connections["s1"]
+    await asyncio.sleep(0)
+    stuck = asyncio.Event()
+
+    async def slow_send(*a, **k):
+        await stuck.wait()          # the cancel handler's write never completes
+        return True
+
+    monkeypatch.setattr(legacy, "send_to_relay", slow_send)
+    real_wait = asyncio.wait
+    monkeypatch.setattr(legacy.asyncio, "wait", lambda fs, timeout: real_wait(fs, timeout=0.05))
+    await asyncio.wait_for(legacy.handle_tcp_close({"type": "tcp_close", "stream_id": "s1"}), 1)
+    assert legacy.pending_connections == {}
+    stuck.set()
+    await asyncio.gather(task, return_exceptions=True)

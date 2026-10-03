@@ -563,3 +563,46 @@ def test_http_get_deadline_bounds_a_trickled_body(head):
         t.join(2)
         a.close()
         b.close()
+
+
+def _trickle_proxy(reply: bytes, then_trickle: bool):
+    """A one-shot proxy: sends `reply`, then optionally one header byte every 50 ms."""
+    srv = socket.create_server(("127.0.0.1", 0))
+    stop = threading.Event()
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(reply)
+            while then_trickle and not stop.wait(0.05):
+                conn.sendall(b"x")
+            stop.wait(5)
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    return srv, stop, t
+
+
+def test_http_connect_deadline_bounds_a_trickled_header():
+    srv, stop, t = _trickle_proxy(b"HTTP/1.1 200 OK\r\nX-Slow: ", then_trickle=True)
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            clients.http_connect(srv.getsockname(), "h", 80, timeout=0.4)
+        assert time.monotonic() - start < 2
+    finally:
+        stop.set()
+        t.join(2)
+        srv.close()
+
+
+def test_http_connect_returns_a_socket_with_the_full_timeout():
+    srv, stop, t = _trickle_proxy(b"HTTP/1.1 200 OK\r\n\r\n", then_trickle=False)
+    try:
+        with clients.http_connect(srv.getsockname(), "h", 80, timeout=7.0) as s:
+            assert s.gettimeout() == 7.0
+    finally:
+        stop.set()
+        t.join(2)
+        srv.close()

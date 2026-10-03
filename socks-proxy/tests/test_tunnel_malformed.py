@@ -117,3 +117,22 @@ async def test_connect_timeout_tells_the_relay_to_close():
     assert sent[0]["type"] == "tcp_connect"
     assert sent[-1] == {"type": "tcp_close", "stream_id": sent[0]["stream_id"], "reason": "client_closed"}
     assert tm.streams == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_connect_frees_the_stream_and_tells_the_relay():
+    tm = _tm()
+    free_before = tm._stream_semaphore._value
+    task = asyncio.create_task(tm.connect("10.0.0.1", 80, timeout=5))
+    for _ in range(100):
+        if tm.streams:
+            break
+        await asyncio.sleep(0)
+    (sid,) = tm.streams
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert tm.streams == {}
+    assert tm._stream_semaphore._value == free_before
+    sent = [json.loads(c.args[0]) for c in tm.ws.send_str.call_args_list]
+    assert sent[-1] == {"type": "tcp_close", "stream_id": sid, "reason": "client_closed"}

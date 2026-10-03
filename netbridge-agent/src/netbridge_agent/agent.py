@@ -73,6 +73,9 @@ _MAX_TCP_DATA_B64_LEN = MAX_TCP_DATA_SIZE * 4 // 3 + 4
 _LOOPBACK_RANGES = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("::1/128"),
+    # unspecified addresses: on POSIX a connect to 0.0.0.0 or :: reaches the local host
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::/128"),
 ]
 
 # Link-local ranges are always blocked (agent-local SSRF protection)
@@ -207,6 +210,8 @@ async def select_destinations(
     except ValueError:
         host_ip = None
     resolved_ips = list(resolved)
+    # "host." and "host" are the same DNS name: compare names without the root dot
+    host_name = bare_host.rstrip(".").lower()
 
     # Block link-local (always)
     for ip in resolved_ips:
@@ -236,7 +241,7 @@ async def select_destinations(
             try:
                 deny_nets.append(_normalize_network(ipaddress.ip_network(entry, strict=False)))
             except ValueError:
-                if host_ip is None and bare_host.lower() == entry.lower():
+                if host_ip is None and host_name == entry.rstrip(".").lower():
                     return [], f"Destination {host} is denied"
         kept = [ip for ip in ips if not any(ip in n for n in deny_nets)]
         if ips and not kept:
@@ -252,7 +257,7 @@ async def select_destinations(
             try:
                 allow_nets.append(_normalize_network(ipaddress.ip_network(entry, strict=False)))
             except ValueError:
-                if host_ip is None and bare_host.lower() == entry.lower():
+                if host_ip is None and host_name == entry.rstrip(".").lower():
                     host_pattern_match = True
         if not host_pattern_match:
             ips = [ip for ip in ips if any(ip in n for n in allow_nets)]

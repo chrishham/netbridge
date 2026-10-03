@@ -274,3 +274,22 @@ async def test_duplicate_at_capacity_gets_no_rejection(monkeypatch):
     ws.send_str.assert_not_awaited()
     state.pending_connections["A"].cancel()
     await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("addr", ["0.0.0.0", "0.1.2.3", "::"])
+async def test_unspecified_addresses_count_as_loopback(addr):
+    ips = [ipaddress.ip_address(addr)]
+    got, err = await agent.select_destinations("x.test", 80, resolved=ips)
+    assert got == [] and "blocked range" in err
+    got, err = await agent.select_destinations("x.test", 80, resolved=ips, allow_loopback=True)
+    assert got == ips and err == ""
+
+
+@pytest.mark.parametrize("host,entry", [("blocked.test.", "blocked.test"), ("Blocked.Test", "blocked.test."),
+                                        ("blocked.test.", "blocked.test.")])
+async def test_hostname_rules_ignore_the_root_dot(host, entry):
+    ips = [ipaddress.ip_address("8.8.8.8")]
+    got, err = await agent.select_destinations(host, 80, resolved=ips, denied_destinations=[entry])
+    assert got == [] and "denied" in err
+    got, err = await agent.select_destinations(host, 80, resolved=ips, allowed_destinations=[entry, "9.9.9.0/24"])
+    assert got == ips
