@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -189,6 +190,8 @@ class Journey:
             self.cleanups.append(lambda c=comp: c.collect_logs(logs))  # runs before cleanup
         self.check("install_agent", lambda: (True, agent.install()))
         self.check("install_proxy", lambda: (True, proxy.install()))
+        nonce = secrets.token_hex(8)  # stamped into the probe plugin; installed before the agent starts so it loads them
+        self.check("plugins_installed", lambda: (True, ", ".join(p.name for p in agent.add_plugins(nonce))))
 
         start_marks = {}
         for comp in (agent, proxy):
@@ -212,6 +215,7 @@ class Journey:
         n = calls.count("account get-access-token")
         self.step("az_called", n >= 2, f"{n} token requests went through the fake az")
 
+        self._plugins(agent, start_marks["agent"], nonce)
         self._traffic(ip, targets, relay)
         self._filter(ip, targets, relay, agent)
         self._errors(ip, targets, relay, agent)
@@ -322,6 +326,39 @@ class Journey:
             return False, f"connection to blocked port {targets.blocked_port} was allowed"
 
         self.check("relay_filter", blocked)
+
+    PROBE_HOST = "netbridge-e2e-probe"
+
+    def _plugins(self, agent, start_mark, nonce: str) -> None:
+        body_expected = f"netbridge-e2e-plugin {nonce}".encode()
+
+        def loaded():
+            good = agent.logs.wait_for(rf"Plugin loaded: {self.PROBE_HOST}\b", 10, since=start_mark)
+            bad = agent.logs.wait_for(r"Skipping plugin broken:", 5, since=start_mark)
+            return good is not None and bad is not None, (
+                f"probe loaded: {good is not None}, broken skipped: {bad is not None}"
+                + ("" if good and bad else f"; agent log tail: {agent.logs.tail(600)!r}"))
+
+        def routable():
+            results = {}
+            with clients.socks5_connect(self.socks, self.PROBE_HOST, 80, timeout=15) as s:
+                results["socks5"] = clients.http_get(s, self.PROBE_HOST)
+            with clients.http_connect(self.http, self.PROBE_HOST, 80, timeout=15) as s:
+                results["http_connect"] = clients.http_get(s, self.PROBE_HOST)
+            results["http_forward"] = clients.http_forward_get(self.http, f"http://{self.PROBE_HOST}/")
+            bad = {k: (st, b[:60]) for k, (st, b) in results.items() if st != 200 or b != body_expected}
+            return not bad, ("all three front ends returned the nonce" if not bad else f"unexpected: {bad}")
+
+        def listed():
+            with clients.socks5_connect(self.socks, "netbridge-exec", 80, timeout=15) as s:
+                status, body = clients.http_get(s, "netbridge-exec", "/plugins")
+            names = [p.get("name") for p in json.loads(body).get("plugins", [])] if status == 200 else []
+            return (status == 200 and "e2e-probe" in names and "e2e-broken" not in names,
+                    f"HTTP {status}, plugins {names}")
+
+        self.check("plugin_loaded_log", loaded)
+        self.check("plugin_routable", routable)
+        self.check("plugins_listed", listed)
 
     def _error_case(self, relay, agent, front_end: str, host: str, port: int, expect: int, budget: float,
                     agent_log: str | None = None, relay_log: str | None = None,

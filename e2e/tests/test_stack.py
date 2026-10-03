@@ -391,3 +391,11 @@ def test_add_plugins_is_idempotent(tmp_path):
     agent.add_plugins("first")
     agent.add_plugins("second")
     assert "second" in (agent.plugins_dir / "probe" / "plugin.py").read_text()
+
+
+def test_exe_add_plugins_installs_under_the_install_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    comp = stack.make_exe_agent(tmp_path / "x.exe", "ws://127.0.0.1:1", {}, tmp_path / "work", console=False, allow_existing=False)
+    dirs = comp.add_plugins("n1")
+    assert [d.parent for d in dirs] == [comp.install_dir / "plugins"] * 2
+    assert "n1" in (comp.install_dir / "plugins" / "probe" / "plugin.py").read_text()

@@ -1,3 +1,5 @@
+import contextlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -305,3 +307,71 @@ def test_tunnel_health_step_fails(j, monkeypatch, clock, reply, streams):
     relay.status = status
     monkeypatch.setattr(j, "_socks_get", lambda *a, **k: (state.update(n=1), reply)[1])
     assert _steps_failing(j, relay, agent) == "errors_leave_tunnel_healthy"
+
+
+NONCE = "feedface"
+BODY = f"netbridge-e2e-plugin {NONCE}".encode()
+
+
+def _plugin_world(monkeypatch, *, body=BODY, plugins=("e2e-probe",), loaded=True, skipped=True):
+    agent = FakeComp("agent")
+    agent.logs.lines = ["old line"]
+    start = agent.logs.mark()
+    if loaded:
+        agent.logs.lines.append("Plugin loaded: netbridge-e2e-probe")
+    if skipped:
+        agent.logs.lines.append("Skipping plugin broken: manifest missing entry_point")
+    sock = FakeSock()
+    monkeypatch.setattr(clients, "socks5_connect", lambda *a, **k: contextlib.closing(sock))
+    monkeypatch.setattr(clients, "http_connect", lambda *a, **k: contextlib.closing(sock))
+
+    def http_get(s, host, path="/"):
+        if path == "/plugins":
+            return 200, json.dumps({"plugins": [{"name": n} for n in plugins]}).encode()
+        return 200, body
+
+    monkeypatch.setattr(clients, "http_get", http_get)
+    monkeypatch.setattr(clients, "http_forward_get", lambda *a, **k: (200, body))
+    return agent, start
+
+
+def test_plugin_steps_pass_against_a_correct_agent(j, monkeypatch):
+    agent, start = _plugin_world(monkeypatch)
+    j._plugins(agent, start, NONCE)
+    assert [r["step"] for r in j.results] == ["plugin_loaded_log", "plugin_routable", "plugins_listed"]
+    assert all(r["ok"] for r in j.results)
+
+
+def test_plugin_routable_rejects_a_stale_nonce(j, monkeypatch):
+    agent, start = _plugin_world(monkeypatch, body=b"netbridge-e2e-plugin oldnonce")
+    with pytest.raises(journey.StepFailed):
+        j._plugins(agent, start, NONCE)
+    assert j.results[-1]["step"] == "plugin_routable" and "unexpected" in j.results[-1]["detail"]
+
+
+def test_plugin_loaded_log_fails_without_the_load_line_and_shows_the_tail(j, monkeypatch):
+    agent, start = _plugin_world(monkeypatch, loaded=False)
+    with pytest.raises(journey.StepFailed):
+        j._plugins(agent, start, NONCE)
+    assert j.results[-1]["step"] == "plugin_loaded_log" and "agent log tail" in j.results[-1]["detail"]
+
+
+def test_plugin_loaded_log_fails_without_the_skip_line(j, monkeypatch):
+    agent, start = _plugin_world(monkeypatch, skipped=False)
+    with pytest.raises(journey.StepFailed):
+        j._plugins(agent, start, NONCE)
+    assert j.results[-1]["step"] == "plugin_loaded_log"
+
+
+def test_plugin_loaded_log_ignores_lines_from_before_the_start_mark(j, monkeypatch):
+    agent, start = _plugin_world(monkeypatch, loaded=False, skipped=False)
+    agent.logs.lines.insert(0, "Plugin loaded: netbridge-e2e-probe")
+    with pytest.raises(journey.StepFailed):
+        j._plugins(agent, start + 1, NONCE)
+
+
+def test_plugins_listed_fails_when_the_broken_plugin_is_listed(j, monkeypatch):
+    agent, start = _plugin_world(monkeypatch, plugins=("e2e-probe", "e2e-broken"))
+    with pytest.raises(journey.StepFailed):
+        j._plugins(agent, start, NONCE)
+    assert j.results[-1]["step"] == "plugins_listed"
