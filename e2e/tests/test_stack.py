@@ -205,7 +205,10 @@ def test_relay_image_gets_fault_tuning(tmp_path, monkeypatch):
     monkeypatch.setattr(stack.subprocess, "run", lambda *a, **k: None)
     stack.Relay(tmp_path, 1, blocked_port=2, env={}, image="img").start()
     argv = seen["relay"]
-    assert ["-e", "RELAY_HEARTBEAT_INTERVAL=10"] in [argv[i:i + 2] for i in range(len(argv) - 1)]
+    pairs = [argv[i:i + 2] for i in range(len(argv) - 1)]
+    assert ["-e", "RELAY_HEARTBEAT_INTERVAL=10"] in pairs
+    assert ["-e", "RELAY_RATE_CONNECTIONS_PER_MIN=600"] in pairs
+    assert ["-e", "RELAY_RATE_IP_CONNECTIONS_PER_MIN=600"] in pairs
 
 
 def test_relay_source_env_gets_fault_tuning(tmp_path, monkeypatch):

@@ -151,9 +151,10 @@ class Journey:
         self.step("relay_up", relay.wait_ready(180), f"{relay.url} {'' if relay.alive() else relay.logs.tail()}")
 
         agent_link = FaultProxy(("127.0.0.1", relay.port), "agent")
+        self.cleanups.append(agent_link.close)
         proxy_link = FaultProxy(("127.0.0.1", relay.port), "proxy")
+        self.cleanups.append(proxy_link.close)
         for link in (agent_link, proxy_link):
-            self.cleanups.append(link.close)
             link.start()
         self.step("fault_links_up", True, f"agent via :{agent_link.port}, proxy via :{proxy_link.port}")
 
@@ -446,7 +447,10 @@ class Journey:
         kind, how, at = probe.get("r", ("hang", "no SOCKS reply within 30s", time.monotonic()))
         # the promise: a SOCKS error reply (not a hang, not a bare reset) within 30 s of the fault
         replied = kind in ("refused", "reply") and at <= t0 + 30
-        ok, traffic = recovered(t0, 75)
+        if ended and replied:
+            ok, traffic = recovered(t0, 75)
+        else:
+            ok, traffic = False, f"stream ended: {ended} after {ended_after:.1f}s; CONNECT: {how}"
         self.step("agent_blackhole_detected", ended and replied and ok,
                   f"stream ended: {ended} after {ended_after:.1f}s; CONNECT during blackhole: {how}; {traffic}"
                   + ("" if ended and replied else f"; {self._evidence(relay, agent, proxy)}"))
@@ -468,8 +472,8 @@ class Journey:
         self._agent_up = time.monotonic()
 
         # 7: agent process down, then restarted
-        agent.stop()
         t0 = time.monotonic()
+        agent.stop()
 
         def agent_down():
             ok, detail = self._fails_fast(ip, targets, t0 + 15)
