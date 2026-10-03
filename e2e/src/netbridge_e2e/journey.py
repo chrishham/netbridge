@@ -328,12 +328,17 @@ class Journey:
     def _agent_sessions(self, agent) -> int:
         return len(re.findall(RELAY_SESSION, agent.logs.text()))
 
-    def _await_agent_session(self, agent, min_age: float = 65.0) -> None:
+    def _await_agent_session(self, relay, agent, min_age: float = 65.0, max_wait: float = 240.0) -> None:
         # the agent resets its reconnect delay only after a 60 s session; if it reconnected
-        # on its own while we waited, the session is new and the wait starts over
-        seen = self._agent_sessions(agent)
+        # on its own while we waited, the session is new and the wait starts over.
+        # Bounded: an agent that never holds a session (or dies) must not hang the job.
+        seen, give_up = self._agent_sessions(agent), time.monotonic() + max_wait
         while (wait := self._agent_up + min_age - time.monotonic()) > 0:
-            time.sleep(min(wait, 5))
+            if not agent.alive() or time.monotonic() >= give_up:
+                why = "agent exited" if not agent.alive() else f"no stable agent session after {max_wait:.0f}s"
+                raise RuntimeError(f"{why} while waiting for a {min_age:.0f}s session ({seen} relay sessions logged); "
+                                   f"{self._evidence(relay, agent)}")
+            time.sleep(min(wait, 5, give_up - time.monotonic()))
             now = self._agent_sessions(agent)
             if now != seen:
                 seen, self._agent_up = now, time.monotonic()
@@ -412,7 +417,7 @@ class Journey:
             return ok, detail if ok else f"{detail}; {self._evidence(relay, agent, proxy)}"
 
         # 1-2: agent link cut
-        self._await_agent_session(agent)
+        self._await_agent_session(relay, agent)
         mark = agent.logs.mark()
         echo = self._open_echo(ip, targets)
         t0, n = self._inject(agent_link, "cut")
@@ -434,7 +439,7 @@ class Journey:
         self.check("proxy_cut_recovers", lambda: recovered(t0, 45, proxy, RELAY_SESSION, mark))
 
         # 5: agent link blackholed (half-open)
-        self._await_agent_session(agent)
+        self._await_agent_session(relay, agent)
         echo = self._open_echo(ip, targets)
         t0, n = self._inject(agent_link, "blackhole")
         probe: dict = {}
@@ -457,7 +462,7 @@ class Journey:
         self._agent_up = time.monotonic()
 
         # 6: relay unreachable for both clients
-        self._await_agent_session(agent)
+        self._await_agent_session(relay, agent)
         for link in (agent_link, proxy_link):
             link.refuse(True)
         t0 = time.monotonic()

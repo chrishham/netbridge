@@ -81,6 +81,9 @@ class FakeComp:
     def connect(self):
         self.logs.lines += ["Status changed: connecting -> connected", "Connected to relay (session: s1)"]
 
+    def alive(self) -> bool:
+        return self.running
+
     def stop(self):
         self.running = False
 
@@ -245,14 +248,16 @@ def test_evidence_has_relay_status_and_log_tails(j):
 # --- _await_agent_session ------------------------------------------------------
 
 def test_await_session_returns_when_old_enough(j, clock):
+    agent = FakeComp("agent")
     j._agent_up = clock.now - 70
-    j._await_agent_session(FakeComp("agent"))
+    j._await_agent_session(FakeRelay(agent), agent)
     assert clock.sleeps == []
 
 
 def test_await_session_sleeps_the_remaining_time(j, clock):
+    agent = FakeComp("agent")
     j._agent_up = clock.now - 63
-    j._await_agent_session(FakeComp("agent"))
+    j._await_agent_session(FakeRelay(agent), agent)
     assert clock.sleeps == [2]
 
 
@@ -267,9 +272,33 @@ def test_await_session_restarts_when_agent_reconnects(j, clock):
             agent.connect()  # a new RELAY_SESSION line appears during the first nap
 
     clock.on_sleep = reconnect_once
-    j._await_agent_session(agent)
+    j._await_agent_session(FakeRelay(agent), agent)
     assert j._agent_up == start + 5
     assert clock.now == start + 5 + 65
+
+
+def test_await_session_gives_up_when_the_agent_keeps_reconnecting(j, clock):
+    agent = FakeComp("agent")
+    agent.connect()
+    start = j._agent_up = clock.now
+    clock.on_sleep = lambda t: agent.connect()  # a new session every nap: never 65 s old
+    with pytest.raises(RuntimeError, match=r"no stable agent session after 240s.*sessions.*'agents': 1.*agent log"):
+        j._await_agent_session(FakeRelay(agent), agent)
+    assert clock.now - start <= 240
+
+
+def test_await_session_gives_up_when_the_agent_dies(j, clock):
+    agent = FakeComp("agent")
+    agent.logs.lines.append("agent crashed")
+    j._agent_up = clock.now
+
+    def die(t):
+        agent.running = False
+
+    clock.on_sleep = die
+    with pytest.raises(RuntimeError, match=r"agent exited.*'agents': 0.*agent crashed"):
+        j._await_agent_session(FakeRelay(agent), agent)
+    assert clock.sleeps == [5]
 
 
 # --- _wait_traffic ---------------------------------------------------------------
