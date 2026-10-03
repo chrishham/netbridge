@@ -563,6 +563,12 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
         })
         return
 
+    # Before any reply: a rejection for a reused id would make the relay tear
+    # down the stream that already owns it.
+    if stream_id in state.pending_connections or stream_id in state.active_streams:
+        logger.warning(f"tcp_connect {stream_id[:8]}: stream id already in use, ignoring")
+        return
+
     lock = state.get_lock()
     async with lock:
         pending_count = len(state.pending_connections)
@@ -722,7 +728,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "success": False,
                 "error": str(e),
             }, silent=True)
-            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {e}")
+            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {type(e).__name__}: {e}")
         except Exception as e:
             await send_to_relay(ws, {
                 "type": "tcp_connect_result",
@@ -730,7 +736,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "success": False,
                 "error": str(e) or type(e).__name__,
             }, silent=True)
-            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {e}")
+            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {type(e).__name__}: {e}")
 
     # No await between this check and the registration below, so it is atomic
     # on the loop; a reused id would orphan the first task and its socket.

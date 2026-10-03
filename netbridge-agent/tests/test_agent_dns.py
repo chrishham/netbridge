@@ -257,3 +257,20 @@ async def test_duplicate_stream_id_is_ignored_while_the_first_is_tracked(monkeyp
     await handle_message(state, ws, json.dumps({"type": "tcp_close", "stream_id": "A"}))
     assert first.cancelled() and state.pending_connections == {}
     ws.send_str.assert_not_awaited()
+
+
+async def test_duplicate_at_capacity_gets_no_rejection(monkeypatch):
+    monkeypatch.setattr(agent, "MAX_CONCURRENT_CONNECTIONS", 1)
+    gate = asyncio.Event()
+
+    async def blocked(self, host, port, **kw):
+        await gate.wait()
+        return _infos("8.8.8.8")
+
+    monkeypatch.setattr(asyncio.get_running_loop().__class__, "getaddrinfo", blocked)
+    state, ws = AgentState(), _ws()
+    await handle_message(state, ws, _connect("A", "slow.test"))
+    await handle_message(state, ws, _connect("A", "slow.test"))   # at the limit, but the id is taken
+    ws.send_str.assert_not_awaited()
+    state.pending_connections["A"].cancel()
+    await asyncio.sleep(0)

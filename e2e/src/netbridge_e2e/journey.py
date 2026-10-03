@@ -215,6 +215,7 @@ class Journey:
         n = calls.count("account get-access-token")
         self.step("az_called", n >= 2, f"{n} token requests went through the fake az")
 
+        self._agent_start_mark = start_marks["agent"]   # this run only: --work may be reused
         self._plugins(agent, start_marks["agent"], nonce)
         self._traffic(ip, targets, relay)
         self._filter(ip, targets, relay, agent)
@@ -394,15 +395,15 @@ class Journey:
 
     def _errors(self, ip: str, targets: Targets, relay: Relay, agent) -> None:
         self.check("errors_baseline_clean", lambda: self._wait_streams_zero(relay, within=10))
-        # Agent-log evidence is anchored to the case's own host:port. The refusal/DNS error text differs
-        # between Linux and Windows, so DNS is told apart from a refusal by host plus "not refused".
+        # Agent-log evidence is anchored to the case's own host:port and names the exception type the agent
+        # logs ("Failed: <id> -> host:port: <Type>: <text>"); the text itself differs between Linux and Windows.
         socks_http = ("socks5", "http_connect", "http_forward")
         groups = [
             ("refused", ip, targets.refused_port, 10,
-             rf"Failed: \S+ -> {re.escape(ip)}:{targets.refused_port}: ", None, None, None, socks_http),
-            ("dns_failure", NXDOMAIN, 80, 20,
-             rf"Failed: \S+ -> {re.escape(NXDOMAIN)}:80: ", None, None, rf"Failed: \S+ -> {re.escape(NXDOMAIN)}:80: .*refused",
+             rf"Failed: \S+ -> {re.escape(ip)}:{targets.refused_port}: ConnectionRefusedError:", None, None, None,
              socks_http),
+            ("dns_failure", NXDOMAIN, 80, 20,
+             rf"Failed: \S+ -> {re.escape(NXDOMAIN)}:80: DnsError:", None, None, None, socks_http),
             ("agent_denies", LINK_LOCAL, 80, 10,
              rf"Destination denied: \S+ -> {re.escape(LINK_LOCAL)}:80\b", None, r"Blocked port|Destination denied for", None,
              socks_http),
@@ -427,7 +428,8 @@ class Journey:
         def never_reached():
             # Per-case checks watch the agent log for a second; this one looks at the whole run so far,
             # long after the blocked attempts, so a late forward past the relay filter still fails.
-            hit = agent.logs.wait_for(rf"Connected: .* -> .*:{targets.blocked_port}\b", 0)
+            hit = agent.logs.wait_for(rf"Connected: .* -> .*:{targets.blocked_port}\b", 0,
+                                      since=getattr(self, "_agent_start_mark", None))
             return hit is None, f"agent connected to the blocked port: {hit.group(0) if hit else 'never'}"
 
         self.check("blocked_port_never_reached_agent", never_reached)

@@ -155,9 +155,9 @@ def _errors_world(j, monkeypatch, replies):
         elif host == "169.254.169.254":
             agent.logs.lines.append(f"Destination denied: s -> {host}:{port}: link-local")
         elif host == journey.NXDOMAIN:
-            agent.logs.lines.append(f"Failed: s -> {host}:{port}: [Errno -2] Name or service not known")
+            agent.logs.lines.append(f"Failed: s -> {host}:{port}: DnsError: [Errno -2] Name or service not known")
         else:
-            agent.logs.lines.append(f"Failed: s -> {host}:{port}: [Errno 111] Connect call failed")
+            agent.logs.lines.append(f"Failed: s -> {host}:{port}: ConnectionRefusedError: [Errno 111] Connect call failed")
         return replies(front), 0.1
 
     monkeypatch.setattr(j, "_fail_case", fail_case)
@@ -231,7 +231,7 @@ def test_dns_step_fails_when_the_name_was_refused(j, monkeypatch, clock):
     def fc(front, host, port, budget):
         out = base(front, host, port, budget)
         if host == journey.NXDOMAIN:
-            agent.logs.lines[-1] = f"Failed: s -> {host}:{port}: Connect call failed (Connection refused)"
+            agent.logs.lines[-1] = f"Failed: s -> {host}:{port}: ConnectionRefusedError: [Errno 111] Connect call failed"
         return out
 
     monkeypatch.setattr(j, "_fail_case", fc)

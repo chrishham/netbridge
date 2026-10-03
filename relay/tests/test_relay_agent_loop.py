@@ -112,3 +112,23 @@ async def test_deeply_nested_json_warns_and_loop_continues(client, caplog):
     await agent.send(type="heartbeat")
     await agent.expect("heartbeat_ack")
     assert "Invalid JSON from agent" in caplog.text
+
+
+async def test_failed_result_does_not_drop_a_stream_that_reused_the_id(client, monkeypatch):
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "s1")
+    replacement = dict(mod.tcp_streams["s1"])
+    real_send = mod.safe_ws_send
+
+    async def send_then_reuse(ws, data):
+        await real_send(ws, data)
+        if '"tcp_connect_result"' in data:   # the id is reopened while the send yields
+            mod.tcp_streams["s1"] = replacement
+
+    monkeypatch.setattr(mod, "safe_ws_send", send_then_reuse)
+    await agent.send(type="tcp_connect_result", stream_id="s1", success=False, error="refused")
+    await tunnel.expect("tcp_connect_result", stream_id="s1", success=False)
+    await agent.send(type="heartbeat")
+    await agent.expect("heartbeat_ack")
+    assert mod.tcp_streams.get("s1") is replacement

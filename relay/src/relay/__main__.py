@@ -697,7 +697,10 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
                             and response["success"] is False
                         ):
                             async with _state_lock:
-                                tcp_streams.pop(stream_id, None)
+                                # the send may have yielded: only drop the record we forwarded for,
+                                # not a stream that reused the id meanwhile
+                                if tcp_streams.get(stream_id) is stream_data:
+                                    del tcp_streams[stream_id]
 
                 else:
                     # Log unknown message types for debugging
