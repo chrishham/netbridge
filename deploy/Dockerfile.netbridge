@@ -2,6 +2,12 @@ FROM python:3.14-slim
 
 WORKDIR /app
 
+# Pick up Debian security fixes newer than the base image, and drop pip: the
+# relay runs from a uv venv, and pip only adds its vendored deps (urllib3, ...)
+# to the image's vulnerability surface.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* \
+    && python -m pip uninstall -y pip
+
 # Install uv via standalone installer (avoids pip transitive deps like msgpack)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
