@@ -355,3 +355,9 @@ async def test_stream_id_enumeration_is_reported_as_a_skip():
 ])
 def test_is_error_reply(text, ok):
     assert ps._is_error_reply(text) is ok
+
+
+async def test_status_check_fails_on_a_non_200_status(relay):
+    fake = await relay(status=503)
+    result = await ps.PenTestSuite(fake.url).test_health_endpoint()
+    assert not result.passed and "503" in result.details
