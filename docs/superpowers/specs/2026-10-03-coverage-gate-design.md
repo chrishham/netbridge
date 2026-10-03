@@ -179,9 +179,13 @@ version matches the one locked in the components so data files combine.
   floor.
 - Output: markdown table (component, coverage, floor, status, hint) to stdout
   and, when `GITHUB_STEP_SUMMARY` is set, appended there.
-- Exit code 0 always: enforcement is done by each component's `pytest --cov`
-  (floor) and by diff-cover (new lines); the report must not mask or
-  duplicate those failures.
+- Exit code: coverage levels never affect it (enforcement is done by each
+  component's `pytest --cov` for the floor and by diff-cover for new lines;
+  the report must not duplicate those failures), and a component with no
+  data file is a "no data" row, not an error. But if there is at least one
+  data file and `coverage combine`, `xml` or `html` fails, the script exits
+  non-zero, so a push to main cannot pass CI without the combined report.
+  If no component produced data at all, it also exits non-zero.
 - Missing data file for a component → row shows "no data" (e.g. its tests
   failed to collect).
 
@@ -259,7 +263,7 @@ New driver option `--coverage DIR` (source mode only):
 - `coverage_report.py`: unit tests in `scripts/tests/` (run in CI with
   `uv run --no-project --with pytest pytest scripts/tests`) using small
   synthetic coverage data generated in a temp dir; covers table/hints,
-  missing data, summary-file append, exit code 0.
+  missing data, summary-file append, exit codes (0 with partial data, non-zero on combine failure or no data at all).
 - E2E driver: unit tests in `e2e/tests/` for argv wrapping (with/without
   `--coverage`, image mode, exe-mode rejection), rcfile content, and summary
   integration with a fake combine result.
