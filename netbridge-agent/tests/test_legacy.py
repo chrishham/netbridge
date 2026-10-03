@@ -409,3 +409,24 @@ async def test_legacy_close_does_not_wait_long_on_a_stuck_cancel(legacy_dial, mo
     assert legacy.pending_connections == {}
     stuck.set()
     await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_legacy_dial_cancelled_by_close_sends_no_late_result(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    await asyncio.sleep(0)
+    await legacy.handle_tcp_close({"type": "tcp_close", "stream_id": "s1"})
+    ws.send_str.assert_not_called()      # the relay let go of s1; a reuse must not be torn down
+
+
+async def test_legacy_dial_cancelled_while_still_pending_reports_it(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    task = legacy.pending_connections["s1"]
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    sent = [json.loads(c.args[0]) for c in ws.send_str.call_args_list]
+    assert sent == [{"type": "tcp_connect_result", "stream_id": "s1", "success": False, "error": "Connection cancelled"}]

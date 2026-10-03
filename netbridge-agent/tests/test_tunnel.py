@@ -387,6 +387,29 @@ class TestConnectViaProxyErrors:
         mock_writer.close.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_cancel_during_connect_reply_closes_the_proxy_socket(self):
+        mock_reader = AsyncMock(spec=asyncio.StreamReader)
+        mock_writer = MagicMock(spec=asyncio.StreamWriter)
+        mock_writer.drain = AsyncMock()
+        replied = asyncio.Event()
+
+        async def never():
+            replied.set()
+            await asyncio.Event().wait()
+
+        mock_reader.readline = never
+
+        with patch("asyncio.open_connection", new_callable=AsyncMock) as mock_open:
+            mock_open.return_value = (mock_reader, mock_writer)
+            task = asyncio.create_task(connect_via_proxy("proxy", 8080, "target", 443))
+            await replied.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        mock_writer.close.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_407_without_sspi_raises(self):
         """On non-Windows (or no Negotiate/NTLM), 407 should raise."""
         mock_reader = AsyncMock(spec=asyncio.StreamReader)

@@ -244,12 +244,18 @@ async def _do_tcp_connect(ws, stream_id: str, host: str, port: int) -> None:
         print(f"[{ts()}] [TCP] Connected: {stream_id} -> {host}:{port}")
 
     except asyncio.CancelledError:
-        await send_to_relay(ws, {
-            "type": "tcp_connect_result",
-            "stream_id": stream_id,
-            "success": False,
-            "error": "Connection cancelled",
-        }, silent=True)
+        # tcp_close and shutdown drop the pending entry before cancelling: the
+        # relay already let go of the id, and a late failure could tear down
+        # a new stream that reused it
+        async with lock:
+            still_ours = pending_connections.get(stream_id) is asyncio.current_task()
+        if still_ours:
+            await send_to_relay(ws, {
+                "type": "tcp_connect_result",
+                "stream_id": stream_id,
+                "success": False,
+                "error": "Connection cancelled",
+            }, silent=True)
         raise
 
     except asyncio.TimeoutError:

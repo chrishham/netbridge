@@ -723,6 +723,10 @@ class TunnelManager:
 
         try:
             await self.ws.send_str(_json_dumps(request))
+        except asyncio.CancelledError:
+            # the request may already be out: free the slot and tell the relay
+            await self.close_stream(stream_id)
+            raise
         except Exception as e:
             # Failed to send - clean up
             async with self._lock:

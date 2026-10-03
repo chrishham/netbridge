@@ -606,3 +606,18 @@ def test_http_connect_returns_a_socket_with_the_full_timeout():
         stop.set()
         t.join(2)
         srv.close()
+
+
+def test_socks5_connect_deadline_bounds_a_trickled_reply():
+    # valid method reply and CONNECT reply head (ATYP=domain); the address then trickles in,
+    # one byte per 50 ms ("x" = a 120-byte name), well inside each per-recv timeout
+    srv, stop, t = _trickle_proxy(b"\x05\x00" + b"\x05\x00\x00\x03", then_trickle=True)
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            clients.socks5_connect(srv.getsockname(), "h", 80, timeout=0.4)
+        assert time.monotonic() - start < 2
+    finally:
+        stop.set()
+        t.join(2)
+        srv.close()

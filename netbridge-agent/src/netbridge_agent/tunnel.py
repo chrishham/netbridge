@@ -524,6 +524,9 @@ async def connect_via_proxy(
         # _raise_for_status always raises for non-200, but just in case:
         return reader, writer
 
+    except asyncio.CancelledError:
+        writer.close()   # the dial was abandoned (stream closed or shutdown): drop the proxy socket
+        raise
     except ProxyConnectionError:
         writer.close()
         try:

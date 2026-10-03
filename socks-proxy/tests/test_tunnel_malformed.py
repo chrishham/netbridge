@@ -136,3 +136,28 @@ async def test_cancelled_connect_frees_the_stream_and_tells_the_relay():
     assert tm._stream_semaphore._value == free_before
     sent = [json.loads(c.args[0]) for c in tm.ws.send_str.call_args_list]
     assert sent[-1] == {"type": "tcp_close", "stream_id": sid, "reason": "client_closed"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_sending_the_connect_request_frees_the_slot():
+    tm = _tm()
+    free_before = tm._stream_semaphore._value
+    sending = asyncio.Event()
+    sent = []
+
+    async def send_str(data):
+        msg = json.loads(data)
+        sent.append(msg)
+        if msg["type"] == "tcp_connect":
+            sending.set()
+            await asyncio.Event().wait()     # the write never completes
+
+    tm.ws.send_str = send_str
+    task = asyncio.create_task(tm.connect("10.0.0.1", 80, timeout=5))
+    await sending.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert tm.streams == {}
+    assert tm._stream_semaphore._value == free_before
+    assert sent[-1] == {"type": "tcp_close", "stream_id": sent[0]["stream_id"], "reason": "client_closed"}

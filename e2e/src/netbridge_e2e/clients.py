@@ -51,19 +51,21 @@ def recv_exact(sock: socket.socket, n: int, deadline: float | None = None) -> by
 def socks5_connect(proxy: Address, dest_host: str, dest_port: int, timeout: float = 15.0) -> socket.socket:
     """CONNECT with ATYP=domain, so the far side (the agent) resolves the name."""
     sock = socket.create_connection(proxy, timeout=timeout)
+    deadline = time.monotonic() + timeout   # one bound for the whole handshake
     try:
         sock.sendall(b"\x05\x01\x00")
-        if recv_exact(sock, 2) != b"\x05\x00":
+        if recv_exact(sock, 2, deadline) != b"\x05\x00":
             raise ProxyError(-1, "SOCKS5 no-auth method rejected")
         host = dest_host.encode("idna")
         sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + dest_port.to_bytes(2, "big"))
-        ver, rep, _rsv, atyp = recv_exact(sock, 4)
+        ver, rep, _rsv, atyp = recv_exact(sock, 4, deadline)
         if ver != 5:
             raise ProxyError(-1, f"bad SOCKS version {ver}")
         if rep != 0:
             raise ProxyError(rep, f"SOCKS5 CONNECT {dest_host}:{dest_port} refused")
-        addr_len = {1: 4, 4: 16}.get(atyp) or recv_exact(sock, 1)[0]
-        recv_exact(sock, addr_len + 2)
+        addr_len = {1: 4, 4: 16}.get(atyp) or recv_exact(sock, 1, deadline)[0]
+        recv_exact(sock, addr_len + 2, deadline)
+        sock.settimeout(timeout)   # the deadline left a shrunken per-recv timeout behind
         return sock
     except BaseException:
         sock.close()
