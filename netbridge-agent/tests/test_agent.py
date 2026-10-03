@@ -573,3 +573,32 @@ class TestInitialAuthRetry:
             await run_agent("relay.com", stop)
 
         mock_connect.assert_not_called()
+
+
+class TestIPv4MappedPolicy:
+    @pytest.mark.parametrize("host", ["::ffff:127.0.0.1", "[::ffff:127.0.0.1]"])
+    async def test_mapped_loopback_blocked(self, host):
+        assert (await validate_destination(host, 80))[0] is False
+        assert (await validate_destination(host, 80, allow_loopback=True))[0] is True
+
+    @pytest.mark.parametrize("host", ["::ffff:169.254.169.254", "[::ffff:169.254.169.254]"])
+    async def test_mapped_link_local_always_blocked(self, host):
+        assert (await validate_destination(host, 80, allow_loopback=True))[0] is False
+
+    async def test_mapped_private_follows_allow_private(self):
+        assert (await validate_destination("::ffff:10.0.0.1", 80, allow_private=False))[0] is False
+        assert (await validate_destination("::ffff:10.0.0.1", 80))[0] is True
+
+    async def test_mapped_address_matches_ipv4_cidr_rules(self):
+        assert (await validate_destination("::ffff:10.1.2.3", 80, allowed_destinations=["10.0.0.0/8"]))[0] is True
+        assert (await validate_destination("::ffff:11.1.2.3", 80, allowed_destinations=["10.0.0.0/8"]))[0] is False
+        assert (await validate_destination("::ffff:10.1.2.3", 80, denied_destinations=["10.0.0.0/8"]))[0] is False
+
+    async def test_plain_ipv6_unaffected(self):
+        assert (await validate_destination("2001:4860:4860::8888", 443))[0] is True
+
+    async def test_resolved_mapped_address_is_normalised(self):
+        loop = asyncio.get_running_loop()
+        infos = [(10, 1, 6, "", ("::ffff:127.0.0.1", 0, 0, 0))]
+        with patch.object(loop, "getaddrinfo", AsyncMock(return_value=infos)):
+            assert (await validate_destination("evil.example", 80))[0] is False

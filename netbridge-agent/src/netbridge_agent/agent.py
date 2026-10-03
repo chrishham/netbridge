@@ -89,6 +89,44 @@ _PRIVATE_RANGES = [
 ]
 
 
+MAX_STREAM_ID_LENGTH = 128
+
+
+def valid_stream_id(value) -> bool:
+    """A stream id is a non-empty str of at most MAX_STREAM_ID_LENGTH chars."""
+    return isinstance(value, str) and 0 < len(value) <= MAX_STREAM_ID_LENGTH
+
+
+def valid_connect_fields(host, port) -> str | None:
+    """Return None if host/port are well-formed, else the error text."""
+    if not isinstance(host, str) or not host:
+        return "Invalid host or port"
+    if type(port) is not int or not (1 <= port <= 65535):
+        return "Invalid host or port"
+    return None
+
+
+def decode_tcp_payload(value) -> bytes | None:
+    """Strictly decode a tcp_data payload; None unless a valid base64 str."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return base64.b64decode(value, validate=True)
+    except ValueError:  # binascii.Error is a ValueError
+        return None
+
+
+def _normalize_ip(addr):
+    """Map an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to its IPv4Address.
+
+    Applied before every policy check so ::ffff:127.0.0.1 cannot bypass
+    loopback/link-local/private/CIDR rules written for IPv4.
+    """
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
 async def validate_destination(
     host: str,
     port: int,
@@ -121,7 +159,7 @@ async def validate_destination(
     # Collect all IPs to check against CIDR rules
     resolved_ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     if host_ip is not None:
-        resolved_ips.append(host_ip)
+        resolved_ips.append(_normalize_ip(host_ip))
     else:
         # Resolve hostname to IP addresses for CIDR checking
         try:
@@ -129,7 +167,7 @@ async def validate_destination(
             infos = await loop.getaddrinfo(bare_host, None)
             for _family, _type, _proto, _canonname, sockaddr in infos:
                 try:
-                    resolved_ips.append(ipaddress.ip_address(sockaddr[0]))
+                    resolved_ips.append(_normalize_ip(ipaddress.ip_address(sockaddr[0])))
                 except ValueError:
                     pass
         except (OSError, UnicodeError):
@@ -412,6 +450,20 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
     host = request.get("host")
     port = request.get("port")
 
+    if not valid_stream_id(stream_id):
+        logger.warning("tcp_connect with invalid stream_id, dropping")
+        return
+    err = valid_connect_fields(host, port)
+    if err:
+        logger.warning(f"tcp_connect {stream_id[:8]}: {err}")
+        await send_to_relay(ws, {
+            "type": "tcp_connect_result",
+            "stream_id": stream_id,
+            "success": False,
+            "error": err,
+        })
+        return
+
     lock = state.get_lock()
     async with lock:
         pending_count = len(state.pending_connections)
@@ -570,12 +622,22 @@ async def handle_tcp_data(state: AgentState, request: dict) -> None:
     stream_id = request.get("stream_id")
     data_b64 = request.get("data", "")
 
+    if not valid_stream_id(stream_id):
+        logger.warning("tcp_data with invalid stream_id, dropping")
+        return
+
     # Guard against oversized payloads
-    if len(data_b64) > _MAX_TCP_DATA_B64_LEN:
+    if isinstance(data_b64, str) and len(data_b64) > _MAX_TCP_DATA_B64_LEN:
         logger.warning(
             f"Oversized tcp_data ({len(data_b64)} chars) for stream "
-            f"{stream_id[:8] if stream_id else '?'}, dropping"
+            f"{stream_id[:8]}, dropping"
         )
+        return
+
+    payload = decode_tcp_payload(data_b64)
+    if payload is None:
+        logger.warning(f"tcp_data with invalid payload for {stream_id[:8]}, closing stream")
+        await close_stream(state, stream_id)
         return
 
     lock = state.get_lock()
@@ -588,8 +650,7 @@ async def handle_tcp_data(state: AgentState, request: dict) -> None:
     stream.touch()
 
     try:
-        data = base64.b64decode(data_b64)
-        stream.writer.write(data)
+        stream.writer.write(payload)
         await stream.writer.drain()
     except Exception as e:
         logger.debug(f"Write error {stream_id}: {e}")
@@ -600,6 +661,9 @@ async def handle_tcp_close(state: AgentState, request: dict) -> None:
     """Handle TCP close request from client."""
     stream_id = request.get("stream_id")
     reason = request.get("reason", "unknown")
+    if not valid_stream_id(stream_id):
+        logger.warning("tcp_close with invalid stream_id, dropping")
+        return
     logger.info(f"Closed: {stream_id[:8]} ({reason})")
     await close_stream(state, stream_id)
 
@@ -608,6 +672,9 @@ async def handle_message(state: AgentState, ws, msg: str) -> None:
     """Handle incoming message from relay."""
     try:
         request = json.loads(msg)
+        if not isinstance(request, dict):
+            logger.warning("Ignoring non-object JSON message")
+            return
         msg_type = request.get("type")
 
         if msg_type == "tcp_connect":
@@ -767,7 +834,7 @@ async def connect_and_run(
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             data = json.loads(msg.data)
-                            if data.get("type") == "heartbeat_ack":
+                            if isinstance(data, dict) and data.get("type") == "heartbeat_ack":
                                 continue
                         except json.JSONDecodeError:
                             pass

@@ -286,3 +286,32 @@ class TestHandleTcpClose:
             assert "s1" not in mod.active_streams
         finally:
             mod.active_streams.pop("s1", None)
+
+
+@pytest.mark.parametrize("raw", ["[1]", '"x"', "null", "42",
+                                 '{"type":"tcp_connect","stream_id":[1],"host":null,"port":1}',
+                                 '{"type":"tcp_connect","stream_id":"s1","host":"h","port":true}'])
+async def test_legacy_handle_message_survives_hostile_frames(raw):
+    from netbridge_agent import legacy
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_message(ws, raw)
+    assert legacy.active_streams == {}
+
+
+@pytest.mark.parametrize("data", [None, 5, [1], "!!not-base64!!"])
+async def test_legacy_tcp_data_bad_payload_closes_the_stream_and_writes_nothing(data, mock_writer, mock_reader, monkeypatch):
+    from netbridge_agent import legacy
+    info = legacy.StreamInfo(mock_reader, mock_writer, None, "h", 80)
+    monkeypatch.setitem(legacy.active_streams, "s1", info)
+    await legacy.handle_tcp_data({"type": "tcp_data", "stream_id": "s1", "data": data})
+    mock_writer.write.assert_not_called()
+    assert "s1" not in legacy.active_streams
+    mock_writer.close.assert_called()
+
+
+async def test_legacy_tcp_data_valid_payload_is_written(mock_writer, mock_reader, monkeypatch):
+    from netbridge_agent import legacy
+    info = legacy.StreamInfo(mock_reader, mock_writer, None, "h", 80)
+    monkeypatch.setitem(legacy.active_streams, "s1", info)
+    await legacy.handle_tcp_data({"type": "tcp_data", "stream_id": "s1", "data": "AA=="})
+    mock_writer.write.assert_called_once_with(b"\x00")
