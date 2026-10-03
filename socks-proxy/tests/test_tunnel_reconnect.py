@@ -33,6 +33,9 @@ async def test_ws_loss_fails_pending_connect_fast():
     with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
         tm = TunnelManager("relay.com")
 
+    # Size semaphore to 1 to make the test meaningful
+    tm._stream_semaphore = asyncio.Semaphore(1)
+
     # Set up connected state with a fake websocket
     tm._connected.set()
 
@@ -117,14 +120,62 @@ async def test_relay_tcp_close_fails_pending_connect():
 
 
 @pytest.mark.asyncio
+async def test_send_failure_retrieves_future_exception():
+    """When send_str fails after handler closed, future exception is retrieved."""
+    import gc
+    import warnings
+
+    with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+        tm = TunnelManager("relay.com")
+
+    tm._connected.set()
+
+    # Create a fake websocket whose send_str closes handlers then raises
+    async def fake_send_str(msg):
+        # Close all handlers while send is in progress
+        handlers = list(tm.streams.values())
+        for h in handlers:
+            await h.close()
+        # Then raise to simulate send failure
+        raise ConnectionResetError("connection reset")
+
+    fake_ws = AsyncMock()
+    fake_ws.closed = False
+    fake_ws.send_str = fake_send_str
+    tm.ws = fake_ws
+
+    # Catch warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+
+        # Try to connect - should fail with ConnectionError
+        with pytest.raises(ConnectionError, match="Failed to send connect request"):
+            await tm.connect("10.0.0.1", 80, timeout=30)
+
+        # Force garbage collection to trigger any pending warnings
+        gc.collect()
+
+        # Check no "Future exception was never retrieved" warning
+        future_warnings = [
+            warning for warning in w
+            if "Future exception was never retrieved" in str(warning.message)
+        ]
+        assert len(future_warnings) == 0, \
+            f"Unexpected future exception warning: {future_warnings}"
+
+
+@pytest.mark.asyncio
 async def test_socks_reply_is_host_unreachable_on_pending_close():
     """SOCKS5 handler returns 0x04 when connect raises ConnectionError."""
     from socks_proxy.socks5 import handle_socks5_client, REPLY_HOST_UNREACHABLE
 
     # Create fake reader/writer
     reader = AsyncMock()
-    writer = AsyncMock()
+    writer = MagicMock()
     writer.get_extra_info = MagicMock(return_value=("127.0.0.1", 12345))
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    writer.close = MagicMock()
 
     # Fake tunnel that raises ConnectionError on connect
     tunnel = AsyncMock()
@@ -191,6 +242,11 @@ async def test_receive_loop_end_closes_established_streams():
 async def test_reconnect_after_failed_handshakes():
     """Reconnect retries with exponential backoff after handshake failures."""
     import socks_proxy.tunnel as tunnel_module
+    from shared_auth.session import (
+        RECONNECT_DELAY,
+        RECONNECT_BACKOFF_FACTOR,
+        RECONNECT_DELAY_MAX,
+    )
 
     with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
         tm = TunnelManager("relay.com")
@@ -250,24 +306,30 @@ async def test_reconnect_after_failed_handshakes():
         except asyncio.CancelledError:
             pass
 
-    # Filter for reconnect delays (>= 4s) - the shortest reconnect is RECONNECT_DELAY=5 with jitter
-    reconnect_delays = [d for d in recorded_delays if d >= 4.0]
+    # Filter for reconnect delays - shortest is RECONNECT_DELAY with jitter
+    min_reconnect = RECONNECT_DELAY * 0.7  # Allow for some margin
+    reconnect_delays = [d for d in recorded_delays if d >= min_reconnect]
 
-    # Should have exactly 3 reconnect delays (attempts 1, 2, 3 failed, 4th succeeded)
-    # Take only the first 3 if we got more due to timing
+    # Should have at least 3 reconnect delays (attempts 1, 2, 3 failed, 4th succeeded)
+    assert attempt_count[0] >= 4, f"Expected at least 4 connection attempts, got {attempt_count[0]}"
+    assert len(reconnect_delays) >= 3, \
+        f"Expected at least 3 reconnect delays, got {len(reconnect_delays)}: {reconnect_delays}"
+
+    # Take first 3 delays for verification
     reconnect_delays = reconnect_delays[:3]
 
-    assert len(reconnect_delays) == 3, \
-        f"Expected 3 reconnect delays, got {len(reconnect_delays)}: {reconnect_delays}"
+    # Derive expected delays from constants
+    # Attempt 1 fails: delay = RECONNECT_DELAY + jitter (0 to 30%)
+    # Attempt 2 fails: delay = RECONNECT_DELAY * RECONNECT_BACKOFF_FACTOR + jitter
+    # Attempt 3 fails: delay = min(prev * RECONNECT_BACKOFF_FACTOR, RECONNECT_DELAY_MAX) + jitter
+    base_delays = [RECONNECT_DELAY]
+    for i in range(1, 3):
+        next_delay = base_delays[-1] * RECONNECT_BACKOFF_FACTOR
+        base_delays.append(min(next_delay, RECONNECT_DELAY_MAX))
 
-    # Check delays are within expected range
-    # Initial: RECONNECT_DELAY=5, backoff factor=2, jitter up to 30%
-    # Attempt 1 fails: delay = 5 + jitter (0 to 1.5)
-    # Attempt 2 fails: delay = 10 + jitter (0 to 3.0)
-    # Attempt 3 fails: delay = 20 + jitter (0 to 6.0)
-    base_delays = [5, 10, 20]
+    # Check delays are within expected range (jitter up to 30%)
     for i, delay in enumerate(reconnect_delays):
         base = base_delays[i]
         max_delay = base * 1.3
         assert base <= delay <= max_delay, \
-            f"Delay {delay} not in range [{base}, {max_delay}]"
+            f"Delay {i}: {delay} not in range [{base}, {max_delay}]"

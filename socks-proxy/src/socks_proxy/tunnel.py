@@ -721,6 +721,13 @@ class TunnelManager:
             async with self._lock:
                 self.streams.pop(stream_id, None)
             self._release_semaphore_for_stream(handler)
+            # If handler was closed while send was suspended, retrieve its exception
+            # to prevent "Future exception was never retrieved" warning
+            if future.done() and not future.cancelled():
+                try:
+                    future.exception()
+                except Exception:
+                    pass
             raise ConnectionError(f"Failed to send connect request: {e}")
 
         # Wait for response
