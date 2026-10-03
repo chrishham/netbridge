@@ -144,79 +144,55 @@ class TestBackoffEscalation:
         assert delays == [5, 10, 20]
 
 
+def _make_fake_websocket(msg_sequence):
+    """Helper to create a fake websocket that returns a sequence of messages."""
+    message_idx = [0]
+
+    async def fake_receive():
+        if message_idx[0] < len(msg_sequence):
+            msg = msg_sequence[message_idx[0]]
+            message_idx[0] += 1
+            return msg
+        raise asyncio.TimeoutError
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.receive = fake_receive
+    ws.close = AsyncMock()
+    ws.send_str = AsyncMock()
+
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=ws)
+    session.__aexit__ = AsyncMock()
+
+    fake_client_session = MagicMock()
+    fake_client_session.ws_connect = MagicMock(return_value=session)
+    fake_client_session.__aenter__ = AsyncMock(return_value=fake_client_session)
+    fake_client_session.__aexit__ = AsyncMock()
+
+    return fake_client_session
+
+
 class TestLivenessTimeout:
     """Liveness timeout detection should end the session."""
 
     @pytest.mark.asyncio
-    async def test_liveness_timeout_ends_session(self):
+    async def test_liveness_timeout_ends_session(self, caplog):
         """When no messages arrive, session ends with 'assuming dead' log."""
+        import logging
+        caplog.set_level(logging.WARNING)
+
         stop = asyncio.Event()
+        state = AgentState()
 
-        # Fake websocket that only sends "registered" then goes silent
-        class FakeWS:
-            closed = False
-            exception = lambda self: None
-
-            async def receive(self):
-                await asyncio.sleep(0.01)  # Simulate timeout
-                raise asyncio.TimeoutError
-
-            async def close(self):
-                self.closed = True
-
-        class FakeSession:
-            def __init__(self):
-                self.ws = FakeWS()
-
-            async def ws_connect(self, *args, **kwargs):
-                return self
-
-            async def __aenter__(self):
-                return self.ws
-
-            async def __aexit__(self, *args):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        # Patch to send "registered" once, then return timeouts
         messages = [
             MagicMock(type=aiohttp.WSMsgType.TEXT, data='{"type": "registered"}'),
         ]
-        message_idx = [0]
-
-        async def fake_receive():
-            if message_idx[0] < len(messages):
-                msg = messages[message_idx[0]]
-                message_idx[0] += 1
-                return msg
-            # After registered, always timeout
-            raise asyncio.TimeoutError
-
-        ws = MagicMock()
-        ws.closed = False
-        ws.receive = fake_receive
-        ws.close = AsyncMock()
-        ws.send_str = AsyncMock()
-
-        session = MagicMock()
-        session.__aenter__ = AsyncMock(return_value=ws)
-        session.__aexit__ = AsyncMock()
-
-        fake_client_session = MagicMock()
-        fake_client_session.ws_connect = MagicMock(return_value=session)
-        fake_client_session.__aenter__ = AsyncMock(return_value=fake_client_session)
-        fake_client_session.__aexit__ = AsyncMock()
-
-        state = AgentState()
+        fake_client_session = _make_fake_websocket(messages)
 
         with patch("netbridge_agent.agent.aiohttp.ClientSession", return_value=fake_client_session), \
              patch("netbridge_agent.agent.CONNECTION_LIVENESS_TIMEOUT", 0.05), \
-             patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock) as mock_close:
+             patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock):
             intentional, duration = await connect_and_run(
                 state, "ws://relay.com", None, None, "token", stop, None, None
             )
@@ -224,51 +200,6 @@ class TestLivenessTimeout:
         # Should not be intentional stop, should have a duration
         assert intentional is False
         assert duration > 0
-
-    @pytest.mark.asyncio
-    async def test_liveness_timeout_logs_assuming_dead(self, caplog):
-        """Verify 'assuming dead' appears in log when liveness times out."""
-        import logging
-        caplog.set_level(logging.WARNING)
-
-        stop = asyncio.Event()
-
-        messages = [
-            MagicMock(type=aiohttp.WSMsgType.TEXT, data='{"type": "registered"}'),
-        ]
-        message_idx = [0]
-
-        async def fake_receive():
-            if message_idx[0] < len(messages):
-                msg = messages[message_idx[0]]
-                message_idx[0] += 1
-                return msg
-            raise asyncio.TimeoutError
-
-        ws = MagicMock()
-        ws.closed = False
-        ws.receive = fake_receive
-        ws.close = AsyncMock()
-        ws.send_str = AsyncMock()
-
-        session = MagicMock()
-        session.__aenter__ = AsyncMock(return_value=ws)
-        session.__aexit__ = AsyncMock()
-
-        fake_client_session = MagicMock()
-        fake_client_session.ws_connect = MagicMock(return_value=session)
-        fake_client_session.__aenter__ = AsyncMock(return_value=fake_client_session)
-        fake_client_session.__aexit__ = AsyncMock()
-
-        state = AgentState()
-
-        with patch("netbridge_agent.agent.aiohttp.ClientSession", return_value=fake_client_session), \
-             patch("netbridge_agent.agent.CONNECTION_LIVENESS_TIMEOUT", 0.05), \
-             patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock):
-            await connect_and_run(
-                state, "ws://relay.com", None, None, "token", stop, None, None
-            )
-
         # Check log contains "assuming dead"
         assert any("assuming dead" in record.message for record in caplog.records)
 
@@ -278,18 +209,34 @@ class TestDisconnectCleanup:
 
     @pytest.mark.asyncio
     async def test_disconnect_closes_all_streams(self):
-        """When websocket closes, close_all_streams should be called."""
+        """When websocket closes, close_all_streams and heartbeat cancellation happen."""
         stop = asyncio.Event()
+        state = AgentState()
+        heartbeat_task_holder = {}
+        started = asyncio.Event()
 
+        async def fake_heartbeat_sender(ws, stop_event, liveness_tracker):
+            heartbeat_task_holder['task'] = asyncio.current_task()
+            started.set()
+            # Wait forever until cancelled
+            await asyncio.Event().wait()
+
+        # Delay the CLOSED message until heartbeat has started
+        message_idx = [0]
         messages = [
             MagicMock(type=aiohttp.WSMsgType.TEXT, data='{"type": "registered"}'),
             MagicMock(type=aiohttp.WSMsgType.CLOSED),
         ]
-        message_idx = [0]
 
         async def fake_receive():
-            if message_idx[0] < len(messages):
-                msg = messages[message_idx[0]]
+            if message_idx[0] == 0:
+                msg = messages[0]
+                message_idx[0] += 1
+                return msg
+            elif message_idx[0] == 1:
+                # Wait for heartbeat to start before returning CLOSED
+                await started.wait()
+                msg = messages[1]
                 message_idx[0] += 1
                 return msg
             raise asyncio.TimeoutError
@@ -309,16 +256,18 @@ class TestDisconnectCleanup:
         fake_client_session.__aenter__ = AsyncMock(return_value=fake_client_session)
         fake_client_session.__aexit__ = AsyncMock()
 
-        state = AgentState()
-
         with patch("netbridge_agent.agent.aiohttp.ClientSession", return_value=fake_client_session), \
-             patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock) as mock_close:
+             patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock) as mock_close, \
+             patch("netbridge_agent.agent.heartbeat_sender", new=fake_heartbeat_sender):
             await connect_and_run(
                 state, "ws://relay.com", None, None, "token", stop, None, None
             )
 
         # close_all_streams should be called
         mock_close.assert_awaited_once_with(state)
+        # Heartbeat task should be cancelled
+        assert 'task' in heartbeat_task_holder
+        assert heartbeat_task_holder['task'].cancelled()
 
 
 class TestCloseAllStreams:
