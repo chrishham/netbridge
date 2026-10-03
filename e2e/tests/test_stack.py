@@ -227,3 +227,126 @@ def test_relay_source_env_gets_fault_tuning(tmp_path, monkeypatch):
     assert {k: envs["relay"][k] for k in stack.FAULT_TUNING} == {
         "RELAY_HEARTBEAT_INTERVAL": "10", "RELAY_RATE_CONNECTIONS_PER_MIN": "600",
         "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "600"}
+
+
+class FakeStub:
+    tenant = "33333333-3333-3333-3333-333333333333"
+    jwks_url = f"http://127.0.0.1:9/{tenant}/discovery/v2.0/keys"
+
+    def __init__(self):
+        self.minted = []
+
+    def mint(self, **kw):
+        self.minted.append(kw)
+        return "signed.test.token"
+
+
+def captured_proc(monkeypatch):
+    seen = {}
+
+    class FakeProc:
+        def __init__(self, name, argv, log_path, env=None, **kw):
+            seen["argv"], seen["env"] = argv, env
+
+        def start(self):
+            return self
+
+    monkeypatch.setattr(stack, "Proc", FakeProc)
+    monkeypatch.setattr(stack, "port_in_use", lambda port: False)
+    monkeypatch.setattr(stack.subprocess, "run", lambda *a, **k: None)
+    return seen
+
+
+def test_relay_source_with_auth(tmp_path, monkeypatch):
+    seen = captured_proc(monkeypatch)
+    stub = FakeStub()
+    env = {"PYTHONPATH": "/existing", "NETBRIDGE_ALLOW_NO_AUTH": "true"}
+    stack.Relay(tmp_path, 1, blocked_port=2, env=env, auth=stub).start()
+    assert "--no-auth" not in seen["argv"]
+    assert seen["argv"][-4:] == ["--host", "127.0.0.1", "--port", "1"]
+    e = seen["env"]
+    assert e["NETBRIDGE_ALLOWED_TENANTS"] == stub.tenant
+    assert e["NETBRIDGE_E2E_JWKS_URL"] == stub.jwks_url
+    assert e["PYTHONPATH"] == os.pathsep.join([str(stack.RELAYSITE_DIR), "/existing"])
+    assert "NETBRIDGE_ALLOW_NO_AUTH" not in e
+    assert e["RELAY_HEARTBEAT_INTERVAL"] == "10"
+    assert e["NO_PROXY"] == e["no_proxy"] == "127.0.0.1,localhost"
+
+
+def test_relay_source_with_auth_and_no_inherited_pythonpath(tmp_path, monkeypatch):
+    seen = captured_proc(monkeypatch)
+    stack.Relay(tmp_path, 1, blocked_port=2, env={"no_proxy": "corp.example"}, auth=FakeStub()).start()
+    assert seen["env"]["PYTHONPATH"] == str(stack.RELAYSITE_DIR)
+    assert seen["env"]["no_proxy"] == "127.0.0.1,localhost,corp.example"
+
+
+def test_relay_source_without_auth_keeps_no_auth_mode(tmp_path, monkeypatch):
+    seen = captured_proc(monkeypatch)
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}).start()
+    assert "--no-auth" in seen["argv"]
+    assert seen["env"]["NETBRIDGE_ALLOW_NO_AUTH"] == "true"
+    assert seen["env"]["NETBRIDGE_ALLOWED_TENANTS"] == stack.TEST_TENANT
+    assert "NETBRIDGE_E2E_JWKS_URL" not in seen["env"] and "PYTHONPATH" not in seen["env"]
+
+
+def test_relay_image_with_auth(tmp_path, monkeypatch):
+    seen = captured_proc(monkeypatch)
+    stub = FakeStub()
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}, image="img", auth=stub).start()
+    argv = seen["argv"]
+    pairs = [argv[i:i + 2] for i in range(len(argv) - 1)]
+    assert "--no-auth" not in argv
+    assert ["-v", f"{stack.RELAYSITE_DIR}:/e2e-site:ro"] in pairs
+    assert ["-e", "PYTHONPATH=/e2e-site"] in pairs
+    assert ["-e", f"NETBRIDGE_E2E_JWKS_URL={stub.jwks_url}"] in pairs
+    assert ["-e", f"NETBRIDGE_ALLOWED_TENANTS={stub.tenant}"] in pairs
+    assert not any(a.startswith("NETBRIDGE_ALLOW_NO_AUTH") for a in argv)
+    assert argv.index("img") > argv.index("-v")  # docker options precede the image
+
+
+def test_relay_status_sends_a_bearer_token_with_auth(tmp_path, monkeypatch):
+    sent = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"auth_required": true, "agents": 0}'
+
+    def fake_open(req, timeout):
+        sent.append(req)
+        return Resp()
+
+    monkeypatch.setattr(stack._NO_PROXY, "open", fake_open)
+    stub = FakeStub()
+    assert stack.Relay(tmp_path, 5, blocked_port=2, env={}, auth=stub).status() == {"auth_required": True, "agents": 0}
+    assert sent[0].full_url == "http://127.0.0.1:5/status"
+    assert sent[0].get_header("Authorization") == "Bearer signed.test.token"
+    assert stub.minted == [{"upn": "status@netbridge.test"}]
+    stack.Relay(tmp_path, 5, blocked_port=2, env={}).status()
+    assert sent[1].get_header("Authorization") is None
+
+
+def test_relay_with_auth_validates_tokens_against_the_stub(tmp_path):
+    import re
+
+    from netbridge_e2e.authstub import AuthStub
+    stub = AuthStub(tmp_path)
+    stub.start()
+    env = dict(os.environ, HTTP_PROXY="http://127.0.0.1:9", http_proxy="http://127.0.0.1:9")
+    r = stack.Relay(tmp_path / "logs", free_port(), blocked_port=1, env=env, auth=stub)
+    try:
+        r.start()
+        assert r.wait_ready(120), r.logs.tail()
+        status = r.status()
+        assert status["auth_required"] is True
+        assert "agents" in status, status  # the stub-signed bearer was accepted
+        assert re.search(stack.REDIRECTED + re.escape(stub.jwks_url), r.logs.text()), r.logs.tail()
+        assert stub.requests() >= 1
+    finally:
+        r.stop()
+        stub.close()
