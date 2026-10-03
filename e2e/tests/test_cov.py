@@ -1,5 +1,7 @@
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -70,11 +72,17 @@ def test_wrap_failure_returns_none_and_warns(c, monkeypatch):
 def test_python_resolves_the_component_venv(tmp_path, monkeypatch):
     calls = []
 
-    def fake_run(argv, **kw):
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="/x/relay/.venv/bin/python\n", stderr="")
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            calls.append(argv)
+            self.args = argv
+            self.pid = 12345
+            self.returncode = 0
 
-    monkeypatch.setattr(cov.subprocess, "run", fake_run)
+        def communicate(self, timeout=None):
+            return "/x/relay/.venv/bin/python\n", ""
+
+    monkeypatch.setattr(cov.subprocess, "Popen", FakePopen)
     e = cov.E2ECoverage(tmp_path)
     assert e._python("relay") == "/x/relay/.venv/bin/python"
     assert e._python("relay") == "/x/relay/.venv/bin/python"
@@ -101,6 +109,43 @@ def test_python_probe_rejects_a_broken_rcfile(tmp_path, monkeypatch):
     monkeypatch.setattr(cov, "_uv", lambda project, *args: [sys.executable, *args[1:]])
     assert e.wrap("relay", ["-m", "relay"]) is None
     assert any("not instrumented" in w for w in e.warnings)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process group killing is POSIX-only")
+def test_python_probe_times_out_and_kills_descendants(tmp_path, monkeypatch):
+    monkeypatch.setattr(cov, "PROBE_TIMEOUT", 1)
+    pid_file = tmp_path / "grandchild.pid"
+    # a probe that spawns a sleeping grandchild and then sleeps itself
+    stalled_probe = (
+        f"import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', "
+        f"'import os, time; open({str(pid_file)!r}, \"w\").write(str(os.getpid())); time.sleep(60)']); "
+        f"time.sleep(60)"
+    )
+    monkeypatch.setattr(cov, "_uv", lambda project, *args: [sys.executable, "-c", stalled_probe])
+    e = cov.E2ECoverage(tmp_path / "cov")
+    e.prepare()
+    start = time.time()
+    assert e.wrap("relay", ["-m", "relay"]) is None
+    elapsed = time.time() - start
+    assert elapsed < 5, "wrap should return quickly after timeout"
+    assert any("relay" in w and "not instrumented" in w for w in e.warnings)
+    # grandchild should be gone (wait briefly for it to write its PID and be killed)
+    for _ in range(50):  # poll up to 5 seconds
+        if pid_file.exists():
+            break
+        time.sleep(0.1)
+    if pid_file.exists():
+        grandchild_pid = int(pid_file.read_text())
+        # poll briefly to ensure it's gone
+        for _ in range(20):
+            try:
+                os.kill(grandchild_pid, 0)
+                time.sleep(0.1)
+            except ProcessLookupError:
+                break
+        else:
+            pytest.fail(f"grandchild {grandchild_pid} still alive")
 
 
 def drive(c, src_root: Path, pkg: str):

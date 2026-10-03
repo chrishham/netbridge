@@ -5,11 +5,15 @@ Each component runs under `coverage run` with its own venv interpreter: through
 after uv exits — before Python's atexit flush.
 """
 import json
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 from .stack import REPO, _uv
+
+PROBE_TIMEOUT = 120
 
 PACKAGES = {
     "relay": "relay/src/relay",
@@ -48,9 +52,24 @@ class E2ECoverage:
             # setup falls back instead of killing the child
             probe = ("import sys, coverage; c = coverage.Coverage(config_file=sys.argv[1], data_file=None); "
                      "c.start(); c.stop(); print(sys.executable)")
-            out = subprocess.run(_uv(project, "python", "-c", probe, str(self.rcfile)),
-                                 capture_output=True, text=True, check=True, timeout=600)
-            self._pythons[project] = out.stdout.strip().splitlines()[-1]
+            # start_new_session creates a process group so we can kill descendants on timeout
+            # (--coverage is rejected on Windows in parse_args, so POSIX-only killpg is fine)
+            p = subprocess.Popen(_uv(project, "python", "-c", probe, str(self.rcfile)),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                 start_new_session=True)
+            try:
+                stdout, stderr = p.communicate(timeout=PROBE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # kill the whole process group (uv + its Python child)
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                p.communicate()  # reap
+                raise
+            if p.returncode != 0:
+                raise subprocess.CalledProcessError(p.returncode, p.args, stdout, stderr)
+            self._pythons[project] = stdout.strip().splitlines()[-1]
         return self._pythons[project]
 
     def wrap(self, project: str, module_args: list[str]) -> list[str] | None:
