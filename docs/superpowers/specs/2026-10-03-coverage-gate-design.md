@@ -208,7 +208,17 @@ New driver option `--coverage DIR` (source mode only):
   sigterm = true
   source_pkgs = relay, netbridge_agent, socks_proxy, shared_auth
   data_file = DIR/.coverage
+
+  [paths]
+  shared_auth =
+      <repo>/shared/src/shared_auth
+      */site-packages/shared_auth
+  (and the same canonical-first mapping for relay, netbridge_agent, socks_proxy)
   ```
+
+  `shared_auth` is installed as a non-editable copy in each component's
+  venv `site-packages`; without the `[paths]` mapping, combine would treat
+  the three copies as distinct files.
 
 - Before writing the rcfile and launching anything, the driver deletes only
   coverage data files in DIR (`DIR/.coverage` and `DIR/.coverage.*`; the
