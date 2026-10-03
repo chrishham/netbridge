@@ -270,14 +270,19 @@ def test_relay_source_with_auth(tmp_path, monkeypatch):
     assert e["PYTHONPATH"] == os.pathsep.join([str(stack.RELAYSITE_DIR), "/existing"])
     assert "NETBRIDGE_ALLOW_NO_AUTH" not in e
     assert e["RELAY_HEARTBEAT_INTERVAL"] == "10"
-    assert e["NO_PROXY"] == e["no_proxy"] == "127.0.0.1,localhost"
+    assert e["NO_PROXY"] == "127.0.0.1,localhost"
+    # Windows env names are case-insensitive, so only one spelling is set there
+    assert ("no_proxy" in e) == (os.name != "nt")
+    if os.name != "nt":
+        assert e["no_proxy"] == "127.0.0.1,localhost"
 
 
 def test_relay_source_with_auth_and_no_inherited_pythonpath(tmp_path, monkeypatch):
     seen = captured_proc(monkeypatch)
-    stack.Relay(tmp_path, 1, blocked_port=2, env={"no_proxy": "corp.example"}, auth=FakeStub()).start()
+    var = "NO_PROXY" if os.name == "nt" else "no_proxy"  # os.environ is upper-cased on Windows
+    stack.Relay(tmp_path, 1, blocked_port=2, env={var: "corp.example"}, auth=FakeStub()).start()
     assert seen["env"]["PYTHONPATH"] == str(stack.RELAYSITE_DIR)
-    assert seen["env"]["no_proxy"] == "127.0.0.1,localhost,corp.example"
+    assert seen["env"][var] == "127.0.0.1,localhost,corp.example"
 
 
 def test_relay_source_without_auth_keeps_no_auth_mode(tmp_path, monkeypatch):
