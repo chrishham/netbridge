@@ -156,6 +156,21 @@ call `.get` the same way; `remote_exec` `/exec` and `/exec/stream` call
 `await request.json()` then `.get` (`remote_exec.py:183, 236`), so a valid
 scalar/array body yields a logged traceback and HTTP 500.
 
+### F6e. IPv4-mapped IPv6 bypasses the agent's address policy (product security bug)
+
+`validate_destination` (`agent.py:72`) builds `host_ip` from the literal
+(`agent.py:114-118`) or from `getaddrinfo` results (`agent.py:126-134`) and
+tests membership in the IPv4 range lists (`_LOOPBACK_RANGES`,
+`_LINK_LOCAL_RANGES`, `_PRIVATE_RANGES`, `agent.py:70-90`) and in user
+allow/deny CIDRs. Nothing normalises `IPv6Address.ipv4_mapped` (no occurrence
+of `ipv4_mapped` in the agent), and an `IPv6Address` is never `in` an IPv4
+network. So `::ffff:127.0.0.1`, `::ffff:169.254.169.254` and `::ffff:10.0.0.1`
+pass every check, and a connect to such an address reaches the IPv4 target on a
+dual-stack host (or a resolver can return a mapped address for a name). The
+"always blocked" link-local rule (cloud metadata endpoint) and the loopback
+block are bypassable by any tunnel user. The same function is used by
+`legacy.py:314`.
+
 ### F6d. Shutdown race in `NetBridgeApp` (product bug)
 
 `_async_main` creates `self._stop_event` and waits on it (`app.py:722, 751`).
@@ -165,6 +180,16 @@ for each connection (`app.py:671`), and `request_exit()` sets whatever
 started, Exit signals the replacement, `_async_main` keeps waiting on the
 original, and the application does not shut down (the same applies to
 `_check_pending_requests` disconnect, which stops the connection, not the app).
+
+### F6f. `tcp_close` ignores a still-pending connect (product bug)
+
+`handle_tcp_close` (`agent.py:599`) calls `close_stream`, which only pops
+`state.active_streams` (`agent.py:313-320`) and returns if absent. A stream
+whose connect task is still in `pending_connections` (`agent.py:561-565`) is
+untouched: the task finishes later and registers an orphaned TCP stream and
+forwarder nobody will close until the relay's idle sweep. Today the window is
+the connect time (up to 30 s); after the DNS move of 3b it also includes
+resolution, which makes it wider.
 
 ### F6. Agent unit-test gaps
 
@@ -185,7 +210,7 @@ original, and the application does not shut down (the same applies to
    that one bad plugin does not break the rest.
 3. Fix test-first: F4/F6c (non-object JSON: relay, agent, proxy, legacy,
    remote_exec), F6a (failed connect leaks the relay stream), F6b (single,
-   bounded DNS resolution in the agent), F6d (app shutdown race).
+   bounded DNS resolution in the agent), F6d (app shutdown race), F6e (IPv4-mapped IPv6 policy bypass), F6f (tcp_close with a pending connect).
 4. Agent unit tests for `app.py` (headless part), `credstore.py`,
    `keepalive.py`, `auth.py` re-exports; relay tests for the agent message loop.
 5. Migrate to `web.AppKey` (relay, agent), drop the warning filter.
@@ -329,12 +354,43 @@ guard (`isinstance(data, dict)` else warn and skip); no shared helper, so
 `shared_auth` (a non-editable path dependency) is untouched.
 
 Also guarded (F6c): `legacy.py:493, 557, 595` get the same `isinstance(dict)`
-check (guard only, plus one small unit test of `handle_message` ignoring
-non-objects if the module's existing test fixtures allow it, otherwise guard
-only; the test is not required for legacy). `remote_exec` `/exec` and
+check (top-level object guard and field validation, section 3-bis). `remote_exec` `/exec` and
 `/exec/stream` answer a non-object body with `400 {"error": "JSON object
 required"}` and no traceback, with unit tests for both routes (`[1]`, `"x"`,
 `null`, `42`).
+
+### 3d. IPv4-mapped normalisation (F6e)
+
+One helper `_normalize_ip(addr)` in `agent.py`: for an `IPv6Address` with
+`ipv4_mapped` not None it returns that `IPv4Address`; everything else
+unchanged. It is applied to the literal and to **every** resolved address
+before **every** policy check (always-blocked link-local, loopback, private,
+user allow and deny CIDRs), so a mapped address is judged exactly as its IPv4
+form. Connecting still uses the original validated address. `sixtofour`
+(2002::/16) and `teredo` embed IPv4 addresses too; they do not reach the IPv4
+host on typical networks, so they are listed as follow-ups rather than
+handled here (tiny to add later with the same helper).
+
+Tests (`test_agent_dns.py` / `test_agent.py`, no network): `::ffff:127.0.0.1`
+denied (loopback; allowed when `allow_loopback`), `::ffff:169.254.169.254` and
+`[::ffff:169.254.169.254]` denied even with `allow_loopback`,
+`::ffff:10.0.0.1` denied when `allow_private=False` and allowed otherwise, a
+mapped address matches an IPv4 allow CIDR (`10.0.0.0/8`) and a deny CIDR, a
+resolver answering a mapped loopback for a name is denied, a real IPv6
+address is unaffected. Journey: `agent_denies_*` adds no mapped case (the
+source of truth is the unit test), to keep steps few.
+
+### 3e. `tcp_close` cancels a pending connect (F6f)
+
+`handle_tcp_close` (and `close_stream`) also look in
+`state.pending_connections` under the lock: if present the task is popped and
+cancelled (awaited with the short timeout), so resolution/connect stops and no
+stream is registered; the pending-connect task's own cleanup path tolerates
+being cancelled (it already pops itself in `finally`, `agent.py:561`).
+Test: fake `getaddrinfo` blocked on an `asyncio.Event` for stream A;
+`tcp_close A`; release the event; assert no `open_connection` call, no
+`active_streams` entry, no `pending_connections` entry, and that another stream
+B opened meanwhile is unaffected.
 
 ### 3c. App shutdown race (F6d)
 
@@ -386,6 +442,16 @@ for a live stream); the receive loop never dies.
   tunnel client then times out on its own side; a peer sending garbage results
   is misbehaving); with `success:true` it may be absent or `null`, anything else
   is dropped.
+- **Legacy mode** (`legacy.py:282, 375, 397, 493`) reuses the agent's
+  validation helpers (`valid_stream_id`, `valid_connect_fields`, defined in
+  `agent.py` next to `validate_destination`, which legacy already imports at
+  `legacy.py:23`), so the same `stream_id`, `host`, `port` and `data` rules hold
+  and "every receiver" is true. Legacy also gets the `_normalize_ip` fix
+  automatically (shared `validate_destination`). Honest limit: legacy keeps its
+  own validate-then-connect (`legacy.py:314, 181`), so the single-resolution fix
+  of 3b is **not** applied to it (deprecated path, follow-up). Small tests in
+  `tests/test_legacy.py` (existing fixtures suffice): `handle_message` with
+  `[1]`, `host: null`, a list `stream_id`: nothing raised, no stream created.
 - **Agent `tcp_connect`** (`handle_tcp_connect`, `agent.py:409`, which reads
   `host`/`port` unchecked; `is_magic_hostname` calls `host.lower()`,
   `intercept.py:28`): before any magic-host handling the agent requires `host`
@@ -696,4 +762,7 @@ lines (it forces the guards and `AppKey` lines to be tested).
 | 25 | Fix F6d: separate app-shutdown event from the per-connection stop event; one `_signal_exit()` for exit/restart/install; early exit honoured via `_pending_exit` | stop replacing `_stop_event` | Exit, restart and install after the agent started are silently ignored today; a dedicated event keeps disconnect semantics intact; an exit during start-up must not be lost |
 | 26 | `stream_id` (non-empty str, <= 128) and field types validated at every receiver; proxy normalises `error` and survives bad JSON syntax | relay-only checks | One bad frame must never end a receive loop or change the pinned 0x04/502 |
 | 27 | `validate_tcp_connect_params` uses `type(port) is int` | `isinstance` | `bool` is an `int` subclass |
+| 28 | Fix F6e: normalise IPv4-mapped IPv6 before every policy check, literals and resolved; 6to4/Teredo as follow-up | IPv4 ranges only | Real SSRF/metadata bypass of the always-blocked ranges; mapped form is the only embedding that reaches the IPv4 host on common stacks |
+| 29 | Fix F6f: `tcp_close` cancels a pending connect | ignore | Prevents orphaned streams, especially once DNS moves into the pending task |
+| 30 | Legacy reuses the agent's field validators and `validate_destination`; single-resolution not ported | leave legacy unguarded | Keeps "every receiver" honest at low cost; legacy rewrite is out of scope |
 | 24 | Windows-only internals (DPAPI, `SendInput`, legacy) listed as uncovered | claim journey coverage | Nothing in CI exercises them; follow-up Windows unit job |
