@@ -462,7 +462,10 @@ for a live stream); the receive loop never dies.
   validation helpers (`valid_stream_id`, `valid_connect_fields`, defined in
   `agent.py` next to `validate_destination`, which legacy already imports at
   `legacy.py:23`), so the same `stream_id`, `host`, `port` and `data` rules hold
-  and "every receiver" is true. Legacy also gets the `_normalize_ip` fix
+  and "every receiver" is true (including strict `tcp_data.data`: a `str` that
+  passes `base64.b64decode(..., validate=True)`, via `decode_tcp_payload`,
+  replacing the lenient decode at `legacy.py:375-389`; a bad payload closes the
+  stream). Legacy also gets the `_normalize_ip` fix
   automatically (shared `validate_destination`). Honest limit: legacy keeps its
   own validate-then-connect (`legacy.py:314, 181`), so the single-resolution fix
   of 3b is **not** applied to it (deprecated path, follow-up). Small tests in
@@ -546,13 +549,20 @@ the end of `handle_tcp_connect`); the receive loop never awaits DNS. Intercepted
 
 Resolution details:
 
-- `resolve_destination(host, port, timeout=10.0)` runs `loop.getaddrinfo`
+- `resolve_destination(host, port, timeout=None)` (None reads the module `DNS_TIMEOUT` = 10.0 at call time, so tests can patch it) runs `loop.getaddrinfo`
   under `asyncio.wait_for` with `type=socket.SOCK_STREAM`; addresses are deduplicated preserving resolver order; on timeout raises an error whose text is `DNS
   resolution timed out for <host>`; a resolver error keeps its own text. IP
   literals skip DNS.
-- Validation applies all existing rules (link-local always, loopback unless
-  allowed, private if disabled, denied/allowed lists) to **every** resolved
-  address, and rejects if any one is blocked.
+- Validation applies all existing rules to **every** resolved address. An
+  address in an always-blocked range (link-local always; loopback unless
+  allowed; private if disabled) denies the whole destination. The deny-CIDR and
+  allowlist rules **filter**: only addresses that individually pass are kept, in
+  resolver order, and the connect dials only those (never a filtered-out
+  address, even as a fallback); if none pass the destination is denied. A
+  hostname-pattern allow entry passes every address. This replaces today's
+  `agent.py:171` behaviour where one allowlisted address authorised the whole
+  answer (an allowlist bypass with a mixed DNS answer). Test: a mixed
+  allowed/disallowed answer dials only the allowed IP, even when it fails.
 - `open_tcp_connection` receives the validated addresses and tries them in
   order (`asyncio.open_connection(ip, port)` each, remaining time of the 30 s
   budget), raising the last error if all fail. The original hostname is kept
@@ -620,7 +630,7 @@ from `tray.py` with a guarded import, and tests never create a `TrayIcon`.
   parts skipped via `pytest.mark.skipif`).
 - `tests/test_credstore.py`: non-Windows branch for real (tmp app dir; the password is stored in plaintext
   there, the test pins that): save -> load round trip, file location, `clear`, `has_proxy_credentials`,
-  corrupt JSON and missing keys return None. Windows branch: `_dpapi_*`
+  corrupt JSON, non-object JSON (`[]`, `"x"`, `null`: a small product fix, `load_proxy_credentials` checks `isinstance(data, dict)` because it raises today) and missing keys return None; the plaintext field is `password_plain`. Windows branch: `_dpapi_*`
   tests marked `skipif(sys.platform != "win32")` (run on the Windows runner in
   `ci.yml`'s agent job if present; otherwise they document intent). A
   parametrised test patches `sys.platform` to cover the `password_b64` /
@@ -781,5 +791,8 @@ lines (it forces the guards and `AppKey` lines to be tested).
 | 28 | Fix F6e: normalise IPv4-mapped IPv6 before every policy check, literals and resolved; 6to4/Teredo as follow-up | IPv4 ranges only | Real SSRF/metadata bypass of the always-blocked ranges; mapped form is the only embedding that reaches the IPv4 host on common stacks |
 | 29 | Fix F6f: `tcp_close` cancels a pending connect | ignore | Prevents orphaned streams, especially once DNS moves into the pending task |
 | 31 | Test `request_restart` with `monkeypatch.setattr(..., raising=False)` for the Windows subprocess constants | extract `_detached_creationflags()` | No product code change just for a test; the patch is local and explicit |
+| 32 | Allowlist filters addresses instead of one match authorising all; always-blocked ranges still deny the whole destination | keep `return True` on any match | A mixed answer must never reach a non-allowlisted IP; deny-whole for blocked ranges is the safer, unchanged behaviour |
+| 33 | `resolve_destination` reads `DNS_TIMEOUT` at call time (`timeout=None`) | default argument bound at import | Makes the bounded-DNS test patchable |
+| 34 | Legacy `tcp_data` gets strict base64 validation; `credstore` tolerates non-object files | leave both | Same hostile-frame contract for every receiver; the credstore crash is a one-line fix |
 | 30 | Legacy reuses the agent's field validators and `validate_destination`; single-resolution not ported | leave legacy unguarded | Keeps "every receiver" honest at low cost; legacy rewrite is out of scope |
 | 24 | Windows-only internals (DPAPI, `SendInput`, legacy) listed as uncovered | claim journey coverage | Nothing in CI exercises them; follow-up Windows unit job |
