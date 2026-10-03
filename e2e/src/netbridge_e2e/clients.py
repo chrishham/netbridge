@@ -144,7 +144,7 @@ def wait_closed(sock: socket.socket, timeout: float) -> bool:
 
 
 def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: float = 10) -> tuple[int, str]:
-    """Perform WebSocket upgrade handshake. Returns (status, body up to 4 KiB); closes the connection."""
+    """WebSocket upgrade with `Authorization: Bearer <token>` (none if token is None). Returns (status, body up to 4 KiB); closes the connection."""
     sock = socket.create_connection((host, port), timeout=timeout)
     try:
         # Generate WebSocket key
@@ -160,7 +160,7 @@ def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: floa
             "Sec-WebSocket-Version: 13",
         ]
         if token:
-            headers.append(f"Authorization: {token}")
+            headers.append(f"Authorization: Bearer {token}")
         headers.append("")
         headers.append("")
 
@@ -189,7 +189,7 @@ class WsClient:
 
     @classmethod
     def connect(cls, host: str, port: int, path: str, token: str | None, timeout: float = 10) -> "WsClient":
-        """Connect and perform WebSocket handshake. Raises ClientError on non-101."""
+        """Handshake with `Authorization: Bearer <token>` (none if token is None). Raises ClientError on non-101."""
         sock = socket.create_connection((host, port), timeout=timeout)
         try:
             # Generate WebSocket key
@@ -205,7 +205,7 @@ class WsClient:
                 "Sec-WebSocket-Version: 13",
             ]
             if token:
-                headers.append(f"Authorization: {token}")
+                headers.append(f"Authorization: Bearer {token}")
             headers.append("")
             headers.append("")
 

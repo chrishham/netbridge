@@ -1,0 +1,254 @@
+"""The journey's auth steps against fakes: no relay, no key stub, no sockets."""
+import re
+from types import SimpleNamespace
+
+import pytest
+
+from netbridge_e2e import clients, journey
+from netbridge_e2e.jwtmint import ISSUER_V2
+
+TARGETS = SimpleNamespace(echo_port=7, http_port=80)
+IP = "10.0.0.1"
+CASES = ["none", "garbage", "wrong signature", "unknown kid", "expired", "not yet valid", "wrong tenant",
+         "wrong issuer", "wrong audience", "no identity", "no kid", "malformed payload", "valid"]
+
+
+@pytest.fixture
+def j(tmp_path):
+    return journey.Journey(journey.parse_args(["--mode", "source", "--work", str(tmp_path)]))
+
+
+class FakeStub:
+    """mint() returns a readable token: header.payload.sig with the keyword arguments in the payload."""
+
+    kid = "k1"
+
+    def __init__(self):
+        self.fetches = 0
+
+    def mint(self, **kw) -> str:
+        return f"hdr.{sorted(kw.items())}.sig"
+
+    def foreign_mint(self, **kw) -> str:
+        return "hdr.foreign.sig"
+
+    def requests(self) -> int:
+        return self.fetches
+
+
+class FakeLogs:
+    def __init__(self, text: str = ""):
+        self.text = text
+
+    def wait_for(self, pattern, timeout, since=None, alive=None):
+        return re.search(pattern, self.text)
+
+
+class FakeRelay:
+    port = 18080
+
+    def __init__(self, logs: str = "", status: dict | None = None):
+        self.logs = FakeLogs(logs)
+        self._status = status
+
+    def status(self):
+        return self._status
+
+
+REJECTED_LOGS = "Agent auth rejected for 127.0.0.1: x\nTunnel auth rejected for 127.0.0.1: y"
+
+
+def fake_relay_auth(stub, overrides=None, on_upgrade=None):
+    """A ws_upgrade that answers each case with its expected outcome, unless overridden by (case, path)."""
+    by_token = {token: (case, reason) for case, token, reason in journey.Journey._auth_cases(stub)}
+    calls = []
+
+    def ws_upgrade(host, port, path, token):
+        case, reason = by_token[token]
+        calls.append((case, path))
+        if on_upgrade:
+            on_upgrade(case, path)
+        if overrides and (case, path) in overrides:
+            return overrides[(case, path)]
+        return (101, "") if reason is None else (401, f"{reason}: details")
+
+    return ws_upgrade, calls
+
+
+def test_auth_cases_pin_the_relay_reasons():
+    cases = journey.Journey._auth_cases(FakeStub())
+    assert [c[0] for c in cases] == CASES
+    reasons = {case: reason for case, _, reason in cases}
+    assert reasons["none"] == "Missing Authorization header"
+    assert reasons["not yet valid"] == "Token not yet valid"
+    assert reasons["no kid"] == "No key ID in token header"
+    assert reasons["malformed payload"] == "Token validation failed"
+    assert reasons["valid"] is None
+    tokens = {case: token for case, token, _ in cases}
+    assert tokens["none"] is None and tokens["garbage"] == "not-a-jwt"
+    assert tokens["wrong signature"] == "hdr.foreign.sig"
+    assert tokens["malformed payload"] == "hdr.@@@not-base64@@@.sig"  # header from a real mint
+    other_iss = ISSUER_V2.format(tid=journey.OTHER_TENANT)
+    assert f"('iss', '{other_iss}')" in tokens["wrong tenant"] and journey.OTHER_TENANT in tokens["wrong tenant"]
+    assert "('upn', None)" in tokens["no identity"]
+    assert "('header', {'kid': None})" in tokens["no kid"]
+    assert "matrix@netbridge.test" in tokens["valid"]
+
+
+def test_auth_matrix_all_match_passes(j, monkeypatch):
+    stub = FakeStub()
+    upgrade, calls = fake_relay_auth(stub)
+    monkeypatch.setattr(clients, "ws_upgrade", upgrade)
+    ok, detail = j._auth_matrix(FakeRelay(REJECTED_LOGS), stub)
+    assert ok, detail
+    assert "26/26" in detail
+    assert len(calls) == 26 and {p for _, p in calls} == {"/ws", "/tunnel"}
+
+
+def test_auth_matrix_wrong_reason_names_the_case(j, monkeypatch):
+    stub = FakeStub()
+    upgrade, _ = fake_relay_auth(stub, {("expired", "/tunnel"): (401, "Invalid audience: x")})
+    monkeypatch.setattr(clients, "ws_upgrade", upgrade)
+    ok, detail = j._auth_matrix(FakeRelay(REJECTED_LOGS), stub)
+    assert not ok
+    assert "25/26" in detail and "expired /tunnel: HTTP 401 'Invalid audience: x'" in detail
+    assert "expired /ws" not in detail
+
+
+def test_auth_matrix_valid_token_must_upgrade(j, monkeypatch):
+    stub = FakeStub()
+    upgrade, _ = fake_relay_auth(stub, {("valid", "/ws"): (401, "Signing key not found: k1")})
+    monkeypatch.setattr(clients, "ws_upgrade", upgrade)
+    ok, detail = j._auth_matrix(FakeRelay(REJECTED_LOGS), stub)
+    assert not ok and "valid /ws: HTTP 401" in detail and "want 101" in detail
+
+
+def test_auth_matrix_wrong_tenant_must_not_fetch_keys(j, monkeypatch):
+    stub = FakeStub()
+
+    def fetch(case, path):
+        if case == "wrong tenant" and path == "/ws":
+            stub.fetches += 1
+
+    upgrade, _ = fake_relay_auth(stub, on_upgrade=fetch)
+    monkeypatch.setattr(clients, "ws_upgrade", upgrade)
+    ok, detail = j._auth_matrix(FakeRelay(REJECTED_LOGS), stub)
+    assert not ok
+    assert "wrong tenant /ws" in detail and "fetched keys for a rejected tenant" in detail
+    assert "wrong tenant /tunnel" not in detail
+
+
+def test_auth_matrix_needs_both_rejection_log_lines(j, monkeypatch):
+    stub = FakeStub()
+    upgrade, _ = fake_relay_auth(stub)
+    monkeypatch.setattr(clients, "ws_upgrade", upgrade)
+    ok, detail = j._auth_matrix(FakeRelay("Agent auth rejected for 127.0.0.1: x"), stub)
+    assert not ok and "no 'Tunnel auth rejected' relay log line" in detail and "Agent auth rejected'" not in detail
+
+
+@pytest.mark.parametrize("logs, status, ok", [
+    ("E2E: relay key URL redirected to http://127.0.0.1:5/t/keys", {"auth_required": True}, True),
+    ("", {"auth_required": True}, False),
+    ("E2E: relay key URL redirected to http://127.0.0.1:5/t/keys", {"auth_required": False}, False),
+    ("E2E: relay key URL redirected to http://127.0.0.1:5/t/keys", None, False),
+])
+def test_relay_auth_on_needs_redirect_and_auth_required(j, logs, status, ok):
+    got, detail = j._relay_auth_on(FakeRelay(logs, status))
+    assert got is ok
+    assert "auth_required=" in detail
+    assert ("http://127.0.0.1:5/t/keys" in detail) == bool(logs)
+
+
+class FakeWs:
+    """Answers tcp_connect from the journey user with success, from anyone else with "no agent"."""
+
+    sessions: list["FakeWs"] = []
+    agent_user = "e2e@netbridge.test"
+
+    def __init__(self, token: str):
+        self.token, self.sent, self.closed = token, [], False
+
+    @classmethod
+    def connect(cls, host, port, path, token, timeout=10):
+        assert path == "/tunnel"
+        ws = cls(token)
+        cls.sessions.append(ws)
+        return ws
+
+    def send_json(self, obj):
+        self.sent.append(obj)
+
+    def recv_json(self, timeout):
+        sid = self.sent[-1]["stream_id"]
+        if f"('upn', '{journey.OTHER_USER}')" not in self.token:
+            return {"type": "tcp_connect_result", "stream_id": sid, "success": True}
+        return {"type": "tcp_connect_result", "stream_id": sid, "success": False, "error": journey.NO_AGENT}
+
+    def close(self):
+        self.closed = True
+
+
+class EchoSock:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def tunnel(monkeypatch, j):
+    FakeWs.sessions = []
+    monkeypatch.setattr(clients, "WsClient", FakeWs)
+    echo = EchoSock()
+    monkeypatch.setattr(j, "_open_echo", lambda ip, targets: echo)
+    monkeypatch.setattr(clients, "echo_roundtrip", lambda s, data: data)
+    return echo
+
+
+def test_user_isolation_passes(j, tunnel):
+    ok, detail = j._user_isolation(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert ok, detail
+    other, mine = FakeWs.sessions
+    assert other.sent[0]["type"] == "tcp_connect" and other.sent[0]["host"] == IP and other.sent[0]["port"] == 80
+    assert len(other.sent) == 1  # nothing to close: the stream never opened
+    assert mine.sent[1] == {"type": "tcp_close", "stream_id": mine.sent[0]["stream_id"]}
+    assert other.closed and mine.closed and tunnel.closed
+    assert journey.NO_AGENT in detail and "before and after: True" in detail
+
+
+def test_user_isolation_fails_when_other_user_reaches_an_agent(j, tunnel, monkeypatch):
+    monkeypatch.setattr(FakeWs, "recv_json",
+                        lambda self, timeout: {"type": "tcp_connect_result", "stream_id": self.sent[-1]["stream_id"],
+                                               "success": True})
+    ok, detail = j._user_isolation(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert not ok and f"{journey.OTHER_USER}: " in detail and '"success": true' in detail
+
+
+def test_user_isolation_fails_when_control_fails(j, tunnel, monkeypatch):
+    monkeypatch.setattr(FakeWs, "recv_json",
+                        lambda self, timeout: {"type": "tcp_connect_result", "stream_id": self.sent[-1]["stream_id"],
+                                               "success": False, "error": journey.NO_AGENT})
+    ok, detail = j._user_isolation(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert not ok
+    assert len(FakeWs.sessions[1].sent) == 1  # no tcp_close for a stream that never opened
+
+
+def test_user_isolation_fails_when_echo_breaks_afterwards(j, tunnel, monkeypatch):
+    monkeypatch.setattr(clients, "echo_roundtrip", lambda s, data: b"")
+    ok, detail = j._user_isolation(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert not ok and "before and after: False" in detail
+    assert tunnel.closed
+
+
+def test_tunnel_connect_closes_the_session_on_error(j, monkeypatch):
+    FakeWs.sessions = []
+    monkeypatch.setattr(clients, "WsClient", FakeWs)
+
+    def boom(self, timeout):
+        raise TimeoutError("no reply")
+
+    monkeypatch.setattr(FakeWs, "recv_json", boom)
+    with pytest.raises(TimeoutError):
+        j._tunnel_connect(FakeRelay(), "tok", IP, TARGETS)
+    assert FakeWs.sessions[0].closed

@@ -289,7 +289,7 @@ def test_ws_client_small_json():
 
     server = _WsServer(handler)
     try:
-        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "Bearer valid-token")
+        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "valid-token")
         data = {"x": 1}
         ws.send_json(data)
         result = ws.recv_json(timeout=2)
@@ -312,7 +312,7 @@ def test_ws_client_medium_json():
 
     server = _WsServer(handler)
     try:
-        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "Bearer valid-token")
+        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "valid-token")
         data = {"data": "x" * 250}  # ~260 bytes JSON
         ws.send_json(data)
         result = ws.recv_json(timeout=2)
@@ -335,7 +335,7 @@ def test_ws_client_large_json():
 
     server = _WsServer(handler)
     try:
-        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "Bearer valid-token")
+        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "valid-token")
         data = {"data": "x" * 70000}  # ~70 KB
         ws.send_json(data)
         result = ws.recv_json(timeout=2)
@@ -364,7 +364,7 @@ def test_ws_client_handles_server_ping():
 
     server = _WsServer(handler)
     try:
-        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "Bearer valid-token")
+        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "valid-token")
         result = ws.recv_json(timeout=2)
         assert result == {"ok": True}
         ws.close()
@@ -383,7 +383,7 @@ def test_ws_client_close_frame_raises():
 
     server = _WsServer(handler)
     try:
-        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "Bearer valid-token")
+        ws = clients.WsClient.connect("127.0.0.1", server.address[1], "/ws", "valid-token")
         with pytest.raises(ConnectionError, match="WebSocket closed"):
             ws.recv_json(timeout=2)
     finally:
@@ -429,7 +429,7 @@ def test_ws_upgrade_against_real_relay(tmp_path):
 
             # Valid token → 101
             token = auth.mint(upn="test@netbridge.test")
-            status, body = clients.ws_upgrade("127.0.0.1", relay.port, "/ws", f"Bearer {token}")
+            status, body = clients.ws_upgrade("127.0.0.1", relay.port, "/ws", token)
             assert status == 101
             assert body == ""
 

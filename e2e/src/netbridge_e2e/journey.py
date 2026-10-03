@@ -3,9 +3,10 @@
   uv run --project e2e python -m netbridge_e2e --mode source
   uv run --project e2e python -m netbridge_e2e --mode exe --agent-exe netbridge.exe --proxy-exe netbridge-socks.exe
 
-install → connect (relay pairs agent and proxy, fake az used) → SOCKS5 /
-HTTP CONNECT / HTTP forward / 5 MiB / 20 parallel streams → relay port
-filter → relay restart and reconnect → link faults through in-process fault
+The relay runs with auth on: a local key stub signs the fake az's tokens.
+install → connect (relay pairs agent and proxy, fake az used) → auth matrix
+→ SOCKS5 / HTTP CONNECT / HTTP forward / 5 MiB / 20 parallel streams → relay
+port filter → user isolation → relay restart and reconnect → link faults through in-process fault
 proxies (cut, blackhole, relay unreachable, agent down) → uninstall (exe mode).
 """
 import argparse
@@ -19,15 +20,23 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import clients, fakeaz, netinfo
+from .authstub import AuthStub
 from .cov import E2ECoverage
 from .faultproxy import FaultProxy
+from .jwtmint import ISSUER_V2
 from .procs import IS_WINDOWS
-from .stack import CLIENT_TUNING, CONNECTED, PROXY_READY, RELAY_SESSION, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
+from .stack import CLIENT_TUNING, CONNECTED, PROXY_READY, REDIRECTED, RELAY_SESSION, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
 from .targets import PAGE, PAYLOAD_SHA256, Targets
+
+
+OTHER_TENANT = "22222222-2222-2222-2222-222222222222"
+OTHER_USER = "other@netbridge.test"
+NO_AGENT = "No bridge agent available"
 
 
 class StepFailed(Exception):
@@ -123,7 +132,11 @@ class Journey:
 
         self.check("network", get_ip)
         ip = self.results[-1]["detail"]
-        env = fakeaz.env_with_fake_az(os.environ, sys.executable, calls_log)
+        stub = AuthStub(self.work)
+        self.cleanups.append(stub.close)
+        stub.start()
+        self.step("auth_stub_up", True, f"{stub.jwks_url} kid {stub.kid}")
+        env = fakeaz.env_with_fake_az(os.environ, sys.executable, calls_log, auth_env=stub.env())
         # strip proxy vars that would route ws://127.0.0.1 through an external proxy
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
             env.pop(var, None)
@@ -146,10 +159,13 @@ class Journey:
 
         self.check("targets_up", create_targets)
 
-        relay = Relay(logs, a.relay_port, targets.blocked_port, env, image=a.relay_image, cov=self.cov)
+        relay = Relay(logs, a.relay_port, targets.blocked_port, env, image=a.relay_image, cov=self.cov, auth=stub)
         self.cleanups.append(relay.stop)
         relay.start()
-        self.step("relay_up", relay.wait_ready(180), f"{relay.url} {'' if relay.alive() else relay.logs.tail()}")
+        ready = relay.wait_ready(180)
+        ok, detail = self._relay_auth_on(relay) if ready else (False, "not ready")
+        self.step("relay_up", ok, f"{relay.url}; {detail}{'' if relay.alive() else ' ' + relay.logs.tail()}")
+        self.check("auth_matrix", lambda: self._auth_matrix(relay, stub))
 
         agent_link = FaultProxy(("127.0.0.1", relay.port), "agent")
         self.cleanups.append(agent_link.close)
@@ -181,6 +197,7 @@ class Journey:
                 self._agent_up_sessions = self._agent_sessions(agent)
         paired = relay.wait_paired(30)
         self.step("relay_paired", paired is not None, json.dumps(paired or relay.status()))
+        self.step("relay_fetched_keys", stub.requests() >= 1, f"{stub.requests()} JWKS fetch(es) by the relay")
 
         calls_log = self.work / "az-calls.log"
         calls = calls_log.read_text() if calls_log.exists() else ""
@@ -189,6 +206,7 @@ class Journey:
 
         self._traffic(ip, targets, relay)
         self._filter(ip, targets, relay)
+        self.check("auth_user_isolation", lambda: self._user_isolation(relay, stub, ip, targets))
         self._reconnect(relay, agent, proxy, ip, targets)
         self._faults(relay, agent, proxy, ip, targets, agent_link, proxy_link)
 
@@ -290,6 +308,83 @@ class Journey:
             return False, f"connection to blocked port {targets.blocked_port} was allowed"
 
         self.check("relay_filter", blocked)
+
+    # --- auth ----------------------------------------------------------------
+
+    def _relay_auth_on(self, relay: Relay) -> tuple[bool, str]:
+        redirected = relay.logs.wait_for(REDIRECTED + r"\S+", 10)
+        auth_required = (relay.status() or {}).get("auth_required")
+        ok = redirected is not None and auth_required is True
+        return ok, f"{redirected.group(0) if redirected else 'no key-URL redirect logged'}; auth_required={auth_required}"
+
+    @staticmethod
+    def _auth_cases(stub: AuthStub) -> list[tuple[str, str | None, str | None]]:
+        """(case, token, reason the 401 body must contain); reason None means the upgrade must succeed (101)."""
+        header = stub.mint().split(".")[0]  # valid header: the decoder parses it before the payload
+        return [
+            ("none", None, "Missing Authorization header"),
+            ("garbage", "not-a-jwt", "Invalid JWT format"),
+            ("wrong signature", stub.foreign_mint(), "Signature verification failed"),
+            ("unknown kid", stub.mint(header={"kid": "other"}), "Signing key not found"),
+            ("expired", stub.mint(lifetime=-60), "Token expired"),
+            ("not yet valid", stub.mint(nbf=int(time.time()) + 600), "Token not yet valid"),
+            ("wrong tenant", stub.mint(tid=OTHER_TENANT, iss=ISSUER_V2.format(tid=OTHER_TENANT)), "Invalid tenant"),
+            ("wrong issuer", stub.mint(iss="https://evil.example/"), "Invalid issuer"),
+            ("wrong audience", stub.mint(aud="https://graph.microsoft.com"), "Invalid audience"),
+            ("no identity", stub.mint(upn=None), "No user identity"),
+            ("no kid", stub.mint(header={"kid": None}), "No key ID in token header"),
+            ("malformed payload", f"{header}.@@@not-base64@@@.sig", "Token validation failed"),
+            ("valid", stub.mint(upn="matrix@netbridge.test"), None),
+        ]
+
+    def _auth_matrix(self, relay: Relay, stub: AuthStub) -> tuple[bool, str]:
+        cases = self._auth_cases(stub)
+        mismatches, total = [], 0
+        for path in ("/ws", "/tunnel"):
+            for case, token, reason in cases:
+                fetched = stub.requests()
+                status, body = clients.ws_upgrade("127.0.0.1", relay.port, path, token)
+                total += 1
+                ok = status == 101 if reason is None else status == 401 and reason in body
+                if case == "wrong tenant" and stub.requests() != fetched:
+                    ok, body = False, f"{body} (relay fetched keys for a rejected tenant)"
+                if not ok:
+                    want = "101" if reason is None else f"401 {reason!r}"
+                    mismatches.append(f"{case} {path}: HTTP {status} {body!r}, want {want}")
+        logged = {name: relay.logs.wait_for(f"{name} auth rejected", 5) is not None for name in ("Agent", "Tunnel")}
+        missing = [f"no '{name} auth rejected' relay log line" for name, seen in logged.items() if not seen]
+        detail = f"{total - len(mismatches)}/{total} outcomes as expected ({len(cases)} cases x /ws, /tunnel)"
+        if mismatches or missing:
+            return False, f"{detail}; " + "; ".join(mismatches + missing)
+        return True, f"{detail}; wrong tenant fetched no keys; relay logged agent and tunnel rejections"
+
+    def _tunnel_connect(self, relay: Relay, token: str, ip: str, targets: Targets) -> dict:
+        """One tcp_connect over a fresh /tunnel session; returns the relay's reply (stream closed if it opened)."""
+        ws = clients.WsClient.connect("127.0.0.1", relay.port, "/tunnel", token)
+        try:
+            stream_id = str(uuid.uuid4())
+            ws.send_json({"type": "tcp_connect", "stream_id": stream_id, "host": ip, "port": targets.http_port})
+            reply = ws.recv_json(10)
+            if reply.get("success") is True:
+                ws.send_json({"type": "tcp_close", "stream_id": stream_id})
+            return reply
+        finally:
+            ws.close()
+
+    def _user_isolation(self, relay: Relay, stub: AuthStub, ip: str, targets: Targets) -> tuple[bool, str]:
+        probe = b"isolation-probe\n"
+        echo = self._open_echo(ip, targets)  # the journey user's agent is connected: this stream works
+        try:
+            other = self._tunnel_connect(relay, stub.mint(upn=OTHER_USER), ip, targets)
+            mine = self._tunnel_connect(relay, stub.mint(), ip, targets)
+            echo_after = clients.echo_roundtrip(echo, probe) == probe
+        finally:
+            echo.close()
+        isolated = (other.get("type") == "tcp_connect_result" and other.get("success") is False
+                    and NO_AGENT in str(other.get("error")))
+        control = mine.get("type") == "tcp_connect_result" and mine.get("success") is True
+        return isolated and control and echo_after, (f"{OTHER_USER}: {json.dumps(other)}; journey user: {json.dumps(mine)}; "
+                                                     f"echo stream round-tripped before and after: {echo_after}")
 
     def _reconnect(self, relay: Relay, agent, proxy, ip: str, targets: Targets) -> None:
         marks = {agent.name: agent.logs.mark(), proxy.name: proxy.logs.mark()}
