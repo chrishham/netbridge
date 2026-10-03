@@ -4,6 +4,7 @@ import pytest
 from pytest_socket import SocketConnectBlockedError
 
 
+@pytest.mark.filterwarnings("ignore:A test tried to use socket")
 def test_non_loopback_connect_is_blocked():
     with socket.socket() as s, pytest.raises(SocketConnectBlockedError):
         s.connect(("192.0.2.1", 80))  # TEST-NET-1: never routable

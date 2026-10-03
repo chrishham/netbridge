@@ -28,7 +28,7 @@ branch = true
 source = ["src/shared_auth"]
 
 [tool.coverage.report]
-fail_under = 70
+fail_under = 72
 precision = 2
 show_missing = true
 skip_covered = true

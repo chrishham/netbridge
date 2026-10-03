@@ -190,10 +190,13 @@ class TestValidateArmToken:
         claims = _make_valid_claims(nbf=int(time.time()) + 30)
         token = _make_jwt(header, claims)
 
-        # Should NOT raise on nbf — it will proceed past nbf check and
-        # fail later at JWKS fetch (which means nbf check passed)
-        with pytest.raises(TokenValidationError, match="Token validation failed"):
-            await validate_arm_token(token)
+        # Mock JWKS to avoid network call
+        mock_jwks = AsyncMock(return_value={"keys": []})
+        with patch("shared_auth.validate._get_jwks", mock_jwks):
+            # Should NOT raise on nbf — it will proceed past nbf check and
+            # fail later at key lookup (which means nbf check passed)
+            with pytest.raises(TokenValidationError, match="Signing key not found"):
+                await validate_arm_token(token)
 
     @pytest.mark.asyncio
     async def test_iat_too_old(self, monkeypatch):
@@ -214,7 +217,10 @@ class TestValidateArmToken:
         claims = _make_valid_claims(iat=int(time.time()) - 172800)  # 48 hours ago
         token = _make_jwt(header, claims)
 
-        # Should NOT raise on iat — it will proceed past iat check and
-        # fail later at JWKS fetch (which means iat check passed)
-        with pytest.raises(TokenValidationError, match="Token validation failed"):
-            await validate_arm_token(token)
+        # Mock JWKS to avoid network call
+        mock_jwks = AsyncMock(return_value={"keys": []})
+        with patch("shared_auth.validate._get_jwks", mock_jwks):
+            # Should NOT raise on iat — it will proceed past iat check and
+            # fail later at key lookup (which means iat check passed)
+            with pytest.raises(TokenValidationError, match="Signing key not found"):
+                await validate_arm_token(token)
