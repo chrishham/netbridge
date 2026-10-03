@@ -127,23 +127,30 @@ refetch, caching) runs unmodified.
 
 ### 5. Auth matrix (step `auth_matrix`, right after `relay_up`)
 
-`clients.ws_upgrade(host, port, path, token|None) -> int` performs a raw
-HTTP/1.1 websocket upgrade and returns the status code (101 or the error),
-closing the socket. For each of `/ws` and `/tunnel`:
+`clients.ws_upgrade(host, port, path, token|None) -> tuple[int, str]`
+performs a raw HTTP/1.1 websocket upgrade and returns the status code (101 or
+the error) and the response body (the relay puts the rejection reason in the
+401 body), closing the socket. A 401 alone is not enough: each case also
+asserts the **reason** in the body, so a regression in one check cannot hide
+behind another check that happens to reject the token too. For each of `/ws`
+and `/tunnel`:
 
-| Case | Token | Expect |
+| Case | Token | Expect (status, reason in body) |
 |---|---|---|
-| none | — | 401 |
-| garbage | `not-a-jwt` | 401 |
-| wrong signature | minted with a foreign key, same `kid` | 401 |
-| unknown kid | minted with stub key, `kid=other` | 401 |
-| expired | `lifetime=-60` | 401 |
-| not yet valid | `nbf=now+600` | 401 |
-| wrong tenant | `tid=<other uuid>` (+ matching iss) | 401 |
-| wrong issuer | `iss=https://evil.example/` | 401 |
-| wrong audience | `aud=https://graph.microsoft.com` | 401 |
-| no identity | `upn=None` (no other identity claims) | 401 |
+| none | — | 401, `Missing Authorization header` |
+| garbage | `not-a-jwt` | 401, `Invalid JWT format` |
+| wrong signature | minted with a foreign key, same `kid` | 401, `Signature verification failed` |
+| unknown kid | minted with stub key, `kid=other` | 401, `Signing key not found` |
+| expired | `lifetime=-60` | 401, `Token expired` |
+| not yet valid | `nbf=now+600` | 401, `not yet valid` |
+| wrong tenant | `tid=<other uuid>` (+ matching iss) | 401, `Invalid tenant`, and the stub's JWKS request count is unchanged (tenant is rejected before any key fetch) |
+| wrong issuer | `iss=https://evil.example/` | 401, `Invalid issuer` |
+| wrong audience | `aud=https://graph.microsoft.com` | 401, `Invalid audience` |
+| no identity | `upn=None` (no other identity claims) | 401, `No user identity` |
 | valid | `stub.mint(upn="matrix@netbridge.test")` | 101 |
+
+The exact reason strings are taken from `validate.py`/`authenticate_request`
+at implementation time (the table reflects the current code).
 
 All 22 outcomes in the step detail on failure; the step also checks that the
 relay logged at least one `auth rejected` line per endpoint. The valid
@@ -165,10 +172,15 @@ the relay's "No bridge agent available" error within 10 s — the agent of
 
 ### 7. Pentest suite in the journey (step `pentest_suite`)
 
-- `security-tests/pentest_suite.py` gets a **reachability precheck**: before
-  any test it requires `GET /status` to answer 200 with JSON; otherwise it
-  prints the reason and exits 2. This removes the "dead relay passes" hole
-  (several rejection tests treat any connection error as a pass).
+- `security-tests/pentest_suite.py` gets a **precheck**: before any test it
+  requires `GET /status` to answer 200 with JSON, and — when `--token` is
+  given — a successful `/tunnel` websocket upgrade with that token; otherwise
+  it prints the reason and exits 2. Tests that need an authenticated
+  connection now **fail** (instead of passing) when that connection cannot
+  be established. Together this removes the "dead relay / bad token passes"
+  holes (several checks treated any connection error as a pass).
+- New `--skip NAME` option (repeatable) that marks a test as skipped with the
+  reason in the report.
 - Fix its broken `[project.scripts]` entry (points at an async `main`) with a
   sync wrapper.
 - Journey step after `auth_user_isolation`: run
@@ -177,9 +189,10 @@ the relay's "No bridge agent available" error within 10 s — the agent of
   with a 180 s timeout; pass if exit code 0 (no CRITICAL failures). Its full
   output is saved to `<work>/logs/pentest.log` and the summary line goes in
   the step detail. Source mode only (needs the checkout); in exe mode the
-  step records "skipped" with the reason. Rate-limit tests in the suite may
-  report non-critical findings because e2e raises the limits (B) — that is
-  expected and not a failure.
+  step records "skipped" with the reason. The journey passes
+  `--skip rapid_connection_dos`: e2e raises the relay's connection limits on
+  purpose (B), so that test (which counts a missing 429 as CRITICAL) cannot
+  apply; rate limiting is covered instead by new relay unit tests (§8).
 
 ### 8. Unit tests
 
@@ -194,6 +207,11 @@ the relay's "No bridge agent available" error within 10 s — the agent of
   refreshed and retried; three consecutive 401s → stops with
   `Max auth failures reached` and the auth-failed status callback; 403 →
   stops immediately with `Access forbidden`.
+- **relay** (`relay/tests/test_relay_limits.py`, real app via
+  `aiohttp.test_utils` like B's lifecycle tests): the per-IP limit answers
+  429 `Too many requests from this IP` before authentication; the per-user
+  connection limit answers 429 after authentication; both with the limits
+  patched small; a rejected token does not consume the per-user budget.
 - **socks-proxy** (`socks-proxy/tests/test_tunnel_auth.py`): same three
   behaviours for the proxy's connect loop (`Token refreshed after auth
   failure`, give-up after 3, 403 permanent).
