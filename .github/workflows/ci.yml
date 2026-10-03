@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -14,6 +18,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # diff-cover compares against the base branch
 
       - uses: actions/setup-python@v7
         with:
@@ -25,28 +31,66 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgirepository-2.0-dev libcairo2-dev
 
       - name: Test shared
-        run: |
-          cd shared
-          uv sync
-          uv run pytest
+        if: ${{ !cancelled() }}
+        working-directory: shared
+        run: uv sync && uv run pytest --cov --cov-report=xml --junitxml=junit.xml
 
       - name: Test relay
-        run: |
-          cd relay
-          uv sync
-          uv run pytest
+        if: ${{ !cancelled() }}
+        working-directory: relay
+        run: uv sync && uv run pytest --cov --cov-report=xml --junitxml=junit.xml
 
       - name: Test socks-proxy
-        run: |
-          cd socks-proxy
-          uv sync
-          uv run pytest
+        if: ${{ !cancelled() }}
+        working-directory: socks-proxy
+        run: uv sync && uv run pytest --cov --cov-report=xml --junitxml=junit.xml
+
+      - name: Test socks-proxy-win
+        if: ${{ !cancelled() }}
+        working-directory: socks-proxy-win
+        run: uv sync && uv run pytest --cov --cov-report=xml --junitxml=junit.xml
 
       - name: Test agent
-        run: |
-          cd netbridge-agent
-          uv sync --group dev
-          uv run pytest
+        if: ${{ !cancelled() }}
+        working-directory: netbridge-agent
+        run: uv sync --group dev && uv run pytest --cov --cov-report=xml --junitxml=junit.xml
+
+      - name: Test the E2E driver
+        if: ${{ !cancelled() }}
+        working-directory: e2e
+        run: uv sync && uv run pytest --cov --cov-report=xml --junitxml=junit.xml
+
+      - name: Test the CI scripts
+        if: ${{ !cancelled() }}
+        run: uv run --no-project --with pytest --with coverage==7.16.2 pytest scripts/tests -q
+
+      - name: Coverage report
+        if: ${{ !cancelled() }}
+        run: uv run --no-project --with coverage==7.16.2 python scripts/coverage_report.py
+
+      - name: Diff coverage (new and changed lines >= 80%)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && hashFiles('coverage.xml') != '' }}
+        run: >
+          uvx --from diff-cover==10.6.0 diff-cover coverage.xml
+          --compare-branch=origin/${{ github.base_ref }} --fail-under=80
+          --html-report diff-cover.html --markdown-report diff-cover.md
+
+      - name: Diff coverage summary
+        if: ${{ always() && hashFiles('diff-cover.md') != '' }}
+        run: cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-and-junit
+          path: |
+            */coverage.xml
+            */junit.xml
+            coverage.xml
+            htmlcov/
+            diff-cover.html
+            diff-cover.md
+          if-no-files-found: ignore
 
   security-scan:
     runs-on: ubuntu-latest
@@ -123,11 +167,6 @@ jobs:
 
       - name: Sync components
         run: for p in relay netbridge-agent socks-proxy e2e; do (cd "$p" && uv sync); done
-
-      - name: Test the E2E driver
-        run: |
-          cd e2e
-          uv run pytest
 
       - name: Map the e2e target hostname (remote-DNS check)
         run: |

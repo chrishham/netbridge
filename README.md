@@ -264,7 +264,16 @@ uv run --native-tls <component-name>
 
 # Run tests
 uv run --native-tls pytest
+
+# Run tests with coverage (enforces the component's fail_under floor)
+uv run --native-tls pytest --cov
 ```
+
+Every component has a coverage floor (`[tool.coverage.report] fail_under` in its
+`pyproject.toml`). CI fails if a component drops below its floor or if a pull
+request's new and changed lines under `*/src/` are less than 80% covered
+(diff-cover). When the CI summary says a component can raise its floor, raise it
+in the same PR. `scripts/coverage.sh` runs the same gate locally.
 
 ## Releasing
 
