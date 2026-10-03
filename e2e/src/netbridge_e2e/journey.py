@@ -544,6 +544,43 @@ class Journey:
             raise RuntimeError(f"{link.name} link: {before} active, {how} affected {n} (nothing to fault)")
         return time.monotonic(), n
 
+    def _fail_case(self, front_end: str, host: str, port: int, budget: float) -> tuple[int | str, float]:
+        """One connect that is expected to fail, capped at `budget` seconds wall-clock."""
+        start = time.monotonic()
+        out: dict = {}
+
+        def run():
+            try:
+                if front_end == "socks5":
+                    clients.socks5_connect(self.socks, host, port, timeout=budget + 2).close()
+                elif front_end == "http_connect":
+                    clients.http_connect(self.http, host, port, timeout=budget + 2).close()
+                else:
+                    out["r"], _ = clients.http_forward_get(self.http, f"http://{host}:{port}/", timeout=budget + 2)
+                    return
+                out["r"] = "ok"
+            except clients.ProxyError as e:
+                out["r"] = e.code
+            except OSError as e:
+                out["r"] = f"error:{type(e).__name__}"
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(budget)
+        return out.get("r", "hang"), time.monotonic() - start
+
+    def _wait_streams_zero(self, relay, within: float, stable: int = 2) -> tuple[bool, str]:
+        deadline = time.monotonic() + within
+        zeros = 0
+        while True:
+            last = (relay.status() or {}).get("active_streams", "unreadable")
+            zeros = zeros + 1 if last == 0 else 0
+            if zeros >= stable:
+                return True, f"active_streams 0 ({stable} consecutive polls)"
+            if time.monotonic() >= deadline:
+                return False, f"active_streams stuck at {last!r} after {within:.0f}s"
+            time.sleep(0.5)
+
     def _faults(self, relay, agent, proxy, ip, targets, agent_link, proxy_link) -> None:
         def recovered(t0, budget, comp=None, marker=None, mark=None):
             ok, detail = self._wait_traffic(ip, targets, relay, t0 + budget)

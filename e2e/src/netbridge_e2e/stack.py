@@ -35,7 +35,20 @@ REDIRECTED = r"E2E: relay key URL redirected to "
 FAULT_TUNING = {"RELAY_HEARTBEAT_INTERVAL": "10", "RELAY_RATE_CONNECTIONS_PER_MIN": "600",
                 "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "600"}
 CLIENT_TUNING = {"NETBRIDGE_CLIENT_HEARTBEAT_INTERVAL": "10"}
+FIXTURES = Path(__file__).resolve().parent / "plugin_fixtures"
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def install_plugin_fixtures(plugins_dir: Path, nonce: str) -> list[Path]:
+    """Copy the probe and broken fixture plugins into `plugins_dir` (nonce stamped into the probe)."""
+    dirs = []
+    for name in ("probe", "broken"):
+        dest = plugins_dir / name
+        shutil.copytree(FIXTURES / name, dest)
+        dirs.append(dest)
+    probe = plugins_dir / "probe" / "plugin.py"
+    probe.write_text(probe.read_text().replace("__NONCE__", nonce))
+    return dirs
 
 
 def _uv(project: str, *args: str) -> list[str]:
@@ -171,6 +184,17 @@ class SourceAgent(_Component):
         self._stdout = work / "logs" / "agent-stdout.log"
         self._env = dict(env, LOCALAPPDATA=str(localappdata))
         self.logs = LogWatch(self.app_dir / "logs" / "*.log", self._stdout)
+        self.plugins_dir = self.app_dir / "plugins"
+        self._plugin_dirs: list[Path] = []
+
+    def add_plugins(self, nonce: str) -> list[Path]:
+        self._plugin_dirs = install_plugin_fixtures(self.plugins_dir, nonce)
+        return self._plugin_dirs
+
+    def cleanup(self) -> None:
+        self.stop()
+        for d in self._plugin_dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
     def install(self) -> str:
         self.app_dir.mkdir(parents=True, exist_ok=True)
@@ -214,6 +238,7 @@ class ExeComponent(_Component):
         self.app_name = app_name
         self.source_exe = source_exe
         self.install_dir = Path(os.environ["LOCALAPPDATA"]) / app_name
+        self.plugins_dir = self.install_dir / "plugins"
         self.installed_exe = self.install_dir / exe_name
         self._config = config
         self._args = args
@@ -224,6 +249,9 @@ class ExeComponent(_Component):
         self._started = False
         self._uninstalled = False
         self.logs = LogWatch(self.install_dir / "logs" / "*.log")
+
+    def add_plugins(self, nonce: str) -> list[Path]:
+        return install_plugin_fixtures(self.plugins_dir, nonce)
 
     def install(self) -> str:
         if self.install_dir.exists() and not self._allow_existing:

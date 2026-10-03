@@ -3,6 +3,8 @@ import ipaddress
 import socket
 import urllib.request
 
+import pytest
+
 from netbridge_e2e import netinfo, targets
 from netbridge_e2e.targets import PAGE, PAYLOAD, PAYLOAD_SHA256, Targets
 
@@ -54,3 +56,20 @@ def test_port_in_use_detects_a_listener():
         port = s.getsockname()[1]
         assert netinfo.port_in_use(port)
     assert not netinfo.port_in_use(port)
+
+
+def test_refused_port_refuses_and_is_held_until_close():
+    with Targets("127.0.0.1") as t:
+        port = t.refused_port
+        s = socket.socket()
+        s.settimeout(5)
+        with pytest.raises(ConnectionRefusedError):
+            s.connect(("127.0.0.1", port))
+        s.close()
+        probe = socket.socket()
+        with pytest.raises(OSError):                         # still bound: nobody else can take it
+            probe.bind(("127.0.0.1", port))
+        probe.close()
+    again = socket.socket()
+    again.bind(("127.0.0.1", port))                          # released by close()
+    again.close()

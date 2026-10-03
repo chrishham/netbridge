@@ -1,5 +1,6 @@
 """Tiny direct-connect SOCKS5 and HTTP proxies to test the e2e clients."""
 import socket
+import http
 import socketserver
 import threading
 import urllib.parse
@@ -32,6 +33,10 @@ def _recv_exact(sock, n):
             raise ConnectionError("eof")
         buf += chunk
     return buf
+
+
+def _status_line(code: int) -> bytes:
+    return f"HTTP/1.1 {code} {http.HTTPStatus(code).phrase}\r\nContent-Length: 0\r\n\r\n".encode()
 
 
 class _Server(socketserver.ThreadingTCPServer):
@@ -78,13 +83,18 @@ class _HttpProxyHandler(socketserver.BaseRequestHandler):
             head += _recv_exact(s, 1)
         method, target, _ = head.decode().split("\r\n")[0].split(" ")
         if method == "CONNECT":
-            if self.server.opts.get("refuse"):
-                s.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            status = self.server.opts.get("connect_status") or (403 if self.server.opts.get("refuse") else 0)
+            if status:
+                s.sendall(_status_line(status))
                 return
             host, port = target.rsplit(":", 1)
             up = socket.create_connection((host, int(port)), timeout=10)
             s.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
             _pipe(s, up)
+            return
+        forward = self.server.opts.get("forward_status")
+        if forward:
+            s.sendall(_status_line(forward))
             return
         url = urllib.parse.urlsplit(target)
         up = socket.create_connection((url.hostname, url.port), timeout=10)

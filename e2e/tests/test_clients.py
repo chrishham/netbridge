@@ -518,3 +518,22 @@ def test_ws_upgrade_deadline_bounds_a_trickled_response():
         stop.set()
         srv.close()
         t.join(2)
+
+
+def test_http_proxy_connect_status_option():
+    proxy = fakeproxy.http_proxy(connect_status=502)
+    try:
+        with pytest.raises(clients.ProxyError) as e:
+            clients.http_connect(proxy.address, "127.0.0.1", 9)
+        assert e.value.code == 502
+    finally:
+        proxy.close()
+
+
+def test_http_proxy_forward_status_option():
+    proxy = fakeproxy.http_proxy(forward_status=502)
+    try:
+        status, _ = clients.http_forward_get(proxy.address, "http://127.0.0.1:9/")
+        assert status == 502
+    finally:
+        proxy.close()
