@@ -355,3 +355,47 @@ def test_relay_with_auth_validates_tokens_against_the_stub(tmp_path):
     finally:
         r.stop()
         stub.close()
+
+
+def test_add_plugins_copies_fixtures_substitutes_nonce_and_cleans_up(tmp_path):
+    agent = stack.SourceAgent(tmp_path, "ws://127.0.0.1:1", env={})
+    agent.install()
+    dirs = agent.add_plugins("abc123")
+    text = (agent.plugins_dir / "probe" / "plugin.py").read_text()
+    assert "abc123" in text and "__NONCE__" not in text
+    assert (agent.plugins_dir / "broken" / "manifest.json").exists()
+    agent.cleanup()
+    assert not any(d.exists() for d in dirs)
+
+
+def test_fixture_plugins_work_with_the_agents_real_loader(tmp_path):
+    pytest.importorskip("netbridge_agent")
+    import asyncio
+    from aiohttp.test_utils import TestClient, TestServer
+    from netbridge_agent.plugin_loader import discover_plugins, load_plugin_app
+    stack.install_plugin_fixtures(tmp_path, "n0nce")
+    manifests = discover_plugins(tmp_path)                    # the broken one is skipped by the loader
+    assert [m.hostname for m in manifests] == ["netbridge-e2e-probe"]
+    app = load_plugin_app(manifests[0])
+
+    async def fetch():
+        async with TestClient(TestServer(app)) as c:
+            return await (await c.get("/")).text()
+
+    assert asyncio.run(fetch()) == "netbridge-e2e-plugin n0nce"
+
+
+def test_add_plugins_is_idempotent(tmp_path):
+    agent = stack.SourceAgent(tmp_path, "ws://127.0.0.1:1", env={})
+    agent.install()
+    agent.add_plugins("first")
+    agent.add_plugins("second")
+    assert "second" in (agent.plugins_dir / "probe" / "plugin.py").read_text()
+
+
+def test_exe_add_plugins_installs_under_the_install_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    comp = stack.make_exe_agent(tmp_path / "x.exe", "ws://127.0.0.1:1", {}, tmp_path / "work", console=False, allow_existing=False)
+    dirs = comp.add_plugins("n1")
+    assert [d.parent for d in dirs] == [comp.install_dir / "plugins"] * 2
+    assert "n1" in (comp.install_dir / "plugins" / "probe" / "plugin.py").read_text()

@@ -20,7 +20,12 @@ from typing import Optional
 import aiohttp
 
 from .config import redact_proxy_url
-from .agent import validate_destination
+from .agent import (
+    decode_tcp_payload,
+    valid_connect_fields,
+    valid_stream_id,
+    validate_destination,
+)
 from .auth import (
     get_arm_token,
     check_az_login,
@@ -239,12 +244,18 @@ async def _do_tcp_connect(ws, stream_id: str, host: str, port: int) -> None:
         print(f"[{ts()}] [TCP] Connected: {stream_id} -> {host}:{port}")
 
     except asyncio.CancelledError:
-        await send_to_relay(ws, {
-            "type": "tcp_connect_result",
-            "stream_id": stream_id,
-            "success": False,
-            "error": "Connection cancelled",
-        }, silent=True)
+        # tcp_close and shutdown drop the pending entry before cancelling: the
+        # relay already let go of the id, and a late failure could tear down
+        # a new stream that reused it
+        async with lock:
+            still_ours = pending_connections.get(stream_id) is asyncio.current_task()
+        if still_ours:
+            await send_to_relay(ws, {
+                "type": "tcp_connect_result",
+                "stream_id": stream_id,
+                "success": False,
+                "error": "Connection cancelled",
+            }, silent=True)
         raise
 
     except asyncio.TimeoutError:
@@ -276,7 +287,9 @@ async def _do_tcp_connect(ws, stream_id: str, host: str, port: int) -> None:
 
     finally:
         async with lock:
-            pending_connections.pop(stream_id, None)
+            # only drop our own entry, not a later connect that reused the id
+            if pending_connections.get(stream_id) is asyncio.current_task():
+                del pending_connections[stream_id]
 
 
 async def handle_tcp_connect(ws, request: dict) -> None:
@@ -284,7 +297,30 @@ async def handle_tcp_connect(ws, request: dict) -> None:
     host = request.get("host")
     port = request.get("port")
 
+    if not valid_stream_id(stream_id):
+        print(f"[{ts()}] [!] tcp_connect with invalid stream_id, dropping")
+        return
+
     lock = _get_streams_lock()
+
+    # before any reply: a rejection for a reused id would make the relay
+    # tear down the stream that already owns it
+    async with lock:
+        duplicate = stream_id in pending_connections or stream_id in active_streams
+    if duplicate:
+        print(f"[{ts()}] [TCP] Ignoring tcp_connect for in-use stream_id: {stream_id}")
+        return
+
+    err = valid_connect_fields(host, port)
+    if err:
+        print(f"[{ts()}] [TCP] Rejected ({err}): {stream_id}")
+        await send_to_relay(ws, {
+            "type": "tcp_connect_result",
+            "stream_id": stream_id,
+            "success": False,
+            "error": err,
+        })
+        return
 
     async with lock:
         pending_count = len(pending_connections)
@@ -324,8 +360,12 @@ async def handle_tcp_connect(ws, request: dict) -> None:
 
     print(f"[{ts()}] [TCP] Connect request: {stream_id} -> {host}:{port}")
 
-    task = asyncio.create_task(_do_tcp_connect(ws, stream_id, host, port))
     async with lock:
+        # re-checked: validate_destination awaited since the first check
+        if stream_id in pending_connections or stream_id in active_streams:
+            print(f"[{ts()}] [TCP] Ignoring tcp_connect for in-use stream_id: {stream_id}")
+            return
+        task = asyncio.create_task(_do_tcp_connect(ws, stream_id, host, port))
         pending_connections[stream_id] = task
 
 
@@ -376,6 +416,10 @@ async def handle_tcp_data(request: dict) -> None:
     stream_id = request.get("stream_id")
     data_b64 = request.get("data", "")
 
+    if not valid_stream_id(stream_id):
+        print(f"[{ts()}] [!] tcp_data with invalid stream_id, dropping")
+        return
+
     lock = _get_streams_lock()
     async with lock:
         stream = active_streams.get(stream_id)
@@ -383,11 +427,16 @@ async def handle_tcp_data(request: dict) -> None:
     if not stream:
         return
 
+    payload = decode_tcp_payload(data_b64)
+    if payload is None:
+        print(f"[{ts()}] [!] tcp_data with invalid payload for {stream_id}, closing stream")
+        await close_stream(stream_id)
+        return
+
     stream.touch()
 
     try:
-        data = base64.b64decode(data_b64)
-        stream.writer.write(data)
+        stream.writer.write(payload)
         await stream.writer.drain()
     except Exception as e:
         print(f"[{ts()}] [TCP] Write error {stream_id}: {type(e).__name__}: {e}")
@@ -397,7 +446,18 @@ async def handle_tcp_data(request: dict) -> None:
 async def handle_tcp_close(request: dict) -> None:
     stream_id = request.get("stream_id")
     reason = request.get("reason", "unknown")
+    if not valid_stream_id(stream_id):
+        print(f"[{ts()}] [!] tcp_close with invalid stream_id, dropping")
+        return
     print(f"[{ts()}] [TCP] Close request: {stream_id} ({reason})")
+    lock = _get_streams_lock()
+    async with lock:
+        pending = pending_connections.pop(stream_id, None)
+    if pending and not pending.done():
+        # a close during DNS/connect: stop the dial so it cannot register later
+        pending.cancel()
+        # bounded: its cancel handler writes to the relay, and this blocks the receive loop
+        await asyncio.wait({pending}, timeout=2.0)
     await close_stream(stream_id)
 
 
@@ -493,6 +553,9 @@ async def cleanup_idle_streams(stop_event: asyncio.Event) -> None:
 async def handle_message(ws, msg: str):
     try:
         request = json.loads(msg)
+        if not isinstance(request, dict):
+            print(f"[{ts()}] [!] Ignoring non-object JSON message")
+            return
         msg_type = request.get("type")
 
         if msg_type == "tcp_connect":
@@ -555,6 +618,9 @@ async def connect_and_run(
                 msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
+                    if not isinstance(data, dict):
+                        print(f"[{ts()}] [!] Unexpected first message (not an object)")
+                        return
                     if data.get("type") == "registered":
                         print(f"[{ts()}] [+] Connected to relay! (session: {session_id})")
                         print(f"[{ts()}] [*] Passthrough connections: direct (no proxy)")
@@ -593,7 +659,7 @@ async def connect_and_run(
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             data = json.loads(msg.data)
-                            if data.get("type") == "heartbeat_ack":
+                            if isinstance(data, dict) and data.get("type") == "heartbeat_ack":
                                 print(f"[{ts()}] [Heartbeat] Received ack from relay")
                                 continue
                         except json.JSONDecodeError:

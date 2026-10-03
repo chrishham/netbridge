@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -39,6 +40,8 @@ OTHER_TENANT = "22222222-2222-2222-2222-222222222222"
 OTHER_USER = "other@netbridge.test"
 NO_AGENT = "No bridge agent available"
 PENTEST_USER = "pentest@netbridge.test"
+NXDOMAIN = "netbridge-e2e-nxdomain.invalid"
+LINK_LOCAL = "169.254.169.254"
 # not observable here: rate limits are raised on purpose (FAULT_TUNING), session_hijack makes one
 # connection without a separation check, stream_id_enumeration is a hard-coded pass
 PENTEST_SKIPS = ("rapid_connection_dos", "session_hijack", "stream_id_enumeration")
@@ -187,6 +190,8 @@ class Journey:
             self.cleanups.append(lambda c=comp: c.collect_logs(logs))  # runs before cleanup
         self.check("install_agent", lambda: (True, agent.install()))
         self.check("install_proxy", lambda: (True, proxy.install()))
+        nonce = secrets.token_hex(8)  # stamped into the probe plugin; installed before the agent starts so it loads them
+        self.check("plugins_installed", lambda: (True, ", ".join(p.name for p in agent.add_plugins(nonce))))
 
         start_marks = {}
         for comp in (agent, proxy):
@@ -210,8 +215,11 @@ class Journey:
         n = calls.count("account get-access-token")
         self.step("az_called", n >= 2, f"{n} token requests went through the fake az")
 
+        self._agent_start_mark = start_marks["agent"]   # this run only: --work may be reused
+        self._plugins(agent, start_marks["agent"], nonce)
         self._traffic(ip, targets, relay)
-        self._filter(ip, targets, relay)
+        self._filter(ip, targets, relay, agent)
+        self._errors(ip, targets, relay, agent)
         self.check("auth_user_isolation", lambda: self._user_isolation(relay, stub, ip, targets))
         self._pentest_step(relay, stub, env, logs)
         self._reconnect(relay, agent, proxy, ip, targets)
@@ -247,6 +255,14 @@ class Journey:
     def _socks_get(self, host: str, targets: Targets, path: str = "/", timeout: float = 15.0) -> tuple[int, bytes]:
         with clients.socks5_connect(self.socks, host, targets.http_port, timeout=timeout) as s:
             return clients.http_get(s, f"{host}:{targets.http_port}", path)
+
+    def _get_all_fronts(self, host: str, targets: Targets) -> dict[str, tuple[int, bytes]]:
+        target = f"{host}:{targets.http_port}"
+        results = {"socks5": self._socks_get(host, targets)}
+        with clients.http_connect(self.http, host, targets.http_port, timeout=15) as s:
+            results["http_connect"] = clients.http_get(s, target)
+        results["http_forward"] = clients.http_forward_get(self.http, f"http://{target}/")
+        return results
 
     def _traffic(self, ip: str, targets: Targets, relay: Relay) -> None:
         def socks5_http():
@@ -302,19 +318,131 @@ class Journey:
         self.check("bulk_payload", bulk_payload)
         self.check("concurrency", concurrency)
 
-    def _filter(self, ip: str, targets: Targets, relay: Relay) -> None:
+    def _filter(self, ip: str, targets: Targets, relay: Relay, agent) -> None:
         def blocked():
+            rmark, amark = relay.logs.mark(), agent.logs.mark()
             start = time.monotonic()
             try:
                 sock = clients.socks5_connect(self.socks, ip, targets.blocked_port, timeout=30)
             except clients.ProxyError as e:
-                logged = relay.logs.wait_for(rf"Blocked port {targets.blocked_port}\b", 5)
-                return logged is not None, (f"SOCKS5 reply {e.code} after {time.monotonic() - start:.1f}s, "
-                                            f"relay logged the block: {logged is not None}")
+                secs = time.monotonic() - start
+                logged = relay.logs.wait_for(rf"Blocked port {targets.blocked_port}\b", 5, since=rmark)
+                reached_agent = agent.logs.wait_for(rf"Connected: .* -> .*:{targets.blocked_port}\b", 1, since=amark)
+                ok = e.code == 0x04 and logged is not None and reached_agent is None
+                return ok, (f"SOCKS5 reply {e.code:#04x} (want 0x04) after {secs:.1f}s, relay logged the block: "
+                            f"{logged is not None}, agent connected anyway: {reached_agent is not None}")
             sock.close()
             return False, f"connection to blocked port {targets.blocked_port} was allowed"
 
         self.check("relay_filter", blocked)
+
+    PROBE_HOST = "netbridge-e2e-probe"
+
+    def _plugins(self, agent, start_mark, nonce: str) -> None:
+        body_expected = f"netbridge-e2e-plugin {nonce}".encode()
+
+        def loaded():
+            good = agent.logs.wait_for(rf"Plugin loaded: {self.PROBE_HOST}\b", 10, since=start_mark)
+            bad = agent.logs.wait_for(r"Skipping plugin broken:", 5, since=start_mark)
+            return good is not None and bad is not None, (
+                f"probe loaded: {good is not None}, broken skipped: {bad is not None}"
+                + ("" if good and bad else f"; agent log tail: {agent.logs.tail(600)!r}"))
+
+        def routable():
+            results = {}
+            with clients.socks5_connect(self.socks, self.PROBE_HOST, 80, timeout=15) as s:
+                results["socks5"] = clients.http_get(s, self.PROBE_HOST)
+            with clients.http_connect(self.http, self.PROBE_HOST, 80, timeout=15) as s:
+                results["http_connect"] = clients.http_get(s, self.PROBE_HOST)
+            results["http_forward"] = clients.http_forward_get(self.http, f"http://{self.PROBE_HOST}/")
+            bad = {k: (st, b[:60]) for k, (st, b) in results.items() if st != 200 or b != body_expected}
+            return not bad, ("all three front ends returned the nonce" if not bad else f"unexpected: {bad}")
+
+        def listed():
+            with clients.socks5_connect(self.socks, "netbridge-exec", 80, timeout=15) as s:
+                status, body = clients.http_get(s, "netbridge-exec", "/plugins")
+            names = [p.get("name") for p in json.loads(body).get("plugins", [])] if status == 200 else []
+            return (status == 200 and "e2e-probe" in names and "e2e-broken" not in names,
+                    f"HTTP {status}, plugins {names}")
+
+        self.check("plugin_loaded_log", loaded)
+        self.check("plugin_routable", routable)
+        self.check("plugins_listed", listed)
+
+    def _error_case(self, relay, agent, front_end: str, host: str, port: int, expect: int, budget: float,
+                    agent_log: str | None = None, relay_log: str | None = None,
+                    not_relay_log: str | None = None, not_agent_log: str | None = None):
+        def run() -> tuple[bool, str]:
+            rmark, amark = relay.logs.mark(), agent.logs.mark()       # before the action
+            got, secs = self._fail_case(front_end, host, port, budget)
+            detail = f"{front_end} {host}:{port} -> {got!r} after {secs:.1f}s (expected {expect})"
+            if got != expect:
+                return False, detail
+            if agent_log:
+                hit = agent.logs.wait_for(agent_log, 5, since=amark)
+                detail += f"; agent log {agent_log!r}: {hit is not None}"
+                if hit is None:
+                    return False, detail
+            if relay_log:
+                hit = relay.logs.wait_for(relay_log, 5, since=rmark)
+                detail += f"; relay log {relay_log!r}: {hit is not None}"
+                if hit is None:
+                    return False, detail
+            if not_relay_log:
+                seen = relay.logs.wait_for(not_relay_log, 1, since=rmark)
+                detail += f"; relay logged {not_relay_log!r}: {seen is not None}"
+                if seen is not None:
+                    return False, detail
+            if not_agent_log:
+                seen = agent.logs.wait_for(not_agent_log, 1, since=amark)
+                detail += f"; agent logged {not_agent_log!r}: {seen is not None}"
+                if seen is not None:
+                    return False, detail
+            return True, detail
+        return run
+
+    def _errors(self, ip: str, targets: Targets, relay: Relay, agent) -> None:
+        self.check("errors_baseline_clean", lambda: self._wait_streams_zero(relay, within=10))
+        # Agent-log evidence is anchored to the case's own host:port and names the exception type the agent
+        # logs ("Failed: <id> -> host:port: <Type>: <text>"); the text itself differs between Linux and Windows.
+        socks_http = ("socks5", "http_connect", "http_forward")
+        groups = [
+            ("refused", ip, targets.refused_port, 10,
+             rf"Failed: \S+ -> {re.escape(ip)}:{targets.refused_port}: ConnectionRefusedError:", None, None, None,
+             socks_http),
+            ("dns_failure", NXDOMAIN, 80, 20,
+             rf"Failed: \S+ -> {re.escape(NXDOMAIN)}:80: DnsError:", None, None, None, socks_http),
+            ("agent_denies", LINK_LOCAL, 80, 10,
+             rf"Destination denied: \S+ -> {re.escape(LINK_LOCAL)}:80\b", None, r"Blocked port|Destination denied for", None,
+             socks_http),
+            ("blocked_port", ip, targets.blocked_port, 10, None, rf"Blocked port {targets.blocked_port}\b", None,
+             rf"Connected: .* -> .*:{targets.blocked_port}\b", ("http_connect", "http_forward")),
+        ]
+        for name, host, port, budget, alog, rlog, not_rlog, not_alog, fronts in groups:
+            for front in fronts:
+                expect = 4 if front == "socks5" else 502
+                self.check(f"{name}_{front}", self._error_case(
+                    relay, agent, front, host, port, expect, budget, alog, rlog, not_rlog, not_alog))
+
+        def healthy():
+            # every front end: the error cases above expected 502 from the HTTP ones
+            bad = {k: (st, len(b)) for k, (st, b) in self._get_all_fronts(ip, targets).items()
+                   if (st, b) != (200, PAGE)}
+            if bad:
+                return False, f"tunnel unhealthy after the error group: {bad}"
+            ok, detail = self._wait_streams_zero(relay, within=5)
+            return ok, f"HTTP 200 on all three front ends after the errors; {detail}"
+
+        self.check("errors_leave_tunnel_healthy", healthy)
+
+        def never_reached():
+            # Per-case checks watch the agent log for a second; this one looks at the whole run so far,
+            # long after the blocked attempts, so a late forward past the relay filter still fails.
+            hit = agent.logs.wait_for(rf"Connected: .* -> .*:{targets.blocked_port}\b", 0,
+                                      since=getattr(self, "_agent_start_mark", None))
+            return hit is None, f"agent connected to the blocked port: {hit.group(0) if hit else 'never'}"
+
+        self.check("blocked_port_never_reached_agent", never_reached)
 
     # --- auth ----------------------------------------------------------------
 
@@ -543,6 +671,48 @@ class Journey:
         if before < 1 or n < 1:
             raise RuntimeError(f"{link.name} link: {before} active, {how} affected {n} (nothing to fault)")
         return time.monotonic(), n
+
+    def _fail_case(self, front_end: str, host: str, port: int, budget: float) -> tuple[int | str, float]:
+        """One connect that is expected to fail, capped at `budget` seconds wall-clock."""
+        start = time.monotonic()
+        out: dict = {}
+
+        def run():
+            try:
+                if front_end == "socks5":
+                    clients.socks5_connect(self.socks, host, port, timeout=budget).close()
+                elif front_end == "http_connect":
+                    clients.http_connect(self.http, host, port, timeout=budget).close()
+                else:
+                    out["r"], _ = clients.http_forward_get(self.http, f"http://{host}:{port}/", timeout=budget)
+                    return
+                out["r"] = "ok"
+            except clients.ProxyError as e:
+                out["r"] = e.code
+            except OSError as e:
+                out["r"] = f"error:{type(e).__name__}"
+            except Exception as e:
+                out["r"] = f"unexpected:{type(e).__name__}"
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(budget)
+        secs = time.monotonic() - start
+        if worker.is_alive() or secs > budget:   # a late answer does not count; the daemon thread is abandoned
+            return "hang", secs
+        return out.get("r", "hang"), secs
+
+    def _wait_streams_zero(self, relay, within: float, stable: int = 2) -> tuple[bool, str]:
+        deadline = time.monotonic() + within
+        zeros = 0
+        while True:
+            last = (relay.status() or {}).get("active_streams", "unreadable")
+            zeros = zeros + 1 if last == 0 else 0
+            if zeros >= stable:
+                return True, f"active_streams 0 ({stable} consecutive polls)"
+            if time.monotonic() >= deadline:
+                return False, f"active_streams stuck at {last!r} after {within:.0f}s"
+            time.sleep(0.5)
 
     def _faults(self, relay, agent, proxy, ip, targets, agent_link, proxy_link) -> None:
         def recovered(t0, budget, comp=None, marker=None, mark=None):

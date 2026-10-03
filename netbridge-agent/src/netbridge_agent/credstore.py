@@ -125,12 +125,16 @@ def load_proxy_credentials() -> Optional[tuple[str, str]]:
     try:
         with open(path) as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
+    except (ValueError, OSError) as e:  # ValueError covers bad JSON and non-UTF-8 bytes
         logger.warning(f"Failed to read proxy creds: {e}")
         return None
 
+    if not isinstance(data, dict):
+        logger.warning("Proxy creds file is not a JSON object")
+        return None
+
     username = data.get("username")
-    if not username:
+    if not username or not isinstance(username, str):
         return None
 
     if "password_b64" in data and sys.platform == "win32":
@@ -138,11 +142,11 @@ def load_proxy_credentials() -> Optional[tuple[str, str]]:
             ciphertext = base64.b64decode(data["password_b64"])
             password = _dpapi_decrypt(ciphertext)
             return (username, password)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, TypeError) as e:
             logger.warning(f"Failed to decrypt proxy password: {e}")
             return None
 
-    if "password_plain" in data:
+    if isinstance(data.get("password_plain"), str):
         return (username, data["password_plain"])
 
     return None

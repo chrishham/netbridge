@@ -518,3 +518,106 @@ def test_ws_upgrade_deadline_bounds_a_trickled_response():
         stop.set()
         srv.close()
         t.join(2)
+
+
+def test_http_proxy_connect_status_option():
+    proxy = fakeproxy.http_proxy(connect_status=502)
+    try:
+        with pytest.raises(clients.ProxyError) as e:
+            clients.http_connect(proxy.address, "127.0.0.1", 9)
+        assert e.value.code == 502
+    finally:
+        proxy.close()
+
+
+def test_http_proxy_forward_status_option():
+    proxy = fakeproxy.http_proxy(forward_status=502)
+    try:
+        status, _ = clients.http_forward_get(proxy.address, "http://127.0.0.1:9/")
+        assert status == 502
+    finally:
+        proxy.close()
+
+
+@pytest.mark.parametrize("head", [b"HTTP/1.1 200 OK\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n"])
+def test_http_get_deadline_bounds_a_trickled_body(head):
+    """A peer that keeps sending a byte now and then must not hold the response read open."""
+    a, b = socket.socketpair()
+    stop = threading.Event()
+
+    def trickle():
+        b.recv(65536)
+        b.sendall(head)
+        while not stop.wait(0.05):
+            b.sendall(b"x")
+
+    t = threading.Thread(target=trickle, daemon=True)
+    t.start()
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            clients.http_get(a, "h", timeout=0.4)
+        assert time.monotonic() - start < 2
+    finally:
+        stop.set()
+        t.join(2)
+        a.close()
+        b.close()
+
+
+def _trickle_proxy(reply: bytes, then_trickle: bool):
+    """A one-shot proxy: sends `reply`, then optionally one header byte every 50 ms."""
+    srv = socket.create_server(("127.0.0.1", 0))
+    stop = threading.Event()
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(reply)
+            while then_trickle and not stop.wait(0.05):
+                conn.sendall(b"x")
+            stop.wait(5)
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    return srv, stop, t
+
+
+def test_http_connect_deadline_bounds_a_trickled_header():
+    srv, stop, t = _trickle_proxy(b"HTTP/1.1 200 OK\r\nX-Slow: ", then_trickle=True)
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            clients.http_connect(srv.getsockname(), "h", 80, timeout=0.4)
+        assert time.monotonic() - start < 2
+    finally:
+        stop.set()
+        t.join(2)
+        srv.close()
+
+
+def test_http_connect_returns_a_socket_with_the_full_timeout():
+    srv, stop, t = _trickle_proxy(b"HTTP/1.1 200 OK\r\n\r\n", then_trickle=False)
+    try:
+        with clients.http_connect(srv.getsockname(), "h", 80, timeout=7.0) as s:
+            assert s.gettimeout() == 7.0
+    finally:
+        stop.set()
+        t.join(2)
+        srv.close()
+
+
+def test_socks5_connect_deadline_bounds_a_trickled_reply():
+    # valid method reply and CONNECT reply head (ATYP=domain); the address then trickles in,
+    # one byte per 50 ms ("x" = a 120-byte name), well inside each per-recv timeout
+    srv, stop, t = _trickle_proxy(b"\x05\x00" + b"\x05\x00\x00\x03", then_trickle=True)
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            clients.socks5_connect(srv.getsockname(), "h", 80, timeout=0.4)
+        assert time.monotonic() - start < 2
+    finally:
+        stop.set()
+        t.join(2)
+        srv.close()

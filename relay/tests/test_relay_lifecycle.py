@@ -15,9 +15,6 @@ import relay.__main__ as mod
 USER = "anonymous@local"  # identity the relay assigns in no-auth mode
 WAIT = 1.0  # upper bound for any single expected message
 
-# create_app() stores its sweep task under a plain string key; not this suite's concern
-pytestmark = pytest.mark.filterwarnings("ignore::aiohttp.web_exceptions.NotAppKeyWarning")
-
 
 @pytest.fixture(autouse=True)
 def relay_state(monkeypatch):

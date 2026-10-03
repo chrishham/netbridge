@@ -31,13 +31,14 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = "--allow-hosts=127.0.0.1,::1,localhost"
+filterwarnings = ["error::aiohttp.web_exceptions.NotAppKeyWarning"]
 
 [tool.coverage.run]
 branch = true
 source = ["src/relay"]
 
 [tool.coverage.report]
-fail_under = 73
+fail_under = 81
 precision = 2
 show_missing = true
 skip_covered = true

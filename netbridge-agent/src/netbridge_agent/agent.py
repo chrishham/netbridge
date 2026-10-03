@@ -73,6 +73,9 @@ _MAX_TCP_DATA_B64_LEN = MAX_TCP_DATA_SIZE * 4 // 3 + 4
 _LOOPBACK_RANGES = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("::1/128"),
+    # unspecified addresses: on POSIX a connect to 0.0.0.0 or :: reaches the local host
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::/128"),
 ]
 
 # Link-local ranges are always blocked (agent-local SSRF protection)
@@ -89,6 +92,194 @@ _PRIVATE_RANGES = [
 ]
 
 
+MAX_STREAM_ID_LENGTH = 128
+
+
+def valid_stream_id(value) -> bool:
+    """A stream id is a non-empty str of at most MAX_STREAM_ID_LENGTH chars."""
+    return isinstance(value, str) and 0 < len(value) <= MAX_STREAM_ID_LENGTH
+
+
+def valid_connect_fields(host, port) -> str | None:
+    """Return None if host/port are well-formed, else the error text."""
+    if not isinstance(host, str) or not host:
+        return "Invalid host or port"
+    if type(port) is not int or not (1 <= port <= 65535):
+        return "Invalid host or port"
+    return None
+
+
+def decode_tcp_payload(value) -> bytes | None:
+    """Strictly decode a tcp_data payload; None unless a valid base64 str."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return base64.b64decode(value, validate=True)
+    except ValueError:  # binascii.Error is a ValueError
+        return None
+
+
+def _normalize_ip(addr):
+    """Map an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to its IPv4Address.
+
+    Applied before every policy check so ::ffff:127.0.0.1 cannot bypass
+    loopback/link-local/private/CIDR rules written for IPv4.
+    """
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def _in_deny_network(ip, net) -> bool:
+    """Deny-list match that also tries an IPv4 address in its ::ffff: form.
+
+    _normalize_network only rewrites mapped entries of /96 or narrower; a wider
+    IPv6 entry (e.g. ::ffff:0:0/95) still covers mapped addresses and must deny
+    them. Only used for deny entries: widening an allow entry would loosen policy.
+    """
+    if ip in net:
+        return True
+    return (isinstance(ip, ipaddress.IPv4Address) and isinstance(net, ipaddress.IPv6Network)
+            and ipaddress.IPv6Address(f"::ffff:{ip}") in net)
+
+
+def _normalize_network(net):
+    """Rewrite an IPv4-mapped IPv6 network (::ffff:a.b.c.d/N, N >= 96) as IPv4.
+
+    Addresses are normalised to IPv4, and an IPv4Address is never in an
+    IPv6Network, so CIDR entries written in mapped form must be rewritten too.
+    """
+    if (isinstance(net, ipaddress.IPv6Network) and net.prefixlen >= 96
+            and net.network_address.ipv4_mapped is not None):
+        return ipaddress.ip_network(
+            f"{net.network_address.ipv4_mapped}/{net.prefixlen - 96}")
+    return net
+
+
+DNS_TIMEOUT = 10.0
+
+
+class DnsError(OSError):
+    """Hostname resolution failed or timed out."""
+
+
+async def resolve_destination(
+    host: str, port: int, timeout: float | None = None,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve host once, bounded, to a deduplicated normalised address list.
+
+    An IP literal is returned as-is (normalised) without any DNS lookup.
+    """
+    bare_host = host.strip("[]") if host.startswith("[") else host
+    try:
+        return [_normalize_ip(ipaddress.ip_address(bare_host))]
+    except ValueError:
+        pass
+    limit = timeout if timeout is not None else DNS_TIMEOUT
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(bare_host, port, type=socket.SOCK_STREAM), limit)
+    except asyncio.TimeoutError:
+        raise DnsError(f"DNS resolution timed out for {host}") from None
+    except (OSError, UnicodeError) as e:
+        raise DnsError(str(e)) from e
+    result: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for _family, _type, _proto, _canonname, sockaddr in infos:
+        try:
+            ip = _normalize_ip(ipaddress.ip_address(sockaddr[0]))
+        except ValueError:
+            continue
+        if ip not in result:
+            result.append(ip)
+    return result
+
+
+async def select_destinations(
+    host: str,
+    port: int,
+    *,
+    allowed_destinations: list[str] | None = None,
+    denied_destinations: list[str] | None = None,
+    allow_private: bool = True,
+    allow_loopback: bool = False,
+    resolved: list,
+) -> tuple[list, str]:
+    """Apply the destination policy to already-resolved addresses.
+
+    Loopback (127/8, ::1) and link-local (169.254/16, fe80::/10) are blocked
+    by default to prevent SSRF against the agent machine itself. Set
+    allow_loopback=True to permit loopback destinations.
+
+    RFC 1918 private ranges are only blocked when allow_private is False.
+
+    A blocked-range hit on ANY address denies the whole destination. The
+    deny-CIDR and allowlist rules filter the list. Returns
+    (addresses_to_dial, "") or ([], reason).
+    """
+    bare_host = host.strip("[]") if host.startswith("[") else host
+    try:
+        host_ip = ipaddress.ip_address(bare_host)
+    except ValueError:
+        host_ip = None
+    resolved_ips = list(resolved)
+    # "host." and "host" are the same DNS name: compare names without the root dot
+    host_name = bare_host.rstrip(".").lower()
+
+    # Block link-local (always)
+    for ip in resolved_ips:
+        for net in _LINK_LOCAL_RANGES:
+            if ip in net:
+                return [], f"Destination {host} is in a blocked range ({net})"
+
+    # Block loopback (unless allow_loopback is True)
+    if not allow_loopback:
+        for ip in resolved_ips:
+            for net in _LOOPBACK_RANGES:
+                if ip in net:
+                    return [], f"Destination {host} is in a blocked range ({net})"
+
+    # Check RFC 1918 private ranges (only when allow_private is False)
+    if not allow_private:
+        for ip in resolved_ips:
+            for net in _PRIVATE_RANGES:
+                if ip in net:
+                    return [], f"Destination {host} is in a private/reserved range ({net})"
+
+    ips = resolved_ips
+    # Check denied destinations list (filters; hostname pattern denies)
+    if denied_destinations:
+        deny_nets = []
+        for entry in denied_destinations:
+            try:
+                deny_nets.append(_normalize_network(ipaddress.ip_network(entry, strict=False)))
+            except ValueError:
+                if host_ip is None and host_name == entry.rstrip(".").lower():
+                    return [], f"Destination {host} is denied"
+        kept = [ip for ip in ips if not any(_in_deny_network(ip, n) for n in deny_nets)]
+        if ips and not kept:
+            net = next(n for n in deny_nets if _in_deny_network(ips[0], n))
+            return [], f"Destination {host} is denied (matches {net})"
+        ips = kept
+
+    # Check allowed destinations list (if configured, only matches pass)
+    if allowed_destinations:
+        allow_nets = []
+        host_pattern_match = False
+        for entry in allowed_destinations:
+            try:
+                allow_nets.append(_normalize_network(ipaddress.ip_network(entry, strict=False)))
+            except ValueError:
+                if host_ip is None and host_name == entry.rstrip(".").lower():
+                    host_pattern_match = True
+        if not host_pattern_match:
+            ips = [ip for ip in ips if any(ip in n for n in allow_nets)]
+            if not ips:
+                return [], f"Destination {host} is not in the allowed destinations list"
+
+    return ips, ""
+
+
 async def validate_destination(
     host: str,
     port: int,
@@ -96,92 +287,26 @@ async def validate_destination(
     denied_destinations: list[str] | None = None,
     allow_private: bool = True,
     allow_loopback: bool = False,
+    resolved: list | None = None,
 ) -> tuple[bool, str]:
-    """Validate a destination against blocked ranges and optional lists.
+    """Compatibility wrapper: resolve (unless given) and apply the policy.
 
-    Loopback (127/8, ::1) and link-local (169.254/16, fe80::/10) are blocked
-    by default to prevent SSRF against the agent machine itself. Set
-    allow_loopback=True to permit loopback destinations (e.g. for local
-    services reachable only through the tunnel).
-
-    RFC 1918 private ranges (10/8, 172.16/12, 192.168/16) are only blocked
-    when allow_private is False. When True (default), private ranges are
-    allowed for corporate/VDI environments.
-
-    Returns (allowed, reason).
+    Returns (allowed, reason). A DNS failure counts as no addresses.
     """
-    # Strip IPv6 brackets (e.g. [::1] -> ::1)
-    bare_host = host.strip("[]") if host.startswith("[") else host
-
-    try:
-        host_ip = ipaddress.ip_address(bare_host)
-    except ValueError:
-        host_ip = None
-
-    # Collect all IPs to check against CIDR rules
-    resolved_ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
-    if host_ip is not None:
-        resolved_ips.append(host_ip)
-    else:
-        # Resolve hostname to IP addresses for CIDR checking
+    if resolved is None:
         try:
-            loop = asyncio.get_running_loop()
-            infos = await loop.getaddrinfo(bare_host, None)
-            for _family, _type, _proto, _canonname, sockaddr in infos:
-                try:
-                    resolved_ips.append(ipaddress.ip_address(sockaddr[0]))
-                except ValueError:
-                    pass
-        except (OSError, UnicodeError):
-            pass  # DNS failure — fall through to hostname pattern checks
-
-    # Block link-local (always)
-    for ip in resolved_ips:
-        for net in _LINK_LOCAL_RANGES:
-            if ip in net:
-                return False, f"Destination {host} is in a blocked range ({net})"
-
-    # Block loopback (unless allow_loopback is True)
-    if not allow_loopback:
-        for ip in resolved_ips:
-            for net in _LOOPBACK_RANGES:
-                if ip in net:
-                    return False, f"Destination {host} is in a blocked range ({net})"
-
-    # Check RFC 1918 private ranges (only when allow_private is False)
-    if not allow_private:
-        for ip in resolved_ips:
-            for net in _PRIVATE_RANGES:
-                if ip in net:
-                    return False, f"Destination {host} is in a private/reserved range ({net})"
-
-    # Check denied destinations list
-    if denied_destinations:
-        for entry in denied_destinations:
-            try:
-                net = ipaddress.ip_network(entry, strict=False)
-                for ip in resolved_ips:
-                    if ip in net:
-                        return False, f"Destination {host} is denied (matches {net})"
-            except ValueError:
-                # Treat as hostname pattern
-                if host_ip is None and bare_host.lower() == entry.lower():
-                    return False, f"Destination {host} is denied"
-
-    # Check allowed destinations list (if configured, only allow matches)
-    if allowed_destinations:
-        for entry in allowed_destinations:
-            try:
-                net = ipaddress.ip_network(entry, strict=False)
-                for ip in resolved_ips:
-                    if ip in net:
-                        return True, ""
-            except ValueError:
-                if host_ip is None and bare_host.lower() == entry.lower():
-                    return True, ""
-        return False, f"Destination {host} is not in the allowed destinations list"
-
-    return True, ""
+            resolved = await resolve_destination(host, port)
+        except DnsError:
+            resolved = []
+    _ips, err = await select_destinations(
+        host, port,
+        allowed_destinations=allowed_destinations,
+        denied_destinations=denied_destinations,
+        allow_private=allow_private,
+        allow_loopback=allow_loopback,
+        resolved=resolved,
+    )
+    return err == "", err
 
 
 # Type for status callback
@@ -249,13 +374,34 @@ def get_proxy_auth_header(proxy_url: Optional[str], cli_user: Optional[str], cli
     return None
 
 
+async def _dial_addresses(addresses: list, port: int, timeout: float):
+    """Try each validated address in order within one overall deadline."""
+    deadline = time.monotonic() + timeout
+    last_exc: BaseException = asyncio.TimeoutError()
+    for ip in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return await asyncio.wait_for(
+                asyncio.open_connection(str(ip), port), timeout=remaining)
+        except (OSError, asyncio.TimeoutError) as e:
+            last_exc = e
+    raise last_exc
+
+
 async def open_tcp_connection(
     host: str,
     port: int,
     timeout: float = 30.0,
     proxy_auth: Optional[tuple[str, str]] = None,
+    addresses: Optional[list] = None,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Open a TCP connection to the target host."""
+    """Open a TCP connection to the target host.
+
+    With addresses (already validated), dial only those, in order, within
+    the overall timeout; host is then used for logging only.
+    """
     proxy = None
 
     if sys.platform == "win32":
@@ -275,6 +421,8 @@ async def open_tcp_connection(
         reader, writer = await connect_via_proxy(
             proxy_host, proxy_port, host, port, proxy_auth, timeout
         )
+    elif addresses is not None:
+        reader, writer = await _dial_addresses(addresses, port, timeout)
     else:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
@@ -314,7 +462,14 @@ async def close_stream(state: AgentState, stream_id: str, timeout: float = 2.0) 
     """Close and clean up a TCP stream."""
     lock = state.get_lock()
     async with lock:
+        pending = state.pending_connections.pop(stream_id, None)
         stream = state.active_streams.pop(stream_id, None)
+
+    if pending is not None and not pending.done():
+        pending.cancel()
+        # asyncio.wait never raises the task's own CancelledError, so an
+        # outer cancellation of this coroutine still propagates.
+        await asyncio.wait([pending], timeout=timeout)
 
     if not stream:
         return
@@ -412,6 +567,27 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
     host = request.get("host")
     port = request.get("port")
 
+    if not valid_stream_id(stream_id):
+        logger.warning("tcp_connect with invalid stream_id, dropping")
+        return
+
+    # Before any reply: a rejection for a reused id would make the relay tear
+    # down the stream that already owns it.
+    if stream_id in state.pending_connections or stream_id in state.active_streams:
+        logger.warning(f"tcp_connect {stream_id[:8]}: stream id already in use, ignoring")
+        return
+
+    err = valid_connect_fields(host, port)
+    if err:
+        logger.warning(f"tcp_connect {stream_id[:8]}: {err}")
+        await send_to_relay(ws, {
+            "type": "tcp_connect_result",
+            "stream_id": stream_id,
+            "success": False,
+            "error": err,
+        })
+        return
+
     lock = state.get_lock()
     async with lock:
         pending_count = len(state.pending_connections)
@@ -473,28 +649,37 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             stream_id[:8], request.get("host"), request.get("port"), port,
         )
 
-    # Skip validation for intercepted connections — they route to our
-    # own in-process server, not to an external destination.
-    if not intercepted:
-        dest_allowed, dest_reason = await validate_destination(
-            host, port, state.allowed_destinations, state.denied_destinations,
-            allow_private=state.allow_private_destinations,
-            allow_loopback=state.allow_loopback,
-        )
-        if not dest_allowed:
-            logger.warning(f"Destination denied: {stream_id[:8]} -> {host}:{port}: {dest_reason}")
-            await send_to_relay(ws, {
-                "type": "tcp_connect_result",
-                "stream_id": stream_id,
-                "success": False,
-                "error": f"Destination {host}:{port} is not allowed",
-            })
-            return
-
     logger.info(f"Connect: {stream_id[:8]} -> {host}:{port}")
 
     async def do_connect():
+        writer = None
+        forward_task = None
+        registered = False
         try:
+            addresses = None
+            # Intercepted connections route to our own in-process server,
+            # so they skip resolution and validation.
+            if not intercepted:
+                resolved = await resolve_destination(host, port)
+                addresses, dest_reason = await select_destinations(
+                    host, port,
+                    allowed_destinations=state.allowed_destinations,
+                    denied_destinations=state.denied_destinations,
+                    allow_private=state.allow_private_destinations,
+                    allow_loopback=state.allow_loopback,
+                    resolved=resolved,
+                )
+                if dest_reason or not addresses:
+                    logger.warning(
+                        f"Destination denied: {stream_id[:8]} -> {host}:{port}: "
+                        f"{dest_reason or 'no usable addresses'}")
+                    await send_to_relay(ws, {
+                        "type": "tcp_connect_result",
+                        "stream_id": stream_id,
+                        "success": False,
+                        "error": f"Destination {host}:{port} is not allowed",
+                    })
+                    return
             # Skip Basic auth if creds were already rejected this run, to
             # avoid AD account lockout from repeated bad-password attempts.
             proxy_auth = (
@@ -502,7 +687,8 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 else state.passthrough_proxy_auth
             )
             reader, writer = await open_tcp_connection(
-                host, port, timeout=30.0, proxy_auth=proxy_auth
+                host, port, timeout=30.0, proxy_auth=proxy_auth,
+                addresses=addresses,
             )
 
             forward_task = asyncio.create_task(
@@ -517,6 +703,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                     host=host,
                     port=port,
                 )
+                registered = True
 
             await send_to_relay(ws, {
                 "type": "tcp_connect_result",
@@ -525,6 +712,19 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             })
             logger.info(f"Connected: {stream_id[:8]} -> {host}:{port}")
 
+        except asyncio.CancelledError:
+            # Cancelled by tcp_close or session cleanup: release anything
+            # acquired but not yet owned by active_streams, then re-raise.
+            if not registered:
+                if forward_task is not None:
+                    forward_task.cancel()
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                    except Exception:
+                        pass
+            raise
         except ProxyAuthRejected as e:
             # Disable cached creds in-memory after a single failure so the
             # next request does not retry and risk an AD lockout. The user
@@ -547,22 +747,33 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "success": False,
                 "error": str(e),
             }, silent=True)
-            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {e}")
+            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {type(e).__name__}: {e}")
         except Exception as e:
             await send_to_relay(ws, {
                 "type": "tcp_connect_result",
                 "stream_id": stream_id,
                 "success": False,
-                "error": str(e),
+                "error": str(e) or type(e).__name__,
             }, silent=True)
-            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {e}")
-        finally:
-            async with lock:
-                state.pending_connections.pop(stream_id, None)
+            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {type(e).__name__}: {e}")
+
+    # No await between this check and the registration below, so it is atomic
+    # on the loop; a reused id would orphan the first task and its socket.
+    if stream_id in state.pending_connections or stream_id in state.active_streams:
+        logger.warning(f"tcp_connect {stream_id[:8]}: stream id already in use, ignoring")
+        return
 
     task = asyncio.create_task(do_connect())
-    async with lock:
-        state.pending_connections[stream_id] = task
+    # Register synchronously so the task is in the table before it can
+    # finish; the done callback also covers a task cancelled before its
+    # first step (its body, and any finally in it, would never run).
+    state.pending_connections[stream_id] = task
+
+    def _forget(t: asyncio.Task) -> None:
+        if state.pending_connections.get(stream_id) is t:
+            del state.pending_connections[stream_id]
+
+    task.add_done_callback(_forget)
 
 
 async def handle_tcp_data(state: AgentState, request: dict) -> None:
@@ -570,12 +781,22 @@ async def handle_tcp_data(state: AgentState, request: dict) -> None:
     stream_id = request.get("stream_id")
     data_b64 = request.get("data", "")
 
+    if not valid_stream_id(stream_id):
+        logger.warning("tcp_data with invalid stream_id, dropping")
+        return
+
     # Guard against oversized payloads
-    if len(data_b64) > _MAX_TCP_DATA_B64_LEN:
+    if isinstance(data_b64, str) and len(data_b64) > _MAX_TCP_DATA_B64_LEN:
         logger.warning(
             f"Oversized tcp_data ({len(data_b64)} chars) for stream "
-            f"{stream_id[:8] if stream_id else '?'}, dropping"
+            f"{stream_id[:8]}, dropping"
         )
+        return
+
+    payload = decode_tcp_payload(data_b64)
+    if payload is None:
+        logger.warning(f"tcp_data with invalid payload for {stream_id[:8]}, closing stream")
+        await close_stream(state, stream_id)
         return
 
     lock = state.get_lock()
@@ -588,8 +809,7 @@ async def handle_tcp_data(state: AgentState, request: dict) -> None:
     stream.touch()
 
     try:
-        data = base64.b64decode(data_b64)
-        stream.writer.write(data)
+        stream.writer.write(payload)
         await stream.writer.drain()
     except Exception as e:
         logger.debug(f"Write error {stream_id}: {e}")
@@ -600,6 +820,9 @@ async def handle_tcp_close(state: AgentState, request: dict) -> None:
     """Handle TCP close request from client."""
     stream_id = request.get("stream_id")
     reason = request.get("reason", "unknown")
+    if not valid_stream_id(stream_id):
+        logger.warning("tcp_close with invalid stream_id, dropping")
+        return
     logger.info(f"Closed: {stream_id[:8]} ({reason})")
     await close_stream(state, stream_id)
 
@@ -608,6 +831,9 @@ async def handle_message(state: AgentState, ws, msg: str) -> None:
     """Handle incoming message from relay."""
     try:
         request = json.loads(msg)
+        if not isinstance(request, dict):
+            logger.warning("Ignoring non-object JSON message")
+            return
         msg_type = request.get("type")
 
         if msg_type == "tcp_connect":
@@ -728,7 +954,13 @@ async def connect_and_run(
             try:
                 msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
+                    try:
+                        data = json.loads(msg.data)
+                    except ValueError:
+                        data = None
+                    if not isinstance(data, dict):
+                        logger.warning("Malformed registration frame from relay")
+                        return False, 0.0
                     if data.get("type") == "registered":
                         logger.info(f"Connected to relay (session: {session_id})")
                         connected_at = time.monotonic()
@@ -767,7 +999,7 @@ async def connect_and_run(
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             data = json.loads(msg.data)
-                            if data.get("type") == "heartbeat_ack":
+                            if isinstance(data, dict) and data.get("type") == "heartbeat_ack":
                                 continue
                         except json.JSONDecodeError:
                             pass

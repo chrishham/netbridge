@@ -286,3 +286,156 @@ class TestHandleTcpClose:
             assert "s1" not in mod.active_streams
         finally:
             mod.active_streams.pop("s1", None)
+
+
+@pytest.mark.parametrize("raw", ["[1]", '"x"', "null", "42",
+                                 '{"type":"tcp_connect","stream_id":[1],"host":null,"port":1}',
+                                 '{"type":"tcp_connect","stream_id":"s1","host":"h","port":true}'])
+async def test_legacy_handle_message_survives_hostile_frames(raw):
+    from netbridge_agent import legacy
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_message(ws, raw)
+    assert legacy.active_streams == {}
+
+
+@pytest.mark.parametrize("data", [None, 5, [1], "!!not-base64!!"])
+async def test_legacy_tcp_data_bad_payload_closes_the_stream_and_writes_nothing(data, mock_writer, mock_reader, monkeypatch):
+    from netbridge_agent import legacy
+    info = legacy.StreamInfo(mock_reader, mock_writer, None, "h", 80)
+    monkeypatch.setitem(legacy.active_streams, "s1", info)
+    await legacy.handle_tcp_data({"type": "tcp_data", "stream_id": "s1", "data": data})
+    mock_writer.write.assert_not_called()
+    assert "s1" not in legacy.active_streams
+    mock_writer.close.assert_called()
+
+
+async def test_legacy_tcp_data_valid_payload_is_written(mock_writer, mock_reader, monkeypatch):
+    from netbridge_agent import legacy
+    info = legacy.StreamInfo(mock_reader, mock_writer, None, "h", 80)
+    monkeypatch.setitem(legacy.active_streams, "s1", info)
+    await legacy.handle_tcp_data({"type": "tcp_data", "stream_id": "s1", "data": "AA=="})
+    mock_writer.write.assert_called_once_with(b"\x00")
+
+
+@pytest.fixture
+def legacy_dial(monkeypatch):
+    """Legacy connect path with an allowed destination and a dial that blocks until released."""
+    from netbridge_agent import legacy
+    release = asyncio.Event()
+    dials = []
+
+    async def slow_dial(host, port, timeout, proxy_auth=None):
+        dials.append((host, port))
+        await release.wait()
+        raise OSError("refused")
+
+    monkeypatch.setattr(legacy, "validate_destination", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(legacy, "open_tcp_connection", slow_dial)
+    monkeypatch.setattr(legacy, "pending_connections", {})
+    monkeypatch.setattr(legacy, "active_streams", {})
+    yield legacy, release, dials
+    release.set()
+
+
+def _connect(sid="s1"):
+    return {"type": "tcp_connect", "stream_id": sid, "host": "example.com", "port": 80}
+
+
+async def test_legacy_duplicate_pending_id_is_ignored(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    first = legacy.pending_connections["s1"]
+    await legacy.handle_tcp_connect(ws, _connect())
+    await asyncio.sleep(0)
+    assert legacy.pending_connections["s1"] is first
+    assert len(dials) == 1
+    ws.send_str.assert_not_called()                 # no reply that would tear down s1
+    release.set()
+    await first
+    assert "s1" not in legacy.pending_connections
+
+
+async def test_legacy_duplicate_at_capacity_gets_no_rejection(legacy_dial, monkeypatch):
+    legacy, release, dials = legacy_dial
+    monkeypatch.setattr(legacy, "MAX_CONCURRENT_CONNECTIONS", 1)
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    await legacy.handle_tcp_connect(ws, _connect())
+    ws.send_str.assert_not_called()
+
+
+async def test_legacy_close_cancels_a_pending_dial(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    task = legacy.pending_connections["s1"]
+    await asyncio.sleep(0)
+    await legacy.handle_tcp_close({"type": "tcp_close", "stream_id": "s1"})
+    assert task.cancelled()
+    assert legacy.pending_connections == {}
+    assert legacy.active_streams == {}
+
+
+async def test_legacy_finished_dial_keeps_an_entry_that_reused_the_id(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    task = legacy.pending_connections["s1"]
+    await asyncio.sleep(0)
+    replacement = asyncio.get_running_loop().create_future()
+    legacy.pending_connections["s1"] = replacement
+    release.set()
+    await task
+    assert legacy.pending_connections["s1"] is replacement
+
+
+async def test_legacy_close_does_not_wait_long_on_a_stuck_cancel(legacy_dial, monkeypatch):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    task = legacy.pending_connections["s1"]
+    await asyncio.sleep(0)
+    stuck = asyncio.Event()
+
+    async def slow_send(*a, **k):
+        await stuck.wait()          # the cancel handler's write never completes
+        return True
+
+    monkeypatch.setattr(legacy, "send_to_relay", slow_send)
+    real_wait = asyncio.wait
+    monkeypatch.setattr(legacy.asyncio, "wait", lambda fs, timeout: real_wait(fs, timeout=0.05))
+    await asyncio.wait_for(legacy.handle_tcp_close({"type": "tcp_close", "stream_id": "s1"}), 1)
+    assert legacy.pending_connections == {}
+    stuck.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_legacy_dial_cancelled_by_close_sends_no_late_result(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    await asyncio.sleep(0)
+    await legacy.handle_tcp_close({"type": "tcp_close", "stream_id": "s1"})
+    ws.send_str.assert_not_called()      # the relay let go of s1; a reuse must not be torn down
+
+
+async def test_legacy_dial_cancelled_while_still_pending_reports_it(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    task = legacy.pending_connections["s1"]
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    sent = [json.loads(c.args[0]) for c in ws.send_str.call_args_list]
+    assert sent == [{"type": "tcp_connect_result", "stream_id": "s1", "success": False, "error": "Connection cancelled"}]
+
+
+async def test_legacy_malformed_connect_reusing_a_live_id_gets_no_rejection(legacy_dial, mock_reader, mock_writer):
+    legacy, release, dials = legacy_dial
+    legacy.active_streams["s1"] = legacy.StreamInfo(mock_reader, mock_writer, None, "h", 80)
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, {"type": "tcp_connect", "stream_id": "s1", "host": None, "port": 80})
+    ws.send_str.assert_not_called()
+    assert "s1" in legacy.active_streams

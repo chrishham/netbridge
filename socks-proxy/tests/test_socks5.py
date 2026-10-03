@@ -4,7 +4,11 @@ import asyncio
 import socket
 import struct
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
+
+from socks_proxy.tunnel import TunnelConnectError
 
 from socks_proxy.socks5 import (
     SOCKS5_VERSION,
@@ -179,3 +183,40 @@ class TestSendReply:
         result = bytes(writer.buffer)
         _, rep, _, _ = struct.unpack("!BBBB", result[:4])
         assert rep == REPLY_NOT_ALLOWED
+
+
+class _ReplyWriter(_FakeWriter):
+    def get_extra_info(self, name):
+        return ("127.0.0.1", 1)
+
+    def close(self):
+        pass
+
+    async def wait_closed(self):
+        pass
+
+
+class TestConnectFailureReplyMapping:
+    """Pin the SOCKS5 reply byte for each tunnel.connect failure."""
+
+    @pytest.mark.parametrize("exc, code", [
+        (TunnelConnectError("x"), 0x04),
+        (asyncio.TimeoutError(), 0x06),
+        (RuntimeError("boom"), 0x01),
+    ])
+    @pytest.mark.asyncio
+    async def test_reply_byte(self, exc, code):
+        from socks_proxy.socks5 import handle_socks5_client
+
+        req = struct.pack("!BBBB", SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4)
+        req += socket.inet_aton("10.0.0.1") + struct.pack("!H", 80)
+        reader = _feed_reader(struct.pack("!BBB", SOCKS5_VERSION, 1, AUTH_NO_AUTH) + req)
+        writer = _ReplyWriter()
+        tunnel = MagicMock()
+        tunnel.connect = AsyncMock(side_effect=exc)
+        tunnel.close_stream = AsyncMock()
+
+        await handle_socks5_client(reader, writer, tunnel)
+
+        # greeting reply (2 bytes) then the request reply
+        assert writer.buffer[2 + 1] == code

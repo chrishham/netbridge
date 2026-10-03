@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from socks_proxy.tunnel import TunnelConnectError
 from socks_proxy.http_proxy import (
+    handle_http_client,
     _check_proxy_auth,
     _read_headers,
     _stream_chunked_body,
@@ -198,3 +200,46 @@ class TestStreamChunkedBody:
         tunnel = AsyncMock()
         with pytest.raises(ValueError, match="exceeds maximum"):
             await _stream_chunked_body(reader, tunnel, "s1", 150)
+
+
+class _HttpWriter:
+    def __init__(self):
+        self.buffer = bytearray()
+
+    def write(self, data):
+        self.buffer.extend(data)
+
+    async def drain(self):
+        pass
+
+    def get_extra_info(self, name):
+        return ("127.0.0.1", 1)
+
+    def close(self):
+        pass
+
+    async def wait_closed(self):
+        pass
+
+
+class TestConnectFailureStatusMapping:
+    """Pin the HTTP status for each tunnel.connect failure."""
+
+    @pytest.mark.parametrize("request_line", [
+        b"CONNECT 10.0.0.1:443 HTTP/1.1\r\n\r\n",
+        b"GET http://10.0.0.1/ HTTP/1.1\r\nHost: 10.0.0.1\r\n\r\n",
+    ])
+    @pytest.mark.parametrize("exc, status", [
+        (TunnelConnectError("x"), b"HTTP/1.1 502"),
+        (asyncio.TimeoutError(), b"HTTP/1.1 504"),
+    ])
+    @pytest.mark.asyncio
+    async def test_status(self, request_line, exc, status):
+        writer = _HttpWriter()
+        tunnel = MagicMock()
+        tunnel.connect = AsyncMock(side_effect=exc)
+        tunnel.close_stream = AsyncMock()
+
+        await handle_http_client(_feed_reader(request_line), writer, tunnel)
+
+        assert bytes(writer.buffer).startswith(status)
