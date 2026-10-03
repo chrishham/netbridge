@@ -252,3 +252,77 @@ def test_tunnel_connect_closes_the_session_on_error(j, monkeypatch):
     with pytest.raises(TimeoutError):
         j._tunnel_connect(FakeRelay(), "tok", IP, TARGETS)
     assert FakeWs.sessions[0].closed
+
+
+PENTEST_OUT = """[PASS] [CRITICAL] No-Auth Bypass
+[SKIP] session_hijack: skipped: requested with --skip
+
+Total Tests: 12
+Passed: 9
+Failed: 0
+Skipped: 3
+"""
+
+
+class FakeRun:
+    """subprocess.run double: writes `output` to the stdout file and returns `code` (or times out)."""
+
+    def __init__(self, output: str = PENTEST_OUT, code: int = 0, timeout: bool = False):
+        self.output, self.code, self.timeout, self.calls = output, code, timeout, []
+
+    def __call__(self, cmd, stdout, stderr, env, timeout):
+        self.calls.append({"cmd": cmd, "stderr": stderr, "env": env, "timeout": timeout})
+        stdout.write(self.output)
+        stdout.flush()
+        if self.timeout:
+            raise journey.subprocess.TimeoutExpired(cmd, timeout)
+        return journey.subprocess.CompletedProcess(cmd, self.code)
+
+
+def test_pentest_runs_the_strict_suite_and_reports_the_summary(j, tmp_path, monkeypatch):
+    run = FakeRun()
+    monkeypatch.setattr(journey.subprocess, "run", run)
+    ok, detail = j._pentest(FakeRelay(), FakeStub(), {"E": "1", "VIRTUAL_ENV": "e2e/.venv"}, tmp_path)
+    assert ok, detail
+    assert detail == "Passed: 9; Failed: 0; Skipped: 3"
+    [call] = run.calls
+    suite = journey.REPO / "security-tests"
+    token = FakeStub().mint(upn="pentest@netbridge.test")
+    assert call["cmd"] == ["uv", "run", "--project", str(suite), "python", str(suite / "pentest_suite.py"),
+                           "ws://127.0.0.1:18080", "--token", token, "--strict",
+                           "--skip", "rapid_connection_dos", "--skip", "session_hijack",
+                           "--skip", "stream_id_enumeration"]
+    assert call["timeout"] == 180 and call["env"] == {"E": "1"} and call["stderr"] is journey.subprocess.STDOUT
+    assert (tmp_path / "pentest.log").read_text() == PENTEST_OUT
+
+
+def test_pentest_fails_on_a_non_zero_exit_with_the_log_tail(j, tmp_path, monkeypatch):
+    out = "x" * 1000 + "\nPrecheck failed: GET http://127.0.0.1:18080/status failed\n"
+    monkeypatch.setattr(journey.subprocess, "run", FakeRun(out, code=2))
+    ok, detail = j._pentest(FakeRelay(), FakeStub(), {}, tmp_path)
+    assert not ok
+    assert detail.startswith("exit 2 (log ") and str(tmp_path / "pentest.log") in detail
+    assert detail.endswith(out[-600:]) and "x" * 601 not in detail
+
+
+def test_pentest_fails_on_timeout_keeping_the_partial_log(j, tmp_path, monkeypatch):
+    monkeypatch.setattr(journey.subprocess, "run", FakeRun("[PASS] [CRITICAL] No-Auth Bypass\n", timeout=True))
+    ok, detail = j._pentest(FakeRelay(), FakeStub(), {}, tmp_path)
+    assert not ok and detail.startswith("timed out after 180s") and "No-Auth Bypass" in detail
+    assert "No-Auth Bypass" in (tmp_path / "pentest.log").read_text()
+
+
+def test_pentest_step_runs_in_source_mode(j, tmp_path, monkeypatch):
+    monkeypatch.setattr(journey.subprocess, "run", FakeRun(code=1))
+    with pytest.raises(journey.StepFailed):
+        j._pentest_step(FakeRelay(), FakeStub(), {}, tmp_path)
+    assert j.results[-1]["step"] == "pentest_suite" and j.results[-1]["detail"].startswith("exit 1")
+
+
+def test_pentest_step_is_a_recorded_skip_in_exe_mode(j, tmp_path, monkeypatch):
+    run = FakeRun()
+    monkeypatch.setattr(journey.subprocess, "run", run)
+    j.args.mode = "exe"
+    j._pentest_step(FakeRelay(), FakeStub(), {}, tmp_path)
+    assert j.results[-1] == {"step": "pentest_suite", "ok": True, "detail": "skipped: exe mode has no checkout"}
+    assert run.calls == []

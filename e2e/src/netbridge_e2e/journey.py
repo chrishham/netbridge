@@ -6,8 +6,9 @@
 The relay runs with auth on: a local key stub signs the fake az's tokens.
 install → connect (relay pairs agent and proxy, fake az used) → auth matrix
 → SOCKS5 / HTTP CONNECT / HTTP forward / 5 MiB / 20 parallel streams → relay
-port filter → user isolation → relay restart and reconnect → link faults through in-process fault
-proxies (cut, blackhole, relay unreachable, agent down) → uninstall (exe mode).
+port filter → user isolation → pentest suite (source mode) → relay restart and
+reconnect → link faults through in-process fault proxies (cut, blackhole, relay
+unreachable, agent down) → uninstall (exe mode).
 """
 import argparse
 import hashlib
@@ -30,13 +31,18 @@ from .cov import E2ECoverage
 from .faultproxy import FaultProxy
 from .jwtmint import ISSUER_V2
 from .procs import IS_WINDOWS
-from .stack import CLIENT_TUNING, CONNECTED, PROXY_READY, REDIRECTED, RELAY_SESSION, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
+from .stack import CLIENT_TUNING, CONNECTED, PROXY_READY, REDIRECTED, RELAY_SESSION, REPO, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
 from .targets import PAGE, PAYLOAD_SHA256, Targets
 
 
 OTHER_TENANT = "22222222-2222-2222-2222-222222222222"
 OTHER_USER = "other@netbridge.test"
 NO_AGENT = "No bridge agent available"
+PENTEST_USER = "pentest@netbridge.test"
+# not observable here: rate limits are raised on purpose (FAULT_TUNING), session_hijack makes one
+# connection without a separation check, stream_id_enumeration is a hard-coded pass
+PENTEST_SKIPS = ("rapid_connection_dos", "session_hijack", "stream_id_enumeration")
+PENTEST_TIMEOUT = 180
 
 
 class StepFailed(Exception):
@@ -207,6 +213,7 @@ class Journey:
         self._traffic(ip, targets, relay)
         self._filter(ip, targets, relay)
         self.check("auth_user_isolation", lambda: self._user_isolation(relay, stub, ip, targets))
+        self._pentest_step(relay, stub, env, logs)
         self._reconnect(relay, agent, proxy, ip, targets)
         self._faults(relay, agent, proxy, ip, targets, agent_link, proxy_link)
 
@@ -385,6 +392,34 @@ class Journey:
         control = mine.get("type") == "tcp_connect_result" and mine.get("success") is True
         return isolated and control and echo_after, (f"{OTHER_USER}: {json.dumps(other)}; journey user: {json.dumps(mine)}; "
                                                      f"echo stream round-tripped before and after: {echo_after}")
+
+    def _pentest_step(self, relay: Relay, stub: AuthStub, env: dict, logs: Path) -> None:
+        if self.args.mode != "source":
+            self.step("pentest_suite", True, "skipped: exe mode has no checkout")
+            return
+        self.check("pentest_suite", lambda: self._pentest(relay, stub, env, logs))
+
+    def _pentest(self, relay: Relay, stub: AuthStub, env: dict, logs: Path) -> tuple[bool, str]:
+        """security-tests/pentest_suite.py --strict against the relay; full output in logs/pentest.log."""
+        suite = REPO / "security-tests"
+        cmd = ["uv", "run", "--project", str(suite), "python", str(suite / "pentest_suite.py"),
+               f"ws://127.0.0.1:{relay.port}", "--token", stub.mint(upn=PENTEST_USER), "--strict"]
+        for name in PENTEST_SKIPS:
+            cmd += ["--skip", name]
+        log = logs / "pentest.log"
+        with log.open("w", encoding="utf-8") as out:
+            try:
+                # VIRTUAL_ENV points at the driver's venv: uv would warn that it ignores it
+                code = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT,
+                                      env={k: v for k, v in env.items() if k != "VIRTUAL_ENV"},
+                                      timeout=PENTEST_TIMEOUT).returncode
+            except subprocess.TimeoutExpired:
+                code = None
+        text = log.read_text(encoding="utf-8", errors="replace")
+        if code == 0:
+            return True, "; ".join(m.group(0) for m in re.finditer(r"^(Passed|Failed|Skipped): \d+", text, re.M))
+        why = f"timed out after {PENTEST_TIMEOUT}s" if code is None else f"exit {code}"
+        return False, f"{why} (log {log}): {text[-600:]}"
 
     def _reconnect(self, relay: Relay, agent, proxy, ip: str, targets: Targets) -> None:
         marks = {agent.name: agent.logs.mark(), proxy.name: proxy.logs.mark()}
