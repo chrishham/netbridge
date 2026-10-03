@@ -19,6 +19,7 @@ class FakeRelay:
     mode "accept": tcp_connect -> success true
     mode "drop":   any message closes the connection
     mode "silent": nothing is ever answered
+    mode "no_agent": tcp_connect -> success false for a reason other than validation
     """
 
     def __init__(self, *, mode="reject", status=200, status_json=True, leak=False, max_msg_size=MiB, limit=20):
@@ -66,7 +67,9 @@ class FakeRelay:
                 continue
             if data.get("type") == "tcp_connect":
                 await ws.send_str(json.dumps({"type": "tcp_connect_result", "stream_id": data.get("stream_id"),
-                                              "success": self.mode == "accept", "error": "Invalid host format"}))
+                                              "success": self.mode == "accept",
+                                              "error": "No bridge agent available" if self.mode == "no_agent"
+                                              else "Invalid host format"}))
         return ws
 
 
@@ -289,3 +292,23 @@ def test_exit_code_rules():
     assert ps.exit_code([ok, low], strict=False) == 0
     assert ps.exit_code([ok, low], strict=True) == 1
     assert ps.exit_code([critical], strict=False) == 1
+
+
+async def test_host_port_injection_fails_on_an_unrelated_refusal(relay):
+    fake = await relay(mode="no_agent")
+    result = await ps.PenTestSuite(fake.url, GOOD).test_host_port_injection()
+    assert not result.passed and "validation unproven" in result.details
+
+
+@pytest.mark.parametrize("test", ["no_auth_bypass", "invalid_token", "expired_token", "malformed_jwt",
+                                  "websocket_without_auth"])
+async def test_rejection_tests_fail_when_the_relay_does_not_answer(test):
+    result = await getattr(ps.PenTestSuite(dead_url(), GOOD), f"test_{test}")()
+    assert result.passed is False and result.severity == "HIGH"
+    assert "no answer from the relay" in result.details
+
+
+async def test_rate_limiting_without_token_is_a_skip(relay):
+    fake = await relay()
+    result = await ps.PenTestSuite(fake.url).test_rapid_connection_dos()
+    assert result.severity == "SKIP"
