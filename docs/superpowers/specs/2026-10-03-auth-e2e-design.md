@@ -147,12 +147,17 @@ and `/tunnel`:
 | wrong issuer | `iss=https://evil.example/` | 401, `Invalid issuer` |
 | wrong audience | `aud=https://graph.microsoft.com` | 401, `Invalid audience` |
 | no identity | `upn=None` (no other identity claims) | 401, `No user identity` |
+| no kid | header without `kid` | 401, `No key ID in token header` |
+| malformed payload | three segments, payload not base64 JSON | 401, `Token validation failed` (or the decode error text in the code) |
 | valid | `stub.mint(upn="matrix@netbridge.test")` | 101 |
 
 The exact reason strings are taken from `validate.py`/`authenticate_request`
-at implementation time (the table reflects the current code).
+at implementation time (the table reflects the current code). The optional
+max-token-age check (`NETBRIDGE_MAX_TOKEN_AGE_HOURS`, off by default) and
+the user/group allowlists are not enabled on the journey relay; they are
+covered by the unit tests in §8.
 
-All 22 outcomes in the step detail on failure; the step also checks that the
+All 26 outcomes in the step detail on failure; the step also checks that the
 relay logged at least one `auth rejected` line per endpoint. The valid
 upgrades use a user nobody else uses and close immediately, so they cannot
 disturb pairing.
@@ -181,12 +186,18 @@ the relay's "No bridge agent available" error within 10 s — the agent of
   holes (several checks treated any connection error as a pass).
 - New `--skip NAME` option (repeatable) that marks a test as skipped with the
   reason in the report.
+- New `--strict` mode used by the journey: exit non-zero if **any**
+  non-skipped test fails (any severity) or errors (exceptions are recorded
+  as failures, not `INFO`), not only on CRITICAL findings. Without
+  `--strict` the existing CRITICAL-only exit behaviour is kept for manual
+  runs against real relays.
 - Fix its broken `[project.scripts]` entry (points at an async `main`) with a
   sync wrapper.
 - Journey step after `auth_user_isolation`: run
   `uv run --project security-tests python security-tests/pentest_suite.py
-  ws://127.0.0.1:<relay> --token <stub.mint(upn="pentest@netbridge.test")>`
-  with a 180 s timeout; pass if exit code 0 (no CRITICAL failures). Its full
+  ws://127.0.0.1:<relay> --token <stub.mint(upn="pentest@netbridge.test")>
+  --strict --skip rapid_connection_dos` with a 180 s timeout; pass if exit
+  code 0 (every non-skipped test passed). Its full
   output is saved to `<work>/logs/pentest.log` and the summary line goes in
   the step detail. Source mode only (needs the checkout); in exe mode the
   step records "skipped" with the reason. The journey passes
@@ -231,7 +242,7 @@ the relay's "No bridge agent available" error within 10 s — the agent of
 ## Success criteria
 
 - The journey passes with auth on in source, image and Windows exe modes.
-- `auth_matrix`: 20 × 401 and 2 × 101; `auth_user_isolation` passes;
+- `auth_matrix`: 24 × 401 and 2 × 101; `auth_user_isolation` passes;
   `relay_fetched_keys` ≥ 1; `pentest_suite` exit 0 (source mode).
 - New unit tests pass; `shared_auth` coverage rises (floor raised).
 
