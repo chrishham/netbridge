@@ -151,13 +151,16 @@ def _errors_world(j, monkeypatch, replies):
         if port == TARGETS.blocked_port:
             relay.logs.lines.append(f"Blocked port {port} requested by t")
         elif host == "169.254.169.254":
-            agent.logs.lines.append("Destination denied: s -> x")
+            agent.logs.lines.append(f"Destination denied: s -> {host}:{port}: link-local")
+        elif host == journey.NXDOMAIN:
+            agent.logs.lines.append(f"Failed: s -> {host}:{port}: [Errno -2] Name or service not known")
         else:
-            agent.logs.lines.append("Failed: s -> x")
+            agent.logs.lines.append(f"Failed: s -> {host}:{port}: [Errno 111] Connect call failed")
         return replies(front), 0.1
 
     monkeypatch.setattr(j, "_fail_case", fail_case)
     monkeypatch.setattr(j, "_socks_get", lambda *a, **k: (200, PAGE))
+    j.fail_case_orig = fail_case
     return relay, agent
 
 
@@ -196,3 +199,109 @@ def test_relay_filter_requires_exactly_0x04_and_the_relay_log(j, monkeypatch):
         except journey.StepFailed:
             got = False
         assert got is want, (code, log)
+
+
+def _steps_failing(j, relay, agent):
+    with pytest.raises(journey.StepFailed):
+        j._errors("10.0.0.1", TARGETS, relay, agent)
+    return j.results[-1]["step"]
+
+
+def test_dns_step_not_satisfied_by_a_refused_line_for_another_host(j, monkeypatch, clock):
+    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    base = j.fail_case_orig
+
+    def fc(front, host, port, budget):
+        out = base(front, host, port, budget)
+        if host == journey.NXDOMAIN:
+            agent.logs.lines[-1] = f"Failed: s -> 10.0.0.1:{port}: [Errno 111] Connect call failed"
+        return out
+
+    monkeypatch.setattr(j, "_fail_case", fc)
+    assert _steps_failing(j, relay, agent) == "dns_failure_socks5"
+
+
+def test_dns_step_fails_when_the_name_was_refused(j, monkeypatch, clock):
+    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    base = j.fail_case_orig
+
+    def fc(front, host, port, budget):
+        out = base(front, host, port, budget)
+        if host == journey.NXDOMAIN:
+            agent.logs.lines[-1] = f"Failed: s -> {host}:{port}: Connect call failed (Connection refused)"
+        return out
+
+    monkeypatch.setattr(j, "_fail_case", fc)
+    assert _steps_failing(j, relay, agent) == "dns_failure_socks5"
+
+
+def test_agent_denial_fails_on_the_relays_own_denial(j, monkeypatch, clock):
+    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    base = j.fail_case_orig
+
+    def fc(front, host, port, budget):
+        out = base(front, host, port, budget)
+        if host == journey.LINK_LOCAL:
+            relay.logs.lines.append("Destination denied for t: x")
+        return out
+
+    monkeypatch.setattr(j, "_fail_case", fc)
+    assert _steps_failing(j, relay, agent) == "agent_denies_socks5"
+
+
+def test_blocked_port_fails_when_the_agent_connected_anyway(j, monkeypatch, clock):
+    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    base = j.fail_case_orig
+
+    def fc(front, host, port, budget):
+        out = base(front, host, port, budget)
+        if port == TARGETS.blocked_port:
+            agent.logs.lines.append(f"Connected: s -> {host}:{port}")
+        return out
+
+    monkeypatch.setattr(j, "_fail_case", fc)
+    assert _steps_failing(j, relay, agent) == "blocked_port_http_connect"
+
+
+def test_relay_filter_fails_when_the_agent_connected_anyway(j, monkeypatch):
+    relay, agent = FakeComp("relay"), FakeComp("agent")
+
+    def connect(*a, **k):
+        relay.logs.lines.append("Blocked port 9 requested by t")
+        agent.logs.lines.append("Connected: s -> 10.0.0.1:9")
+        raise clients.ProxyError(4, "refused")
+
+    monkeypatch.setattr(clients, "socks5_connect", connect)
+    with pytest.raises(journey.StepFailed):
+        j._filter("10.0.0.1", TARGETS, relay, agent)
+
+
+def test_relay_filter_ignores_a_longer_port_number(j, monkeypatch):
+    relay, agent = FakeComp("relay"), FakeComp("agent")
+
+    def connect(*a, **k):
+        relay.logs.lines.append("Blocked port 9 requested by t")
+        agent.logs.lines.append("Connected: s -> 10.0.0.1:90")
+        raise clients.ProxyError(4, "refused")
+
+    monkeypatch.setattr(clients, "socks5_connect", connect)
+    j._filter("10.0.0.1", TARGETS, relay, agent)
+
+
+def test_errors_baseline_fails_when_streams_are_stuck(j, monkeypatch, clock):
+    relay, agent = _errors_world(j, monkeypatch, lambda front: 4)
+    relay.status = lambda: {"active_streams": 3}
+    assert _steps_failing(j, relay, agent) == "errors_baseline_clean"
+
+
+@pytest.mark.parametrize("reply,streams", [((503, b"x"), 0), ((200, PAGE), 2)])
+def test_tunnel_health_step_fails(j, monkeypatch, clock, reply, streams):
+    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    state = {"n": 0}
+
+    def status():
+        return {"active_streams": 0 if state["n"] == 0 else streams}
+
+    relay.status = status
+    monkeypatch.setattr(j, "_socks_get", lambda *a, **k: (state.update(n=1), reply)[1])
+    assert _steps_failing(j, relay, agent) == "errors_leave_tunnel_healthy"

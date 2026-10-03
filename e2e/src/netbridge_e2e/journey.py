@@ -314,7 +314,7 @@ class Journey:
             except clients.ProxyError as e:
                 secs = time.monotonic() - start
                 logged = relay.logs.wait_for(rf"Blocked port {targets.blocked_port}\b", 5, since=rmark)
-                reached_agent = agent.logs.wait_for(r"Connected: .* -> .*:" + str(targets.blocked_port), 1, since=amark)
+                reached_agent = agent.logs.wait_for(rf"Connected: .* -> .*:{targets.blocked_port}\b", 1, since=amark)
                 ok = e.code == 0x04 and logged is not None and reached_agent is None
                 return ok, (f"SOCKS5 reply {e.code:#04x} (want 0x04) after {secs:.1f}s, relay logged the block: "
                             f"{logged is not None}, agent connected anyway: {reached_agent is not None}")
@@ -325,7 +325,7 @@ class Journey:
 
     def _error_case(self, relay, agent, front_end: str, host: str, port: int, expect: int, budget: float,
                     agent_log: str | None = None, relay_log: str | None = None,
-                    not_relay_log: str | None = None):
+                    not_relay_log: str | None = None, not_agent_log: str | None = None):
         def run() -> tuple[bool, str]:
             rmark, amark = relay.logs.mark(), agent.logs.mark()       # before the action
             got, secs = self._fail_case(front_end, host, port, budget)
@@ -347,26 +347,36 @@ class Journey:
                 detail += f"; relay logged {not_relay_log!r}: {seen is not None}"
                 if seen is not None:
                     return False, detail
+            if not_agent_log:
+                seen = agent.logs.wait_for(not_agent_log, 1, since=amark)
+                detail += f"; agent logged {not_agent_log!r}: {seen is not None}"
+                if seen is not None:
+                    return False, detail
             return True, detail
         return run
 
     def _errors(self, ip: str, targets: Targets, relay: Relay, agent) -> None:
         self.check("errors_baseline_clean", lambda: self._wait_streams_zero(relay, within=10))
+        # Agent-log evidence is anchored to the case's own host:port. The refusal/DNS error text differs
+        # between Linux and Windows, so DNS is told apart from a refusal by host plus "not refused".
+        socks_http = ("socks5", "http_connect", "http_forward")
         groups = [
-            ("refused", ip, targets.refused_port, 10, "Failed:", None, None,
-             ("socks5", "http_connect", "http_forward")),
-            ("dns_failure", NXDOMAIN, 80, 20, "Failed:", None, None,
-             ("socks5", "http_connect", "http_forward")),
-            ("agent_denies", LINK_LOCAL, 80, 10, "Destination denied", None, r"Blocked port",
-             ("socks5", "http_connect", "http_forward")),
+            ("refused", ip, targets.refused_port, 10,
+             rf"Failed: \S+ -> {re.escape(ip)}:{targets.refused_port}: ", None, None, None, socks_http),
+            ("dns_failure", NXDOMAIN, 80, 20,
+             rf"Failed: \S+ -> {re.escape(NXDOMAIN)}:80: ", None, None, rf"Failed: \S+ -> {re.escape(NXDOMAIN)}:80: .*refused",
+             socks_http),
+            ("agent_denies", LINK_LOCAL, 80, 10,
+             rf"Destination denied: \S+ -> {re.escape(LINK_LOCAL)}:80\b", None, r"Blocked port|Destination denied for", None,
+             socks_http),
             ("blocked_port", ip, targets.blocked_port, 10, None, rf"Blocked port {targets.blocked_port}\b", None,
-             ("http_connect", "http_forward")),
+             rf"Connected: .* -> .*:{targets.blocked_port}\b", ("http_connect", "http_forward")),
         ]
-        for name, host, port, budget, alog, rlog, not_rlog, fronts in groups:
+        for name, host, port, budget, alog, rlog, not_rlog, not_alog, fronts in groups:
             for front in fronts:
                 expect = 4 if front == "socks5" else 502
                 self.check(f"{name}_{front}", self._error_case(
-                    relay, agent, front, host, port, expect, budget, alog, rlog, not_rlog))
+                    relay, agent, front, host, port, expect, budget, alog, rlog, not_rlog, not_alog))
 
         def healthy():
             status, body = self._socks_get(ip, targets)
