@@ -198,3 +198,32 @@ def test_agent_and_proxy_argv_under_coverage(tmp_path, monkeypatch):
     assert seen["agent"] == ["COV", "netbridge-agent", "-m", "netbridge_agent", "--console"]
     assert seen["proxy"][:5] == ["COV", "socks-proxy", "-m", "socks_proxy", "serve"]
     assert "--no-tray" in seen["proxy"]
+
+
+def test_relay_image_gets_fault_tuning(tmp_path, monkeypatch):
+    seen = captured_argv(monkeypatch)
+    monkeypatch.setattr(stack.subprocess, "run", lambda *a, **k: None)
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}, image="img").start()
+    argv = seen["relay"]
+    pairs = [argv[i:i + 2] for i in range(len(argv) - 1)]
+    assert ["-e", "RELAY_HEARTBEAT_INTERVAL=10"] in pairs
+    assert ["-e", "RELAY_RATE_CONNECTIONS_PER_MIN=600"] in pairs
+    assert ["-e", "RELAY_RATE_IP_CONNECTIONS_PER_MIN=600"] in pairs
+
+
+def test_relay_source_env_gets_fault_tuning(tmp_path, monkeypatch):
+    envs = {}
+
+    class FakeProc:
+        def __init__(self, name, argv, log_path, env=None, **kw):
+            envs[name] = env
+
+        def start(self):
+            return self
+
+    monkeypatch.setattr(stack, "Proc", FakeProc)
+    monkeypatch.setattr(stack, "port_in_use", lambda port: False)
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}).start()
+    assert {k: envs["relay"][k] for k in stack.FAULT_TUNING} == {
+        "RELAY_HEARTBEAT_INTERVAL": "10", "RELAY_RATE_CONNECTIONS_PER_MIN": "600",
+        "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "600"}

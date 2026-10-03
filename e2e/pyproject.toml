@@ -26,7 +26,7 @@ branch = true
 source = ["src/netbridge_e2e"]
 
 [tool.coverage.report]
-fail_under = 64
+fail_under = 72
 precision = 2
 show_missing = true
 skip_covered = true

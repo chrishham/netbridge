@@ -515,6 +515,7 @@ class TestHandleTcpConnect:
             "user_email": "user@x.com",
             "tunnel_key": "key",
             "tunnel_ws": ws,
+            "agent_ws": agent_ws,
             "created_at": time.monotonic(),
             "last_activity": time.monotonic(),
         }
@@ -586,6 +587,7 @@ class TestHandleTcpData:
             "user_email": "user@x.com",
             "tunnel_key": "tkey",
             "tunnel_ws": MagicMock(),
+            "agent_ws": agent_ws,
             "created_at": time.monotonic(),
             "last_activity": time.monotonic(),
         }
@@ -612,6 +614,7 @@ class TestHandleTcpData:
             "user_email": "user@x.com",
             "tunnel_key": "correct_key",
             "tunnel_ws": MagicMock(),
+            "agent_ws": agent_ws,
             "created_at": time.monotonic(),
             "last_activity": time.monotonic(),
         }
@@ -652,6 +655,7 @@ class TestHandleTcpClose:
             "user_email": "user@x.com",
             "tunnel_key": "tkey",
             "tunnel_ws": MagicMock(),
+            "agent_ws": agent_ws,
             "created_at": time.monotonic(),
             "last_activity": time.monotonic(),
         }
@@ -678,6 +682,7 @@ class TestHandleTcpClose:
             "user_email": "user@x.com",
             "tunnel_key": "correct_key",
             "tunnel_ws": MagicMock(),
+            "agent_ws": agent_ws,
             "created_at": time.monotonic(),
             "last_activity": time.monotonic(),
         }

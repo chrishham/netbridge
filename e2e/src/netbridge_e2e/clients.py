@@ -5,6 +5,7 @@ of hanging the gate.
 """
 import socket
 import threading
+import time
 import urllib.parse
 
 Address = tuple[str, int]
@@ -112,3 +113,18 @@ def echo_roundtrip(sock: socket.socket, data: bytes) -> bytes:
     got = recv_exact(sock, len(data))
     sender.join()
     return got
+
+
+def wait_closed(sock: socket.socket, timeout: float) -> bool:
+    """True once the peer ends the connection (EOF or error) within timeout; data is discarded."""
+    deadline = time.monotonic() + timeout
+    while (left := deadline - time.monotonic()) > 0:
+        sock.settimeout(min(left, 1.0))
+        try:
+            if sock.recv(65536) == b"":
+                return True
+        except socket.timeout:
+            continue
+        except OSError:
+            return True
+    return False

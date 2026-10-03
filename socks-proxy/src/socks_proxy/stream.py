@@ -72,6 +72,11 @@ class StreamHandler:
         """Mark stream as closed and signal EOF to reader."""
         if not self.closed:
             self.closed = True
+            # Fail pending connect so it returns immediately instead of waiting for timeout
+            if not self.connect_future.done():
+                self.connect_future.set_exception(
+                    ConnectionError("stream closed before connect completed")
+                )
             # Signal close event to wake up any waiting readers
             self._close_event.set()
             # Try to queue EOF sentinel, but don't block
