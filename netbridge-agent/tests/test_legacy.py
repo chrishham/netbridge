@@ -430,3 +430,12 @@ async def test_legacy_dial_cancelled_while_still_pending_reports_it(legacy_dial)
     await asyncio.gather(task, return_exceptions=True)
     sent = [json.loads(c.args[0]) for c in ws.send_str.call_args_list]
     assert sent == [{"type": "tcp_connect_result", "stream_id": "s1", "success": False, "error": "Connection cancelled"}]
+
+
+async def test_legacy_malformed_connect_reusing_a_live_id_gets_no_rejection(legacy_dial, mock_reader, mock_writer):
+    legacy, release, dials = legacy_dial
+    legacy.active_streams["s1"] = legacy.StreamInfo(mock_reader, mock_writer, None, "h", 80)
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, {"type": "tcp_connect", "stream_id": "s1", "host": None, "port": 80})
+    ws.send_str.assert_not_called()
+    assert "s1" in legacy.active_streams

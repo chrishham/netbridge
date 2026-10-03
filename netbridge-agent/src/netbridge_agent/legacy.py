@@ -300,6 +300,17 @@ async def handle_tcp_connect(ws, request: dict) -> None:
     if not valid_stream_id(stream_id):
         print(f"[{ts()}] [!] tcp_connect with invalid stream_id, dropping")
         return
+
+    lock = _get_streams_lock()
+
+    # before any reply: a rejection for a reused id would make the relay
+    # tear down the stream that already owns it
+    async with lock:
+        duplicate = stream_id in pending_connections or stream_id in active_streams
+    if duplicate:
+        print(f"[{ts()}] [TCP] Ignoring tcp_connect for in-use stream_id: {stream_id}")
+        return
+
     err = valid_connect_fields(host, port)
     if err:
         print(f"[{ts()}] [TCP] Rejected ({err}): {stream_id}")
@@ -311,18 +322,9 @@ async def handle_tcp_connect(ws, request: dict) -> None:
         })
         return
 
-    lock = _get_streams_lock()
-
     async with lock:
-        # before any reply: a rejection for a reused id would make the relay
-        # tear down the stream that already owns it
-        duplicate = stream_id in pending_connections or stream_id in active_streams
         pending_count = len(pending_connections)
         active_count = len(active_streams)
-
-    if duplicate:
-        print(f"[{ts()}] [TCP] Ignoring tcp_connect for in-use stream_id: {stream_id}")
-        return
 
     if pending_count >= MAX_CONCURRENT_CONNECTIONS:
         print(f"[{ts()}] [TCP] Rejected (too many pending): {stream_id} -> {host}:{port}")

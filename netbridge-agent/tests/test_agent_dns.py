@@ -293,3 +293,12 @@ async def test_hostname_rules_ignore_the_root_dot(host, entry):
     assert got == [] and "denied" in err
     got, err = await agent.select_destinations(host, 80, resolved=ips, allowed_destinations=[entry, "9.9.9.0/24"])
     assert got == ips
+
+
+@pytest.mark.parametrize("host,port", [(None, 80), ("ok.test", "80"), ("ok.test", 0)])
+async def test_malformed_connect_reusing_a_live_id_gets_no_rejection(host, port, mock_writer, mock_reader):
+    state, ws = AgentState(), _ws()
+    state.active_streams["A"] = agent.StreamInfo(mock_reader, mock_writer, None, "h", 80)
+    await handle_message(state, ws, _connect("A", host, port))
+    ws.send_str.assert_not_awaited()
+    assert "A" in state.active_streams

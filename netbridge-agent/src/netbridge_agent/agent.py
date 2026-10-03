@@ -557,6 +557,13 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
     if not valid_stream_id(stream_id):
         logger.warning("tcp_connect with invalid stream_id, dropping")
         return
+
+    # Before any reply: a rejection for a reused id would make the relay tear
+    # down the stream that already owns it.
+    if stream_id in state.pending_connections or stream_id in state.active_streams:
+        logger.warning(f"tcp_connect {stream_id[:8]}: stream id already in use, ignoring")
+        return
+
     err = valid_connect_fields(host, port)
     if err:
         logger.warning(f"tcp_connect {stream_id[:8]}: {err}")
@@ -566,12 +573,6 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             "success": False,
             "error": err,
         })
-        return
-
-    # Before any reply: a rejection for a reused id would make the relay tear
-    # down the stream that already owns it.
-    if stream_id in state.pending_connections or stream_id in state.active_streams:
-        logger.warning(f"tcp_connect {stream_id[:8]}: stream id already in use, ignoring")
         return
 
     lock = state.get_lock()
