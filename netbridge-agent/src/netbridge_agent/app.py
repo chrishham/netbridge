@@ -25,9 +25,14 @@ if TYPE_CHECKING:
 
 from .config import Config, ensure_app_dirs, get_log_path, get_log_dir, get_app_dir, APP_NAME, APP_VERSION
 from .tray import TrayIcon, Status, TRAY_AVAILABLE
-from .remote_exec import PLUGIN_RELOAD_CALLBACK, REMOTE_EXEC_ENABLED
+from .remote_exec import PLUGIN_RELOAD_CALLBACK, REMOTE_EXEC_ENABLED, create_app as create_exec_app
 
 REMOTE_EXEC_TIMEOUT = 3600  # 1 hour auto-disable
+
+
+def _detached_creationflags() -> int:
+    """Windows detached-process flags; 0 where the constants do not exist."""
+    return getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -115,6 +120,7 @@ class NetBridgeApp:
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._async_thread: Optional[threading.Thread] = None
         self._stop_event: Optional[asyncio.Event] = None
+        self._shutdown_event: Optional[asyncio.Event] = None
         self._agent_task: Optional[asyncio.Task] = None
 
         # Pending requests from tray menu (thread-safe)
@@ -220,15 +226,13 @@ class NetBridgeApp:
         try:
             subprocess.Popen(
                 [str(target_exe), "--no-install"],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+                creationflags=_detached_creationflags(),
             )
         except OSError:
             logger.exception("Failed to launch new process")
             return
 
-        self._pending_exit.set()
-        if self._async_loop and self._stop_event:
-            self._async_loop.call_soon_threadsafe(self._stop_event.set)
+        self._signal_exit()
         if self.tray:
             self.tray.stop()
 
@@ -325,11 +329,7 @@ class NetBridgeApp:
             url = self.config.relay_url
 
         # First stop this instance, then install (which launches the new one)
-        self._pending_exit.set()
-
-        # Signal async loop to stop
-        if self._async_loop and self._stop_event:
-            self._async_loop.call_soon_threadsafe(self._stop_event.set)
+        self._signal_exit()
 
         # Do the install (this launches the installed version)
         success = Installer.install_fresh(url)
@@ -340,7 +340,6 @@ class NetBridgeApp:
 
         if success:
             # Force process exit after a short delay to let tray cleanup
-            import os
             os._exit(0)
 
     def request_uninstall(self) -> None:
@@ -531,14 +530,23 @@ class NetBridgeApp:
         self._plugin_manifests = loaded
         return added, removed
 
+    def _signal_exit(self) -> None:
+        """End the app from any thread: app-shutdown event plus the live connection's stop event."""
+        self._pending_exit.set()
+        loop = self._async_loop
+        if loop is None:
+            return
+        for event in (self._shutdown_event, self._stop_event):
+            if event is not None:
+                try:
+                    loop.call_soon_threadsafe(event.set)
+                except RuntimeError:  # loop already closed
+                    pass
+
     def request_exit(self) -> None:
         """Request application exit (from tray menu)."""
         logger.info("Exit requested")
-        self._pending_exit.set()
-
-        # Signal async loop to stop
-        if self._async_loop and self._stop_event:
-            self._async_loop.call_soon_threadsafe(self._stop_event.set)
+        self._signal_exit()
 
         # Stop tray
         if self.tray:
@@ -650,7 +658,7 @@ class NetBridgeApp:
         logger.info(f"Launching update script: {script}")
         subprocess.Popen(
             ["cmd", "/C", str(script)],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+            creationflags=_detached_creationflags(),
         )
         self.request_exit()
 
@@ -723,6 +731,9 @@ class NetBridgeApp:
     async def _async_main(self) -> None:
         """Main async loop running in background thread."""
         self._stop_event = asyncio.Event()
+        self._shutdown_event = asyncio.Event()
+        if self._async_loop is None:
+            self._async_loop = asyncio.get_running_loop()
 
         # Start intercept server, register netbridge-exec, and load plugins
         # BEFORE agent connects so hostnames are ready for relay traffic.
@@ -730,7 +741,6 @@ class NetBridgeApp:
         self._intercept_server = InterceptServer()
         await self._intercept_server.start()
 
-        from .remote_exec import create_app as create_exec_app
         self._exec_app = create_exec_app()
         self._exec_app[PLUGIN_RELOAD_CALLBACK] = self._reload_plugins
         await self._intercept_server.register_app("netbridge-exec", self._exec_app)
@@ -748,8 +758,14 @@ class NetBridgeApp:
         # Check for updates (non-blocking, fire-and-forget)
         asyncio.create_task(self._check_for_update())
 
+        # An exit requested during start-up may predate the events
+        if self._pending_exit.is_set():
+            self._shutdown_event.set()
+
         # Wait for exit request
-        await self._stop_event.wait()
+        if self._pending_exit.is_set():
+            self._shutdown_event.set()
+        await self._shutdown_event.wait()
 
         # Cancel agent task first so in-flight TCP streams close,
         # preventing intercept server cleanup from stalling.
