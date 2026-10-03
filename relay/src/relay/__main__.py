@@ -114,7 +114,7 @@ def _parse_message(raw: str, who: str) -> dict | None:
     """json.loads that only returns objects; warns and returns None otherwise."""
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):  # JSONDecodeError, or nesting too deep
         logger.warning(f"Invalid JSON from {who}")
         return None
     if not isinstance(data, dict):
