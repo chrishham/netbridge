@@ -68,7 +68,7 @@ class FaultProxy:
                 if not ready:
                     continue
                 client, _ = self._lsock.accept()
-            except OSError:
+            except (OSError, ValueError):  # ValueError: select on a closed socket (negative fd)
                 break
             if self._refuse:  # relay unreachable: the TCP handshake works, then nothing
                 _close(client)

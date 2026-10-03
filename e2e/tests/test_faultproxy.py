@@ -146,7 +146,28 @@ def test_close_is_idempotent_and_stops_threads(echo_server):
     before = threading.active_count()
     p = FaultProxy(echo_server, "t")
     p.start()
-    connect(p)
+    s = connect(p)
     p.close()
     p.close()
+    s.close()
     assert wait_until(lambda: threading.active_count() <= before, timeout=3)
+
+
+def test_close_while_listener_selects(echo_server):
+    exceptions = []
+    old_hook = threading.excepthook
+
+    def record(args):
+        exceptions.append(args)
+
+    try:
+        threading.excepthook = record
+        for _ in range(20):
+            p = FaultProxy(echo_server, "race")
+            p.start()
+            p.close()
+            for t in p._threads:
+                t.join(1)
+        assert not exceptions, f"Unhandled exceptions in threads: {exceptions}"
+    finally:
+        threading.excepthook = old_hook
