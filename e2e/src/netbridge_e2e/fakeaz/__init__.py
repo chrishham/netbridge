@@ -4,6 +4,11 @@ The relay runs with --no-auth and ignores the bearer token, but the agent
 and proxy still run their real auth path: `az account show`, then
 `az account get-access-token` via a subprocess, then a local check of the
 token's `exp` claim. This fake answers both.
+
+When the auth stub env vars (NETBRIDGE_E2E_SIGNING_KEY, NETBRIDGE_E2E_KID,
+NETBRIDGE_E2E_TENANT) are set, the fake az mints RS256-signed tokens
+compatible with Azure AD token structure. Otherwise, it returns unsigned
+tokens for backward compatibility.
 """
 import base64
 import json
@@ -17,8 +22,19 @@ ENV_PYTHON = "NETBRIDGE_E2E_PYTHON"
 ENV_LOG = "NETBRIDGE_E2E_AZ_LOG"
 
 
-def env_with_fake_az(base: Mapping[str, str], python: str, log: Path) -> dict[str, str]:
+def env_with_fake_az(
+    base: Mapping[str, str],
+    python: str,
+    log: Path,
+    auth_env: dict | None = None
+) -> dict[str, str]:
     """Copy of `base` with the fake az first on PATH.
+
+    Args:
+        base: Base environment to extend
+        python: Python interpreter path for the fake az wrapper
+        log: Path to log az commands
+        auth_env: Optional auth stub environment (e.g., from AuthStub.env())
 
     On Windows, preserves SystemRoot, ComSpec, and PATHEXT from the base env.
     """
@@ -26,6 +42,8 @@ def env_with_fake_az(base: Mapping[str, str], python: str, log: Path) -> dict[st
     env["PATH"] = os.pathsep.join(p for p in (str(FAKE_AZ_DIR), base.get("PATH", "")) if p)
     env[ENV_PYTHON] = python
     env[ENV_LOG] = str(log)
+    if auth_env:
+        env.update(auth_env)
     return env
 
 
