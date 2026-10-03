@@ -40,9 +40,13 @@ repo's weakness — an actual enforced gate instead of report-only coverage.
 
 1. Every component measures line+branch coverage with the same tooling.
 2. A per-component floor (`fail_under`) that cannot silently drop (ratchet).
-3. New/changed lines in a PR must be ≥80% covered (diff-cover).
+3. New/changed lines in a PR within the six measured `src/<package>` trees
+   must be ≥80% covered (diff-cover). Python outside those trees (e.g.
+   `scripts/`, tests) is not in the coverage XML and therefore not gated.
 4. `socks-proxy-win` tests run in CI.
-5. Unit tests cannot reach the real network.
+5. Unit tests cannot open TCP connections to non-loopback hosts (best-effort
+   guard, not a full network sandbox: DNS lookups and unconnected UDP
+   `sendto` are not intercepted).
 6. The source-mode e2e journey reports which product lines it exercises
    (report-only), as the yardstick for B–D.
 7. Test/coverage artifacts are always uploaded, even on failure.
@@ -72,10 +76,15 @@ Each of `shared`, `relay`, `netbridge-agent`, `socks-proxy`,
 
   [tool.coverage.report]
   fail_under = <floor(baseline)>
+  precision = 2
   show_missing = true
   skip_covered = true
   ```
 
+- `precision = 2` matters: coverage compares `fail_under` against the total
+  rounded to `precision` (default 0), so without it 46.6% would round to 47
+  and pass a floor of 47. With two decimals the integer floor is compared
+  against the real value.
 - No `omit` beyond what is genuinely not product code (none expected; the
   relay's 1119-line `__main__.py` is real code and stays in).
 - `--cov` is **not** added to `addopts`. Plain `uv run pytest` stays fast and
@@ -157,11 +166,17 @@ version matches the one locked in the components so data files combine.
 - For each component with a `<comp>/.coverage` file: read `fail_under` from
   `<comp>/pyproject.toml` (`tomllib`), compute the total percentage by
   shelling out to `coverage report --data-file=... --format=total`.
-- Combine all data files into `.coverage.combined` at repo root
-  (`coverage combine --keep`) — all data files hold absolute paths under the
-  same checkout, so no `[paths]` remapping is needed — then
-  `coverage xml -o coverage.xml` and `coverage html -d htmlcov` from repo root,
+- Combine the data files explicitly (bare `coverage combine` only searches
+  the current directory):
+  `coverage combine --keep --data-file=.coverage.combined shared/.coverage relay/.coverage ...`
+  (only the files that exist). All data files hold absolute paths under the
+  same checkout, so no `[paths]` remapping is needed. Then
+  `coverage xml --data-file=.coverage.combined -o coverage.xml` and
+  `coverage html --data-file=.coverage.combined -d htmlcov` from repo root,
   which yields repo-relative filenames as diff-cover expects.
+- Totals come from `coverage report --data-file=<comp>/.coverage
+  --format=total --precision=2` so hints use the same precision as the
+  floor.
 - Output: markdown table (component, coverage, floor, status, hint) to stdout
   and, when `GITHUB_STEP_SUMMARY` is set, appended there.
 - Exit code 0 always: enforcement is done by each component's `pytest --cov`
@@ -191,13 +206,26 @@ New driver option `--coverage DIR` (source mode only):
   data_file = DIR/.coverage
   ```
 
+- Before launching anything the driver deletes `DIR/.coverage*` (only
+  coverage-owned files), because work directories may be reused across runs
+  and stale parallel data files would inflate totals or mask a component
+  that produced no data.
 - `Relay` (non-image), `SourceAgent` and `SourceProxy` launch their module
-  through `python -m coverage run --rcfile=DIR/.coveragerc -m <module> ...`
-  instead of `python -m <module>` / the console script. For the proxy that is
-  `-m socks_proxy serve ...` (same `main` as the `netbridge-socks` entry
-  point). Without `--coverage` the argv is unchanged.
-- `sigterm = true` makes coverage flush on the SIGTERM that `Proc.stop`
-  sends; apps that exit gracefully on SIGTERM flush via atexit anyway.
+  through `<component venv python> -m coverage run --rcfile=DIR/.coveragerc
+  -m <module> ...` instead of `uv run ... python -m <module>` / the console
+  script. For the proxy that is `-m socks_proxy serve ...` (same `main` as the
+  `netbridge-socks` entry point). Without `--coverage` the argv is unchanged.
+- The venv interpreter is used directly, not through `uv run`, because
+  `Proc.stop` SIGTERMs the process group, waits only for the direct child
+  (which would be `uv`) and then SIGKILLs the group: the Python child could be
+  killed before its atexit coverage flush. With Python as the direct child,
+  `Proc.stop` waits (10 s) for that exact process. The interpreter path is
+  resolved once per component with
+  `uv run --project <comp> python -c "import sys; print(sys.executable)"`,
+  which also syncs the venv like the normal path does.
+- `sigterm = true` makes coverage flush on SIGTERM for processes that keep
+  the default handler; the relay, agent and proxy install their own
+  graceful-shutdown handlers and flush via atexit when they exit normally.
 - With `--relay-image` the relay is not instrumented; the driver logs that.
   In exe mode `--coverage` is rejected with a clear error.
 - After the journey (pass or fail), the driver runs `coverage combine` and
@@ -236,7 +264,7 @@ New driver option `--coverage DIR` (source mode only):
   its floor.
 - A PR adding untested Python lines fails diff-cover at <80%.
 - `socks-proxy-win`'s 103 tests run in `ci.yml`.
-- A unit test attempting a non-loopback connect fails.
+- A unit test attempting a non-loopback TCP connect fails.
 - The e2e-source job summary shows per-package e2e coverage.
 - Coverage/junit artifacts exist for failed runs.
 
