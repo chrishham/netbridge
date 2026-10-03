@@ -36,8 +36,9 @@ Chain for a failed destination:
      `[Errno -2] Name or service not known` (Windows `[Errno 11001]
      getaddrinfo failed`). The text is OS- and locale-dependent.
    - DNS failure inside `validate_destination` is swallowed
-     (`agent.py:130-134`) and the connect proceeds, so the name is resolved
-     twice (validation, then connect). Harmless, noted.
+     (`agent.py:130-134`) and the connect proceeds; the name is then resolved
+     a **second** time by `open_connection` (`agent.py:279`). This is not
+     harmless, see F8.
 2. Relay forwards the agent's result verbatim; relay-side rejections (blocked
    port `relay/__main__.py:723`, invalid params, rate limit, no agent) use the
    same message shape.
@@ -124,12 +125,43 @@ a `filterwarnings("ignore::NotAppKeyWarning")` to hide it
 (`test_relay_lifecycle.py:18`). The agent has the same pattern in
 `remote_exec.py:323,402,425`, `app.py:449,466,734` and its tests.
 
+### F6a. Failed connects leak the relay stream (product bug)
+
+`_handle_tcp_connect` registers the stream in `tcp_streams` before the agent
+answers (`relay/__main__.py:792`). On `tcp_connect_result{success:false}` the
+agent-result branch only forwards the message (`__main__.py:621`) and removes
+the stream solely for `tcp_close`. The proxy drops its own handler
+(`tunnel.py:742`) and never learns a `stream_id` to close
+(`socks5.py:90`), so the relay keeps the entry until the idle sweep
+(`STREAM_TIMEOUT` 120 s, `__main__.py:108, 430`). Every refused port, DNS
+failure or denial therefore leaves a phantom stream in `active_streams` for two
+minutes (and counts against `/status`). Relay-side failures that return before
+registration (blocked port, invalid params) do not leak.
+
+### F6b. DNS rebinding gap in the agent (product bug)
+
+`validate_destination` resolves the name (`agent.py:126`) and checks the
+answers; `open_tcp_connection` then calls `asyncio.open_connection(host, port)`
+(`agent.py:279`), which resolves again. A name whose answer changes between the
+two lookups (short TTL / rebinding server) passes validation with an allowed
+address and connects to loopback or link-local, defeating the "always blocked"
+boundary (`agent.py:78-95`). The validation lookup is also unbounded
+(`agent.py:127`), so a blackholed resolver stalls the stream for the OS
+resolver timeout; the driver cannot cancel that.
+
+### F6c. Other unguarded JSON consumers
+
+Beyond F4: `legacy.py:493, 557, 595` (the shipped `--legacy` mode) parse then
+call `.get` the same way; `remote_exec` `/exec` and `/exec/stream` call
+`await request.json()` then `.get` (`remote_exec.py:183, 236`), so a valid
+scalar/array body yields a logged traceback and HTTP 500.
+
 ### F6. Agent unit-test gaps
 
 | File | Stmts | Cov today | Nature |
 |---|---|---|---|
 | `app.py` | 456 | 0 % | `NetBridgeApp`: no Tk. Tray is `pystray` (guarded import, `TRAY_AVAILABLE`); console mode needs none. Mostly plain methods around `self.tray`, asyncio events, `Config`, subprocess |
-| `credstore.py` | 85 | 23 % | JSON file store; DPAPI via `ctypes.windll` only on `win32`; non-Windows branch is base64 |
+| `credstore.py` | 85 | 23 % | JSON file store; DPAPI via `ctypes.windll` only on `win32`; the non-Windows branch stores the password as **plaintext** JSON (`credstore.py:102, 145`) |
 | `keepalive.py` | 54 | 0 % | loop + two `ctypes.windll` calls that are no-ops off Windows |
 | `auth.py` | 71 | n/a | pure re-export of `shared_auth` (imports only; no logic) |
 | `__main__.py`, `tray.py`, `dialogs.py` | 190, 156, 274 | 0 % | CLI wiring, pystray menu, Win32/Tk dialogs: need a display |
@@ -141,7 +173,9 @@ a `filterwarnings("ignore::NotAppKeyWarning")` to hide it
    three front ends, fast and deterministic, in source and exe modes.
 2. A journey step proving plugins load, are routable through the tunnel, and
    that one bad plugin does not break the rest.
-3. Fix F4 test-first in relay, agent and proxy.
+3. Fix test-first: F4/F6c (non-object JSON: relay, agent, proxy, legacy,
+   remote_exec), F6a (failed connect leaks the relay stream), F6b (single,
+   bounded DNS resolution in the agent).
 4. Agent unit tests for `app.py` (headless part), `credstore.py`,
    `keepalive.py`, `auth.py` re-exports; relay tests for the agent message loop.
 5. Migrate to `web.AppKey` (relay, agent), drop the warning filter.
@@ -151,9 +185,11 @@ a `filterwarnings("ignore::NotAppKeyWarning")` to hide it
 
 - A structured connect-error code / correct SOCKS5 reply mapping (F1): a
   protocol change; recorded as a follow-up.
-- Testing `tray.py`, `dialogs.py`, `__main__.py`, `legacy.py`, Windows DPAPI /
-  `SendInput` internals (need a display or real Win32; the Windows e2e journey
-  already starts the exe).
+- Testing `tray.py`, `dialogs.py`, `__main__.py`, Windows DPAPI /
+  `SendInput` internals (need a display or real Win32). Nothing in CI exercises
+  them (the Windows workflow runs the e2e driver tests and the exe journey, whose
+  config enables neither keep-alive nor stored credentials): honest follow-up,
+  see section 5.
 - Plugin install/uninstall/hot-reload through `netbridge-socks plugin ...`
   (needs git/clone and exec; `test_plugin_cli.py` / `test_remote_exec.py` own it).
 - Changing reconnect, rate-limit or timeout behaviour.
@@ -171,30 +207,43 @@ all other targets), so the agent's loopback block does not apply.
 
 Clients: `clients.socks5_connect` already raises `ProxyError(code)`;
 `clients.http_connect` raises `ProxyError(status)` on non-200;
-`clients.http_forward_get` returns `(status, body)`. No new client code except
-a helper `attempt(fn, budget)` in the journey returning
-`(outcome, seconds)`, where outcome is the reply code/status, `"ok"`, or
-`"hang"` (budget exhausted).
+`clients.http_forward_get` returns `(status, body)`. A journey helper
+`_fail_case(front_end, dest, expect, budget)` runs one failure over one front
+end and returns `(outcome, seconds)`, outcome being the reply code/status,
+`"ok"`, or `"hang"` (budget exhausted, via the existing thread-based
+`_attempt`; this is only a backstop, the agent bounds DNS itself, section 3).
+The matrix is parametrised over failure kind x front end, one step each:
 
-| Step | Action | Expect | Budget |
-|---|---|---|---|
-| `refused_socks5` | SOCKS5 CONNECT `ip:refused_port` | reply **0x04**; agent log `Failed: ... Connect call failed`/OS refusal text | 10 s |
-| `refused_http_connect` | HTTP CONNECT `ip:refused_port` | **502** | 10 s |
-| `refused_http_forward` | `GET http://ip:refused_port/` | **502** | 10 s |
-| `dns_failure_socks5` | SOCKS5 CONNECT domain `netbridge-e2e-nxdomain.invalid:80` (ATYP=0x03; `.invalid` is reserved and never resolves) | **0x04**; agent log shows the resolver error | 20 s |
-| `dns_failure_http_connect` | HTTP CONNECT same name | **502** | 20 s |
-| `agent_denies_link_local` | SOCKS5 CONNECT `169.254.169.254:80` (literal, no network I/O; agent always blocks it) | **0x04**; agent log `Destination denied`; relay log has **no** `Blocked port` | 10 s |
-| `blocked_port_http_connect` / `blocked_port_http_forward` | the relay-blocked port over the two HTTP front ends | **502**; relay logs `Blocked port` | 10 s |
-| `missing_service` | SOCKS5 CONNECT `netbridge-e2e-missing:80` | **0x04**; agent log `Service ... is not available` | 10 s |
-| `errors_leave_tunnel_healthy` | after all of the above: `socks5_http` round trip succeeds; relay `/status` `active_streams` is back to its pre-error baseline within 5 s | both | 15 s |
+| Failure | Destination | SOCKS5 | HTTP CONNECT | HTTP forward | Budget |
+|---|---|---|---|---|---|
+| refused | `ip:refused_port` | `refused_socks5` 0x04 | `refused_http_connect` 502 | `refused_http_forward` 502 | 10 s |
+| DNS failure | `netbridge-e2e-nxdomain.invalid:80` (ATYP=0x03 on SOCKS5) | `dns_failure_socks5` 0x04 | `dns_failure_http_connect` 502 | `dns_failure_http_forward` 502 | 20 s |
+| agent denial | `169.254.169.254:80` (literal, no network I/O, always blocked) | `agent_denies_socks5` 0x04 | `agent_denies_http_connect` 502 | `agent_denies_http_forward` 502 | 10 s |
+| relay port block | relay-blocked port | existing `relay_filter` | `blocked_port_http_connect` 502 | `blocked_port_http_forward` 502 | 10 s |
 
-Each step also records elapsed seconds in its detail and fails on `"hang"`.
-"Pinned current behaviour" is stated in the step detail
-(`0x04 (host unreachable; the product maps all connect failures to it)`), so a
-future structured-error change updates exactly these assertions.
-Steps use `Journey.check` so one failure does not hide the rest; the log
-evidence is read from `agent.logs` and `relay.logs` with `wait_for(..., 5)`
-since file logs lag slightly.
+Evidence rules: **before every action** the step takes `agent.logs.mark()` and
+`relay.logs.mark()`, and every log assertion uses `wait_for(..., 5,
+since=mark)`, so earlier lines (e.g. `relay_filter`'s `Blocked port`) can neither
+satisfy nor break a later step. Refused: agent log `Failed:` line with the OS
+refusal text; DNS: agent log `Failed:` with the resolver error; agent denial:
+agent log `Destination denied` and **no** relay `Blocked port` since the mark;
+port block: relay `Blocked port` since the mark.
+
+`errors_leave_tunnel_healthy` runs last: a `socks5_http` round trip succeeds
+and relay `/status` `active_streams` returns to the baseline taken before the
+group within 5 s. It depends on the relay fix F6a (without it the phantom
+streams stay for 120 s); that is the point of the step.
+
+Every step prints reply, seconds and evidence, and fails on `"hang"`. The step
+detail says `0x04 (host unreachable; the product maps all connect failures to
+it)`, so a future structured-error change updates exactly these assertions.
+Steps use the journey's normal `check`, which fails fast like the rest of the
+journey: a failing case ends the run.
+
+The agent's `Service H is not available` branch (`agent.py:438-459`, a registered
+magic hostname without an app) is **not** a journey step: `netbridge-e2e-missing`
+is not a magic hostname (`intercept.py:22-28`), so it would go to plain DNS. It
+is covered by an agent unit test (section 5).
 
 `relay_filter` is kept as is (it already pins the SOCKS5 relay block); the
 HTTP variants are the new `blocked_port_*` steps.
@@ -212,8 +261,9 @@ imported, which the agent (and the PyInstaller exe) already bundles.
 list[Path]` and copies them into `<app dir>/plugins/` before `start()`
 (plugins load at agent start, F3). The nonce is a per-run random token
 substituted into the copy, so a stale directory from an earlier run cannot
-satisfy the check. Cleanup removes only the two fixture directories (an
-`--allow-existing-install` machine keeps its own plugins).
+satisfy the check. Source mode cleanup removes the two fixture directories; in exe mode the whole
+install dir is removed by `uninstall` (nothing is preserved, as for all other
+exe state).
 
 Steps, all through the real proxy -> relay -> agent path:
 
@@ -227,8 +277,9 @@ Steps, all through the real proxy -> relay -> agent path:
   JSON whose `plugins` names contain the probe plugin and not `broken`
   (always-on route, no remote exec needed; this is the same endpoint
   `netbridge-socks plugin list` uses).
-- `plugin_isolation`: `netbridge-e2e-missing:80` is the `missing_service` step
-  above; ordering guarantees plugins loaded before errors are asserted.
+- `plugin_isolation`: covered by `plugin_loaded_log` (the broken plugin is
+  skipped while the probe plugin loads) and `plugin_routable`; plugin steps run
+  before the error group.
 
 **Which journeys:** both. The steps only use the proxy front ends and files in
 the agent's app dir. Source mode: `<work>/localappdata/NetBridge/plugins`. Exe
@@ -261,6 +312,62 @@ covered by `validate_tcp_connect_params`.
 Agent (`agent.py:610, 731, 769`) and proxy (`tunnel.py:867`) get the same
 guard (`isinstance(data, dict)` else warn and skip); no shared helper, so
 `shared_auth` (a non-editable path dependency) is untouched.
+
+Also guarded (F6c): `legacy.py:493, 557, 595` get the same `isinstance(dict)`
+check (guard only, plus one small unit test of `handle_message` ignoring
+non-objects if the module's existing test fixtures allow it, otherwise guard
+only; the test is not required for legacy). `remote_exec` `/exec` and
+`/exec/stream` answer a non-object body with `400 {"error": "JSON object
+required"}` and no traceback, with unit tests for both routes (`[1]`, `"x"`,
+`null`, `42`).
+
+### 3a. Relay: release failed streams (F6a)
+
+In the agent loop, after forwarding a `tcp_connect_result` whose `success` is
+not `true`, the relay removes `tcp_streams[stream_id]` (under `_state_lock`,
+only if the entry still belongs to this agent and user, same ownership check
+as today). A successful result keeps the stream. The stream limiter is a
+rate limiter, not a counter, so there is no per-user count to decrement; the
+removal makes `/status` `active_streams` accurate immediately. Late
+`tcp_data`/`tcp_close` for the removed id are already dropped as unknown.
+
+Tests: relay unit test (`test_relay_agent_loop.py`): a failed result is
+forwarded and the stream removed; a successful result keeps it; a failed
+result for another user's stream does not remove it. Journey:
+`errors_leave_tunnel_healthy`.
+
+### 3b. Agent: resolve once, bounded, connect to validated IPs (F6b)
+
+`validate_destination` is split so one resolution serves both purposes:
+
+- `resolve_destination(host, port, timeout=10.0)` runs `loop.getaddrinfo`
+  under `asyncio.wait_for`; on timeout raises an error whose text is `DNS
+  resolution timed out for <host>`; a resolver error keeps its own text. IP
+  literals skip DNS.
+- Validation applies all existing rules (link-local always, loopback unless
+  allowed, private if disabled, denied/allowed lists) to **every** resolved
+  address, and rejects if any one is blocked.
+- `open_tcp_connection` receives the validated addresses and tries them in
+  order (`asyncio.open_connection(ip, port)` each, remaining time of the 30 s
+  budget), raising the last error if all fail. The original hostname is kept
+  for logs, the `Destination H:P` message and `StreamInfo.host`. With a
+  corporate upstream proxy (`connect_via_proxy`) the name is passed to the proxy
+  as today (the proxy resolves it); the agent still validates its own
+  resolution first.
+- Unaffected: magic hostnames and plugin hosts return before any resolution
+  (`agent.py:438-471`, intercepted streams skip validation and connect to
+  `127.0.0.1:<plugin port>`); IP-literal destinations behave as before.
+
+Unit tests (`netbridge-agent/tests/test_agent_dns.py`, resolver mocked, no
+network): rebinding prevented (a fake `getaddrinfo` that answers `1.2.3.4` first
+and `127.0.0.1` afterwards: exactly one lookup happens and the connect uses
+`1.2.3.4`; a name resolving to a blocked address is rejected, as is a name with
+one blocked among several answers); timeout (a never-completing resolver yields
+`DNS resolution timed out` within the patched small timeout and the failure
+reaches the relay as `success:false`); multi-address fallback (first address
+refuses, second accepted, order preserved; all fail -> last error); hostname
+preserved in log/`StreamInfo`; magic hostname and intercepted plugin path make
+no resolver call.
 
 ### 4. `web.AppKey` migration (F5)
 
@@ -305,8 +412,8 @@ from `tray.py` with a guarded import, and tests never create a `TrayIcon`.
   `_check_for_update` / `_do_update` decision logic with `updater` patched
   (no network); `_launch_update_script` writes the expected script (Windows-only
   parts skipped via `pytest.mark.skipif`).
-- `tests/test_credstore.py`: non-Windows branch for real (tmp app dir): save ->
-  load round trip, file mode/location, `clear`, `has_proxy_credentials`,
+- `tests/test_credstore.py`: non-Windows branch for real (tmp app dir; the password is stored in plaintext
+  there, the test pins that): save -> load round trip, file location, `clear`, `has_proxy_credentials`,
   corrupt JSON and missing keys return None. Windows branch: `_dpapi_*`
   tests marked `skipif(sys.platform != "win32")` (run on the Windows runner in
   `ci.yml`'s agent job if present; otherwise they document intent). A
@@ -318,17 +425,24 @@ from `tray.py` with a guarded import, and tests never create a `TrayIcon`.
   call are asserted; `session_keepalive_loop` with `KEEPALIVE_INTERVAL`
   patched to 0.01 s: sets state on start, jiggles, warns when `SendInput`
   fails, clears state and stops on `stop_event`, clears state when cancelled.
+- `tests/test_agent.py` addition: `handle_tcp_connect` for a registered magic
+  hostname whose app is unregistered answers `Service H is not available`;
+  not configured / not running branches (`agent.py:438-459`).
+- `tests/test_remote_exec.py` additions: non-object bodies on `/exec` and
+  `/exec/stream` give 400 JSON, no traceback.
 - `tests/test_auth_reexports.py`: every name in `netbridge_agent.auth.__all__`
   is the same object as in `shared_auth` and `__all__` has no duplicates (the
   module has no logic; this catches a rename in `shared_auth`).
 
-**Excluded (documented in `[tool.coverage.report] exclude_also` is NOT used;
-files stay in the denominator, honestly low):** `tray.py`, `dialogs.py`,
-`__main__.py`, `legacy.py`, the `win32`-only branches of `app.py`
-(`request_restart`, `_launch_update_script` Windows script, `request_install`
-/ `request_uninstall` which call the installer and dialogs), and the DPAPI /
-`SendInput` calls themselves. They are exercised by the Windows exe journey
-(start, connect, traffic, uninstall), not by unit tests.
+**Excluded and honestly uncovered:** `tray.py`, `dialogs.py`, `__main__.py`,
+`legacy.py` (apart from the new guard), the `win32`-only branches of
+`app.py` (`request_restart`, `_launch_update_script` Windows script,
+`request_install` / `request_uninstall`), and the DPAPI / `SendInput` calls
+themselves. They stay in the coverage denominator. They are **not** exercised by
+the Windows journey (its exe config enables neither keep-alive nor stored
+credentials) nor by CI (the Windows workflow runs only the e2e driver tests).
+Non-goal for D; follow-up: a Windows unit-test job for `credstore` DPAPI and
+`keepalive` `SendInput`.
 
 ### 6. Relay tests
 
@@ -342,7 +456,7 @@ acked), no `ERROR`/traceback record from `aiohttp.server` or `relay` (caplog),
 and `Ignoring non-object JSON` / `Invalid stream_id` warnings appear. A
 state-level test asserts `tcp_streams` is unchanged.
 
-`relay/tests/test_relay_agent_loop.py`: the uncovered agent message loop
+`relay/tests/test_relay_agent_loop.py` (also the F6a tests above): the uncovered agent message loop
 (`__main__.py:603-666`): result/data/close forwarded to the owning tunnel
 client; ownership denied (stream of another user or another agent socket) is
 dropped with the warning; `tcp_close` removes the stream; oversized message
@@ -374,15 +488,16 @@ as a path dev-dependency for this test, or the test is skipped when
 
 ## Coverage floors
 
-Rule: new floor = floor(measured after D) minus 1, never lowered. Estimates
-before measuring:
+Rule: new floor = `floor(measured after D)`, matching the hint printed by
+`scripts/coverage_report.py:41`; never lowered. Estimates before measuring (the
+resulting floors are the integer parts):
 
 | Component | Now (floor) | After D (estimate) | New floor |
 |---|---|---|---|
-| netbridge-agent | 37.66 (37) | ~47 (`app.py` ~60 % of 456 stmts, `credstore` ~85 %, `keepalive` ~90 %, guards) | **45** |
-| relay | 73.41 (73) | ~81 (agent loop 603-666, malformed paths) | **79** |
-| socks-proxy | 50.95 (50) | ~52 (guards, mapping pins) | **51** |
-| e2e | 77.40 (77) | ~78 (new targets/steps/fixtures) | **77** unless measured higher |
+| netbridge-agent | 37.66 (37) | ~46 (`app.py` ~60 % of 456 stmts, `credstore` ~85 %, `keepalive` ~90 %, DNS/guards) | **46** |
+| relay | 73.41 (73) | ~80.5 (agent loop 603-666, malformed paths, stream release) | **80** |
+| socks-proxy | 50.95 (50) | ~52.3 (guards, mapping pins) | **52** |
+| e2e | 77.40 (77) | ~78.2 (new targets/steps/fixtures) | **78** |
 | shared, socks-proxy-win | unchanged | unchanged | unchanged |
 
 Floors are set from the actual numbers in the final commit of D, not from
@@ -400,7 +515,7 @@ lines (it forces the guards and `AppKey` lines to be tested).
 
 ## Error handling
 
-- Error steps never fail from a different cause than they assert: they print
+- Error steps never fail from a different cause than they assert (log evidence only since the per-action mark): they print
   reply code, elapsed time and the relevant agent/relay log lines; a hang is
   reported as such, not as a timeout exception.
 - Plugin steps attach the agent log tail on failure (missing `Plugin loaded`
@@ -408,17 +523,17 @@ lines (it forces the guards and `AppKey` lines to be tested).
 
 ## Risks
 
-- **DNS in CI.** `.invalid` should resolve instantly to NXDOMAIN, but a
-  runner with a blackholed resolver could take the full resolver timeout. The
-  20 s budget and a clear "hang" report keep it bounded; if flaky it is
-  switched to a hosts-file-free alternative (a name containing a character the
-  relay's hostname pattern accepts but no resolver answers, same `.invalid`).
+- **DNS in CI.** `.invalid` should answer NXDOMAIN instantly. If the resolver
+  is blackholed the agent now gives up after 10 s with `DNS resolution timed
+  out` (F6b), so the stream ends deterministically; the driver's 20 s budget is
+  only a backstop. Residual flake risk: a resolver slower than 10 s fails the
+  step with that explicit message.
 - **Windows refused-connect latency** (~2 s per attempt, three attempts):
   within budget.
 - **Frozen exe plugin import** (see section 2): first Windows run will confirm.
 - **Pinning 0x04/502** makes a later correct mapping a deliberate test change;
   intended.
-- **Message-limiter interaction:** the new steps add about 12 connects; the
+- **Message-limiter interaction:** the new steps add about 18 connects; the
   e2e relay already raises per-user/IP limits (B), and stream-rate limiting is
   far above this.
 - **App tests and logging:** `NetBridgeApp.__init__` calls `setup_logging`;
@@ -442,6 +557,13 @@ lines (it forces the guards and `AppKey` lines to be tested).
 | 12 | Test `app.py` headless logic, exclude tray/dialogs/`__main__`/`legacy`/Win32 branches | exclude `app.py` entirely, or omit files from coverage | `app.py` has no Tk and most logic is plain asyncio/state; excluding untestable files from the denominator would hide the gap, so they stay in and are covered by the Windows journey |
 | 13 | `auth.py` gets only an identity test | mock-heavy tests | It is a pure re-export; behaviour belongs to `shared_auth` tests |
 | 14 | `AppKey` migration includes the agent's `remote_exec` keys, and the warning becomes an error | relay only | Same warning, same fix, prevents regressions |
-| 15 | Floors = measured minus 1, set at the end of D | fixed targets now | Avoids a red CI from estimate error; ratchet never lowers |
+| 15 | Floors set from measured values at the end of D (see 23) | fixed targets now | Avoids a red CI from estimate error; ratchet never lowers |
 | 16 | `stream_id` must be `str` <= 128 chars in the relay | accept any hashable | Closes the `TypeError` crash and bounds memory; proxy stream ids are `token_urlsafe(16)` |
-| 17 | Error steps use `Journey.check` (continue after failure) | stop at first failure | One run reports every divergence |
+| 17 | Error cases are separate steps and fail fast like the rest of the journey | add a non-raising recorder | `check`/`step` raise `StepFailed` today; consistency over a new mechanism |
+| 18 | Fix F6a in the relay: drop the stream on `tcp_connect_result success:false` | weaken the `active_streams` assertion | Real leak: 120 s phantom streams after every failed connect; fix is a few lines and makes `/status` honest |
+| 19 | Fix F6b in the agent: one bounded (10 s) resolution, validate all answers, connect to the validated IPs in order, keep hostname for logs | keep validate-then-resolve | Closes a DNS-rebinding bypass of the always-blocked ranges and makes DNS failures deterministic; magic/plugin hosts never resolve so are unaffected |
+| 20 | Matrix covers each failure on all three front ends, parametrised by a helper | narrow Goal 1 | Goal 1 stays true; helper keeps the code compact |
+| 21 | Guard legacy and `remote_exec` JSON parsing too; legacy test optional | relay/agent/proxy only | Shipped code paths with the same crash; remote_exec gets 400 instead of 500 |
+| 22 | `missing_service` is a unit test, not a journey step | journey step | The name is not magic, so the journey would test plain DNS |
+| 23 | Floors use `floor(measured)` | measured minus 1 | Matches `coverage_report.py:41` |
+| 24 | Windows-only internals (DPAPI, `SendInput`, legacy) listed as uncovered | claim journey coverage | Nothing in CI exercises them; follow-up Windows unit job |
