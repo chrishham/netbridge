@@ -124,7 +124,17 @@ round trip; `_wait_stream_end(sock, timeout)` returns how long it took until
 `_wait_traffic(timeout)` repeats the SOCKS GET until it succeeds (the loop
 from `_reconnect`, extracted and reused there).
 
-In order (each step's timeout is a promise, chosen from the facts above with
+Rules for every fault step:
+
+- Before injecting, assert the targeted link has at least one active
+  connection (`link.active() >= 1`), and assert the injection affected at
+  least one connection (`cut()`/`blackhole()` return value ≥ 1) — otherwise a
+  spontaneous earlier disconnect could make the checks pass vacuously.
+- The fault time `t0` is recorded once at injection; every deadline of that
+  fault (stream end, recovery, log line) is measured from `t0`, not from the
+  start of its own step.
+
+In order (each deadline is a promise, chosen from the facts above with
 margin):
 
 1. **`agent_cut_ends_streams`** — open an echo stream, `agent_link.cut()`;
@@ -137,9 +147,13 @@ margin):
    `RELAY_SESSION` line after the cut.
 5. **`agent_blackhole_detected`** — open an echo stream,
    `agent_link.blackhole()`; the stream must end within 45 s (relay ping
-   timeout → `agent_disconnected`) and traffic must flow again within 75 s
-   (client ping timeout ~15 s + reconnect delay ≤ 20 s through a fresh,
-   unaffected connection).
+   timeout → `agent_disconnected`). While the link is still blackholed, a new
+   SOCKS CONNECT issued right after `t0` must not hang: it must return an
+   error reply within 30 s of `t0` (fail-fast starts once the relay detects
+   the dead agent, ~15–16 s, and the relay's `tcp_close` fails the pending
+   connect — see §4). Traffic must flow again within 75 s of `t0` (client
+   ping timeout ~15 s + reconnect delay ≤ 20 s through a fresh, unaffected
+   connection).
 6. **`relay_unreachable_fails_fast`** — `refuse(True)` on both links, then
    `cut()` both. Within 20 s a SOCKS connect must fail with a `ProxyError`
    (not succeed, not hang); every attempt must return within 10 s. Then
@@ -174,14 +188,22 @@ its own commit:
    a second agent for the same user replaces the first, the old handler's
    `finally` removes every stream of that user and notifies
    `agent_disconnected`, including streams created through the new agent.
-   Fix: the old handler only performs the user-wide stream cleanup and
-   unregistration if it is still the registered agent for that user
-   (`bridge_agents.get(user) is ws`); otherwise it only closes itself.
+   Fix: each stream records the agent websocket it was routed to
+   (`agent_ws`, set in `tcp_connect` from `bridge_agents[user]`). A closing
+   agent handler closes and notifies (`agent_disconnected`) only the streams
+   whose `agent_ws` is itself — so the old agent's streams end promptly and
+   the new agent's survive — and unregisters `bridge_agents[user]` only if it
+   still points at itself.
 3. **Stale-stream sweep can close a stream that just became active**
    (relay). `cleanup_stale_streams` collects stale ids under the lock,
    releases it, then removes them without re-checking `last_activity`. Fix:
    re-check staleness under the lock at removal time and skip streams that
    saw traffic in between.
+
+Related to bug 1: a `tcp_close` from the relay for a stream whose connect
+is still pending must also fail that connect at once (same `ConnectionError`
+path), so a CONNECT routed to an agent that then dies is answered as soon as
+the relay notices, not after the proxy's 30 s connect timeout.
 
 If implementation shows a finding is not a real defect, the test that proves
 it stays and the fix is dropped, with the reason in the final report.
@@ -221,8 +243,8 @@ Fakes live next to the tests that use them; no real timers (patch
   - reconnect after `fail_times=N` failed handshakes, delays within the
     jittered bounds.
 - **e2e driver** (`e2e/tests/test_faultproxy.py`): pass-through round trip;
-  `cut()` makes both peers see the connection end (reset) and returns the
-  count; `blackhole()` keeps the sockets open while dropping bytes, and new
+  `cut()` makes both peers see the connection end (EOF or a socket error,
+  within 1 s) and returns the count; `blackhole()` keeps the sockets open while dropping bytes, and new
   connections pass; `refuse(True)` closes new connections immediately,
   `refuse(False)` restores; upstream down → client connection closed;
   `close()` idempotent and leaves no threads.
