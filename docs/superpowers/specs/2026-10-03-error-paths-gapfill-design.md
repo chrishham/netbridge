@@ -156,6 +156,16 @@ call `.get` the same way; `remote_exec` `/exec` and `/exec/stream` call
 `await request.json()` then `.get` (`remote_exec.py:183, 236`), so a valid
 scalar/array body yields a logged traceback and HTTP 500.
 
+### F6d. Shutdown race in `NetBridgeApp` (product bug)
+
+`_async_main` creates `self._stop_event` and waits on it (`app.py:722, 751`).
+`_run_agent` then **replaces** `self._stop_event` with a new `asyncio.Event`
+for each connection (`app.py:671`), and `request_exit()` sets whatever
+`self._stop_event` is at that moment (`app.py:540`). After the agent task has
+started, Exit signals the replacement, `_async_main` keeps waiting on the
+original, and the application does not shut down (the same applies to
+`_check_pending_requests` disconnect, which stops the connection, not the app).
+
 ### F6. Agent unit-test gaps
 
 | File | Stmts | Cov today | Nature |
@@ -175,7 +185,7 @@ scalar/array body yields a logged traceback and HTTP 500.
    that one bad plugin does not break the rest.
 3. Fix test-first: F4/F6c (non-object JSON: relay, agent, proxy, legacy,
    remote_exec), F6a (failed connect leaks the relay stream), F6b (single,
-   bounded DNS resolution in the agent).
+   bounded DNS resolution in the agent), F6d (app shutdown race).
 4. Agent unit tests for `app.py` (headless part), `credstore.py`,
    `keepalive.py`, `auth.py` re-exports; relay tests for the agent message loop.
 5. Migrate to `web.AppKey` (relay, agent), drop the warning filter.
@@ -241,7 +251,7 @@ Steps use the journey's normal `check`, which fails fast like the rest of the
 journey: a failing case ends the run.
 
 The agent's `Service H is not available` branch (`agent.py:438-459`, a registered
-magic hostname without an app) is **not** a journey step: `netbridge-e2e-missing`
+magic hostname whose app has no port) is **not** a journey step: `netbridge-e2e-missing`
 is not a magic hostname (`intercept.py:22-28`), so it would go to plain DNS. It
 is covered by an agent unit test (section 5).
 
@@ -303,7 +313,7 @@ def _parse_message(raw: str, who: str) -> dict | None:
 Used at the two loops (`__main__.py:613`, `:934`). Behaviour: invalid JSON
 keeps today's "Invalid JSON from ..." warning; a valid non-object logs
 `Ignoring non-object JSON message from <who>` (warning, no traceback) and the
-loop continues. The `stream_id` handled by `_handle_tcp_connect`,
+loop continues. `validate_tcp_connect_params` (`__main__.py:72`) accepts `True`/`False` as a port because `bool` is an `int`; it now requires `type(port) is int` (tests: `true`, `false`, plus existing out-of-range cases). The `stream_id` handled by `_handle_tcp_connect`,
 `_handle_tcp_data`, `_handle_tcp_close`, and the agent branch must be a
 `str` of at most 128 characters: anything else is treated as a missing
 `stream_id` (tcp_connect answers `tcp_connect_result success:false` with
@@ -323,6 +333,19 @@ only; the test is not required for legacy). `remote_exec` `/exec` and
 required"}` and no traceback, with unit tests for both routes (`[1]`, `"x"`,
 `null`, `42`).
 
+### 3c. App shutdown race (F6d)
+
+`NetBridgeApp` gets a separate app-lifetime event, `self._shutdown_event`,
+created once in `_async_main` and awaited there instead of `_stop_event`.
+`request_exit()` sets `_shutdown_event` (via `call_soon_threadsafe` as today)
+**and** the current per-connection `_stop_event` so an active agent stops;
+`_run_agent` keeps creating a fresh per-connection `_stop_event`. Disconnect
+from the tray keeps signalling only the per-connection event. Test
+(`test_app.py`): start `_async_main` with a fake `run_agent` that blocks on its
+stop event; after the agent has started (event replaced), `request_exit()` ends
+`_async_main` within a short timeout, the fake agent is stopped, and the
+intercept server is stopped; disconnect still leaves the app running.
+
 ### 3-bis. Field-type validation at every receiver
 
 Beyond "top-level is an object" and `stream_id` being a bounded `str`, each
@@ -330,11 +353,17 @@ receiver validates the fields it uses. A bad message is warned and dropped
 (the stream is closed when that is the natural reaction, e.g. undecodable data
 for a live stream); the receive loop never dies.
 
+- **`stream_id` everywhere:** every receiver (relay both loops, agent
+  `handle_tcp_data`/`handle_tcp_close`/`handle_tcp_connect` at `agent.py:570`
+  etc., proxy `_handle_message` at `tunnel.py:893`) requires a non-empty `str`
+  of at most 128 characters; anything else (null, list, overlong, empty) is
+  warned and dropped before it is used as a key.
 - **Relay** (both loops): `tcp_data.data` must be `str`, else dropped and not
   forwarded (`__main__.py:623, 817`); `tcp_connect_result.success` must be
   `bool` and `error` `str | None`, else the result is dropped with a warning
   (the tunnel client then times out on its own side; an agent that sends garbage
-  results is misbehaving).
+  results is misbehaving). `success:false` with `error` null or non-str is
+  valid and forwarded; the relay does not interpret `error`.
 - **Agent** (`handle_tcp_data`, `agent.py:570`): `data` must be `str`
   (`len(None)` crashes before any size guard today); otherwise warn, close the
   stream, return. Invalid base64 is handled the same way.
@@ -343,9 +372,20 @@ for a live stream); the receive loop never dies.
   (`handler.close()`, release the semaphore); an uncaught `b64decode` error
   no longer ends the receive loop. `tcp_connect_result` is checked the same
   way as in the relay (`success` bool, `error` str or None); an invalid result
-  fails that connect with `ConnectionError("Invalid connect result")`.
+  fails that connect with `ConnectionError("Invalid connect result")`. For
+  `success:false` the proxy normalises a missing/None/non-str `error` to
+  `"Unknown error"` before `classify_connect_error` (which calls `.lower()`,
+  `tunnel.py:136`) and `TunnelConnectError` (`tunnel.py:742`), so the front
+  ends still answer the pinned 0x04 / 502.
+- **Invalid JSON syntax:** the proxy's receive loop (`tunnel.py:867`) calls
+  `_json_loads` unguarded, so one malformed frame (`orjson` or `json` decode
+  error, a `ValueError`) ends the loop. It now catches `ValueError` per frame,
+  warns and continues. Checked the others: relay loops (`__main__.py:613,
+  934`) and the agent (`agent.py:610, 731, 769`) already catch
+  `json.JSONDecodeError` per frame and continue, so they need no change for
+  syntax errors (only for non-objects, above).
 
-Tests, bidirectional: relay `test_relay_malformed.py` (tcp_data with
+Tests, bidirectional (every case also covers `stream_id` null, a list and a 129-character value, and `success:false` with `error: null`; proxy additionally malformed JSON syntax followed by a valid message that is still processed): relay `test_relay_malformed.py` (tcp_data with
 `None`/int/list data both directions, results with non-bool `success`,
 non-str `error`: dropped, connection stays up, next valid message works);
 `netbridge-agent/tests/test_agent_malformed.py` (`tcp_data` with
@@ -465,8 +505,11 @@ from `tray.py` with a guarded import, and tests never create a `TrayIcon`.
   call are asserted; `session_keepalive_loop` with `KEEPALIVE_INTERVAL`
   patched to 0.01 s: sets state on start, jiggles, warns when `SendInput`
   fails, clears state and stops on `stop_event`, clears state when cancelled.
-- `tests/test_agent.py` addition: `handle_tcp_connect` for a registered magic
-  hostname whose app is unregistered answers `Service H is not available`;
+- `tests/test_agent.py` addition: `handle_tcp_connect` for the permanently magic
+  host `netbridge-exec` with an intercept server whose `port_for` returns None
+  answers `Service netbridge-exec is not available` (a dynamic plugin host stops
+  being magic once unregistered, `intercept.py:73`, so it cannot be used; or
+  `is_magic_hostname` is mocked explicitly);
   not configured / not running branches (`agent.py:438-459`).
 - `tests/test_remote_exec.py` additions: non-object bodies on `/exec` and
   `/exec/stream` give 400 JSON, no traceback.
@@ -606,4 +649,7 @@ lines (it forces the guards and `AppKey` lines to be tested).
 | 21 | Guard legacy and `remote_exec` JSON parsing too; legacy test optional | relay/agent/proxy only | Shipped code paths with the same crash; remote_exec gets 400 instead of 500 |
 | 22 | `missing_service` is a unit test, not a journey step | journey step | The name is not magic, so the journey would test plain DNS |
 | 23 | Floors use `floor(measured)` | measured minus 1 | Matches `coverage_report.py:41` |
+| 25 | Fix F6d: separate app-shutdown event from the per-connection stop event | stop replacing `_stop_event` | Exit after the agent started is silently ignored today; a dedicated event keeps disconnect semantics intact |
+| 26 | `stream_id` (non-empty str, <= 128) and field types validated at every receiver; proxy normalises `error` and survives bad JSON syntax | relay-only checks | One bad frame must never end a receive loop or change the pinned 0x04/502 |
+| 27 | `validate_tcp_connect_params` uses `type(port) is int` | `isinstance` | `bool` is an `int` subclass |
 | 24 | Windows-only internals (DPAPI, `SendInput`, legacy) listed as uncovered | claim journey coverage | Nothing in CI exercises them; follow-up Windows unit job |
