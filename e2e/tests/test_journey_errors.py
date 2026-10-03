@@ -173,7 +173,8 @@ def test_errors_group_runs_all_steps_in_order(j, monkeypatch, clock):
         "errors_baseline_clean", "refused_socks5", "refused_http_connect", "refused_http_forward",
         "dns_failure_socks5", "dns_failure_http_connect", "dns_failure_http_forward",
         "agent_denies_socks5", "agent_denies_http_connect", "agent_denies_http_forward",
-        "blocked_port_http_connect", "blocked_port_http_forward", "errors_leave_tunnel_healthy"]
+        "blocked_port_http_connect", "blocked_port_http_forward", "errors_leave_tunnel_healthy",
+        "blocked_port_never_reached_agent"]
     assert all(r["ok"] for r in j.results)
 
 
@@ -375,3 +376,31 @@ def test_plugins_listed_fails_when_the_broken_plugin_is_listed(j, monkeypatch):
     with pytest.raises(journey.StepFailed):
         j._plugins(agent, start, NONCE)
     assert j.results[-1]["step"] == "plugins_listed"
+
+
+def test_late_agent_connect_to_the_blocked_port_fails_the_sweep(j, monkeypatch, clock):
+    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    calls = []
+    base = j._wait_streams_zero
+
+    def late(*a, **k):
+        calls.append(1)
+        if len(calls) == 2:   # the healthy check, after every blocked case has passed
+            agent.logs.lines.append(f"Connected: s -> 10.0.0.1:{TARGETS.blocked_port}")
+        return base(*a, **k)
+
+    monkeypatch.setattr(j, "_wait_streams_zero", late)
+    assert _steps_failing(j, relay, agent) == "blocked_port_never_reached_agent"
+
+
+def test_fail_case_late_answer_counts_as_hang(j, monkeypatch):
+    t = [0.0]
+    monkeypatch.setattr(journey.time, "monotonic", lambda: t[0])
+
+    def slow(*a, **k):
+        t[0] += 10          # the reply arrives after the budget
+        raise clients.ProxyError(4, "late")
+
+    monkeypatch.setattr(journey.clients, "socks5_connect", slow)
+    got, secs = j._fail_case("socks5", HOST, 80, 5)
+    assert got == "hang" and secs == 10

@@ -424,6 +424,14 @@ class Journey:
 
         self.check("errors_leave_tunnel_healthy", healthy)
 
+        def never_reached():
+            # Per-case checks watch the agent log for a second; this one looks at the whole run so far,
+            # long after the blocked attempts, so a late forward past the relay filter still fails.
+            hit = agent.logs.wait_for(rf"Connected: .* -> .*:{targets.blocked_port}\b", 0)
+            return hit is None, f"agent connected to the blocked port: {hit.group(0) if hit else 'never'}"
+
+        self.check("blocked_port_never_reached_agent", never_reached)
+
     # --- auth ----------------------------------------------------------------
 
     def _relay_auth_on(self, relay: Relay, stub: AuthStub) -> tuple[bool, str]:
@@ -660,11 +668,11 @@ class Journey:
         def run():
             try:
                 if front_end == "socks5":
-                    clients.socks5_connect(self.socks, host, port, timeout=budget + 2).close()
+                    clients.socks5_connect(self.socks, host, port, timeout=budget).close()
                 elif front_end == "http_connect":
-                    clients.http_connect(self.http, host, port, timeout=budget + 2).close()
+                    clients.http_connect(self.http, host, port, timeout=budget).close()
                 else:
-                    out["r"], _ = clients.http_forward_get(self.http, f"http://{host}:{port}/", timeout=budget + 2)
+                    out["r"], _ = clients.http_forward_get(self.http, f"http://{host}:{port}/", timeout=budget)
                     return
                 out["r"] = "ok"
             except clients.ProxyError as e:
@@ -677,7 +685,10 @@ class Journey:
         worker = threading.Thread(target=run, daemon=True)
         worker.start()
         worker.join(budget)
-        return out.get("r", "hang"), time.monotonic() - start
+        secs = time.monotonic() - start
+        if worker.is_alive() or secs > budget:   # a late answer does not count; the daemon thread is abandoned
+            return "hang", secs
+        return out.get("r", "hang"), secs
 
     def _wait_streams_zero(self, relay, within: float, stable: int = 2) -> tuple[bool, str]:
         deadline = time.monotonic() + within

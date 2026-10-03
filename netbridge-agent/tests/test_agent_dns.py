@@ -232,3 +232,28 @@ async def test_cancel_between_connect_and_registration_closes_the_writer(monkeyp
     assert task.cancelled()
     writer.close.assert_called()
     assert state.active_streams == {} and state.pending_connections == {}
+
+
+async def test_duplicate_stream_id_is_ignored_while_the_first_is_tracked(monkeypatch):
+    gate, lookups = asyncio.Event(), []
+
+    async def blocked(self, host, port, **kw):
+        lookups.append(host)
+        await gate.wait()
+        return _infos("8.8.8.8")
+
+    monkeypatch.setattr(asyncio.get_running_loop().__class__, "getaddrinfo", blocked)
+    state, ws = AgentState(), _ws()
+    await handle_message(state, ws, _connect("A", "slow.test"))
+    first = state.pending_connections["A"]
+    for _ in range(5):
+        await handle_message(state, ws, _connect("A", "slow.test"))
+    assert state.pending_connections["A"] is first
+    await asyncio.sleep(0)
+    assert lookups == ["slow.test"]
+    state.active_streams["B"] = MagicMock()
+    await handle_message(state, ws, _connect("B", "slow.test"))
+    assert "B" not in state.pending_connections
+    await handle_message(state, ws, json.dumps({"type": "tcp_close", "stream_id": "A"}))
+    assert first.cancelled() and state.pending_connections == {}
+    ws.send_str.assert_not_awaited()

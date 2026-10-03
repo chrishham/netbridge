@@ -732,6 +732,12 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             }, silent=True)
             logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {e}")
 
+    # No await between this check and the registration below, so it is atomic
+    # on the loop; a reused id would orphan the first task and its socket.
+    if stream_id in state.pending_connections or stream_id in state.active_streams:
+        logger.warning(f"tcp_connect {stream_id[:8]}: stream id already in use, ignoring")
+        return
+
     task = asyncio.create_task(do_connect())
     # Register synchronously so the task is in the table before it can
     # finish; the done callback also covers a task cancelled before its
