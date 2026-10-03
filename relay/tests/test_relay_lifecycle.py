@@ -136,6 +136,36 @@ async def hold_cleanup(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_disconnect_closes_its_streams(client):
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "s1")
+
+    await agent.close()
+
+    msg = await tunnel.expect("tcp_close", stream_id="s1")
+    assert msg["reason"] == "agent_disconnected"
+    assert "s1" not in mod.tcp_streams
+    status = await (await client.get("/status")).json()
+    assert status["agents"] == 0
+    await tunnel.close()
+
+
+@pytest.mark.asyncio
+async def test_tunnel_disconnect_notifies_agent(client):
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "s1")
+
+    await tunnel.close()
+
+    msg = await agent.expect("tcp_close", stream_id="s1")
+    assert msg["reason"] == "tunnel_client_disconnected"
+    assert mod.tcp_streams == {}
+    await agent.close()
+
+
+@pytest.mark.asyncio
 async def test_replacement_keeps_new_agent_and_its_streams(client, hold_cleanup):
     agent_a, ws_a = await connect_agent(client)
     entered, release, done = hold_cleanup(ws_a)
@@ -182,6 +212,24 @@ async def test_old_stream_data_not_forwarded_to_replacement(client, hold_cleanup
     assert all(m.get("stream_id") != "s1" for m in agent_b.seen)
     await tunnel.close()
     await agent_b.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_closes_idle_streams_only(fast_sweep, client):
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "idle")
+    await open_stream(tunnel, agent, "fresh")
+    mod.tcp_streams["idle"]["last_activity"] = time.monotonic() - 100
+
+    for peer in (tunnel, agent):
+        await peer.expect("tcp_close", stream_id="idle", reason="idle_timeout")
+    assert "idle" not in mod.tcp_streams
+    assert "fresh" in mod.tcp_streams
+    assert all(m.get("stream_id") != "fresh" for m in tunnel.seen + agent.seen
+               if m["type"] == "tcp_close")
+    await tunnel.close()
+    await agent.close()
 
 
 @pytest.mark.asyncio
