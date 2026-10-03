@@ -255,7 +255,7 @@ async def test_strict_fails_on_a_non_critical_failure_default_does_not(relay, ca
     fake = await relay(leak=True)
     assert await ps.main([fake.url, "--token", GOOD, "--strict"]) == 1
     out = capsys.readouterr().out
-    assert "Passed: 11" in out and "Failed: 1" in out
+    assert "Passed: 10" in out and "Failed: 1" in out
 
 
 async def test_strict_passes_on_a_clean_relay(relay, capsys):
@@ -312,3 +312,30 @@ async def test_rate_limiting_without_token_is_a_skip(relay):
     fake = await relay()
     result = await ps.PenTestSuite(fake.url).test_rapid_connection_dos()
     assert result.severity == "SKIP"
+
+
+def test_empty_token_is_an_argparse_error(capsys):
+    with pytest.raises(SystemExit):
+        ps.parse_args(["ws://127.0.0.1:1", "--token", ""])
+    assert "--token is empty" in capsys.readouterr().err
+
+
+async def test_status_check_fails_when_status_is_unreadable():
+    result = await ps.PenTestSuite(dead_url()).test_health_endpoint()
+    assert not result.passed and "nothing checked" in result.details
+
+
+async def test_stream_id_enumeration_is_reported_as_a_skip():
+    result = await ps.PenTestSuite(dead_url()).test_stream_id_enumeration()
+    assert result.severity == "SKIP"
+
+
+@pytest.mark.parametrize("text, ok", [
+    ('{"type": "error", "error": "Message too large"}', True),
+    ('{"accepted": true, "error": null}', False),
+    ('{"success": true, "error": "x"}', False),
+    ('"error"', False),
+    ("not json error", False),
+])
+def test_is_error_reply(text, ok):
+    assert ps._is_error_reply(text) is ok
