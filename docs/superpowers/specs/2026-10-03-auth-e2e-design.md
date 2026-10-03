@@ -200,6 +200,9 @@ same connection. Then, as a control, a
   properly; the journey runs the file directly.
 - `test_large_payload_dos` must observe a rejection (close or explicit error
   within its timeout); silence is a failure.
+- `test_host_port_injection` and `test_invalid_message_types` must observe
+  explicit rejections (or proven connection health); timeouts and arbitrary
+  exceptions are failures.
 - Journey step after `auth_user_isolation`: run
   `uv run --project security-tests python security-tests/pentest_suite.py
   ws://127.0.0.1:<relay> --token <stub.mint(upn="pentest@netbridge.test")>
@@ -229,6 +232,11 @@ same connection. Then, as a control, a
   token signed by B is accepted after exactly one more fetch, and a token
   signed by A afterwards is rejected; `NETBRIDGE_ALLOWED_USERS` (upn and oid) and
   `NETBRIDGE_ALLOWED_GROUPS` allow/deny.
+- **agent product bug** (found by the plan review): `TokenHolder.refresh()`
+  resets the failure counter on every successful refresh, so after a 401 the
+  agent refreshes, the count goes back to 0, and three consecutive relay
+  rejections never stop it. Fixed test-first: only a successful relay
+  registration resets the counter.
 - **agent** (`netbridge-agent/tests/test_agent_auth.py`): `run_agent` with a
   faked `connect_and_run` raising `WSServerHandshakeError(401)`: token
   refreshed and retried; three consecutive 401s → stops with
