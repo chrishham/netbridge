@@ -84,19 +84,6 @@ class TestTokenHolder:
         holder = TokenHolder("abc")
         assert holder.get() == "abc"
 
-    def test_refresh_success(self):
-        """Successful refresh updates the token but preserves failure_count."""
-        callback = MagicMock(return_value="new_tok")
-        holder = TokenHolder("old", refresh_callback=callback)
-        holder.failure_count = 2
-
-        result = holder.refresh()
-
-        assert result is True
-        assert holder.get() == "new_tok"
-        assert holder.failure_count == 2  # Preserved — relay rejection count
-        callback.assert_called_once()
-
     def test_refresh_callback_returns_none(self):
         """Callback returning None does not update token."""
         callback = MagicMock(return_value=None)

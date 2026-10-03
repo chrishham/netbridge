@@ -94,6 +94,7 @@ class TestReconnectLoop:
 
         assert seen == ["tok0", "tok1", "tok2"]
         assert tm._permanent_failure
+        assert caplog.text.count("Token refreshed successfully") == 2
         assert "3 consecutive auth failures. Giving up." in caplog.text
         assert any(c.kwargs.get("auth_required") for c in on_status.call_args_list)
 

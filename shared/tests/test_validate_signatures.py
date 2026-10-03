@@ -260,9 +260,11 @@ async def test_key_rotation_via_real_get_jwks(reset_caches):
             # Token A should now fail (key no longer served)
             with pytest.raises(TokenValidationError, match="Signing key not found"):
                 await validate_arm_token(token_a)
+            assert len(requests) == 3  # one refetch for the unknown kid, then give up
 
     finally:
         server.shutdown()
+        server.server_close()
 
 
 @pytest.mark.asyncio
@@ -353,6 +355,10 @@ async def test_allowed_users_by_oid(reset_caches, monkeypatch):
     with patch("shared_auth.validate._get_jwks", return_value=jwks):
         user = await validate_arm_token(token)
         assert user == "user@example.com"
+
+        other = _sign_jwt(private_key, header, _make_valid_claims(upn="user@example.com", oid="oid-999"))
+        with pytest.raises(TokenValidationError, match="not in the allowed users list"):
+            await validate_arm_token(other)
 
 
 @pytest.mark.asyncio
