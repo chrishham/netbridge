@@ -73,7 +73,8 @@ class Relay:
         if auth:
             self._env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(RELAYSITE_DIR), env.get("PYTHONPATH")]))
             # the key stub is on loopback: an inherited HTTP_PROXY must not swallow the relay's key fetch
-            for var in ("NO_PROXY", "no_proxy"):
+            # Windows env names are case-insensitive: setting both would duplicate the variable
+            for var in ("NO_PROXY",) if os.name == "nt" else ("NO_PROXY", "no_proxy"):
                 self._env[var] = ",".join(filter(None, ["127.0.0.1,localhost", env.get(var)]))
         self._container = f"netbridge-e2e-relay-{port}"
         self._runs = 0

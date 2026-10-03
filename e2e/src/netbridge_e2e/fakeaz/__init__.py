@@ -1,7 +1,6 @@
 """Fake Azure CLI put first on PATH for the binaries under test.
 
-The relay runs with --no-auth and ignores the bearer token, but the agent
-and proxy still run their real auth path: `az account show`, then
+The agent and proxy run their real auth path: `az account show`, then
 `az account get-access-token` via a subprocess, then a local check of the
 token's `exp` claim. This fake answers both.
 

@@ -24,7 +24,7 @@ if _url:
     parts = urlsplit(_url)
     tenant = parts.path.strip("/").split("/")[0]
     if not _loopback(parts.hostname):
-        print(f"E2E: refusing to redirect the relay key URL to non-loopback {_url}", file=sys.stderr)
+        print(f"E2E: refusing to redirect the relay key URL to non-loopback {_url}", file=sys.stderr, flush=True)
     else:
         from shared_auth import validate
 

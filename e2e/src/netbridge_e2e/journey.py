@@ -169,7 +169,7 @@ class Journey:
         self.cleanups.append(relay.stop)
         relay.start()
         ready = relay.wait_ready(180)
-        ok, detail = self._relay_auth_on(relay) if ready else (False, "not ready")
+        ok, detail = self._relay_auth_on(relay, stub) if ready else (False, "not ready")
         self.step("relay_up", ok, f"{relay.url}; {detail}{'' if relay.alive() else ' ' + relay.logs.tail()}")
         self.check("auth_matrix", lambda: self._auth_matrix(relay, stub))
 
@@ -318,8 +318,8 @@ class Journey:
 
     # --- auth ----------------------------------------------------------------
 
-    def _relay_auth_on(self, relay: Relay) -> tuple[bool, str]:
-        redirected = relay.logs.wait_for(REDIRECTED + r"\S+", 10)
+    def _relay_auth_on(self, relay: Relay, stub: AuthStub) -> tuple[bool, str]:
+        redirected = relay.logs.wait_for(REDIRECTED + re.escape(stub.jwks_url) + r"(?!\S)", 10)
         auth_required = (relay.status() or {}).get("auth_required")
         ok = redirected is not None and auth_required is True
         return ok, f"{redirected.group(0) if redirected else 'no key-URL redirect logged'}; auth_required={auth_required}"
@@ -350,8 +350,11 @@ class Journey:
         for path in ("/ws", "/tunnel"):
             for case, token, reason in cases:
                 fetched = stub.requests()
-                status, body = clients.ws_upgrade("127.0.0.1", relay.port, path, token)
                 total += 1
+                try:
+                    status, body = clients.ws_upgrade("127.0.0.1", relay.port, path, token)
+                except OSError as e:
+                    status, body = None, f"{type(e).__name__}: {e}"
                 ok = status == 101 if reason is None else status == 401 and reason in body
                 if case == "wrong tenant" and stub.requests() != fetched:
                     ok, body = False, f"{body} (relay fetched keys for a rejected tenant)"

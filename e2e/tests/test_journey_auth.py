@@ -153,10 +153,37 @@ def test_auth_matrix_needs_both_rejection_log_lines(j, monkeypatch):
     ("E2E: relay key URL redirected to http://127.0.0.1:5/t/keys", None, False),
 ])
 def test_relay_auth_on_needs_redirect_and_auth_required(j, logs, status, ok):
-    got, detail = j._relay_auth_on(FakeRelay(logs, status))
+    stub = FakeStub()
+    stub.jwks_url = "http://127.0.0.1:5/t/keys"
+    got, detail = j._relay_auth_on(FakeRelay(logs, status), stub)
     assert got is ok
     assert "auth_required=" in detail
     assert ("http://127.0.0.1:5/t/keys" in detail) == bool(logs)
+
+
+@pytest.mark.parametrize("logged", ["http://127.0.0.1:6/t/keys", "http://127.0.0.1:5/t/keys2"])
+def test_relay_auth_on_needs_the_stub_url_exactly(j, logged):
+    stub = FakeStub()
+    stub.jwks_url = "http://127.0.0.1:5/t/keys"
+    got, _ = j._relay_auth_on(FakeRelay(f"E2E: relay key URL redirected to {logged}", {"auth_required": True}), stub)
+    assert got is False
+
+
+def test_auth_matrix_reports_a_connection_error_and_carries_on(j, monkeypatch):
+    stub = FakeStub()
+    upgrade, calls = fake_relay_auth(stub)
+
+    def flaky(host, port, path, token):
+        if token is None and path == "/ws":
+            upgrade(host, port, path, token)
+            raise ConnectionResetError("reset by peer")
+        return upgrade(host, port, path, token)
+
+    monkeypatch.setattr(clients, "ws_upgrade", flaky)
+    ok, detail = j._auth_matrix(FakeRelay(REJECTED_LOGS), stub)
+    assert not ok
+    assert "none /ws: HTTP None 'ConnectionResetError: reset by peer'" in detail
+    assert len(calls) == 2 * len(CASES)
 
 
 class FakeWs:
