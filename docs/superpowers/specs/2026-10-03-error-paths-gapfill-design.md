@@ -240,8 +240,11 @@ agent log `Destination denied` and **no** relay `Blocked port` since the mark;
 port block: relay `Blocked port` since the mark.
 
 `errors_leave_tunnel_healthy` runs last: a `socks5_http` round trip succeeds
-and relay `/status` `active_streams` returns to the baseline taken before the
-group within 5 s. It depends on the relay fix F6a (without it the phantom
+and relay `/status` `active_streams` eventually returns to 0 (polled for up to 5 s,
+after the health probe has closed its socket). Before the error group starts, the journey polls relay `/status` until
+`active_streams == 0` holds on two consecutive reads, within 10 s (on timeout it
+fails and reports the last value); 0 is then the baseline, not a snapshot that
+might include a stream still closing. The final step depends on the relay fix F6a (without it the phantom
 streams stay for 120 s); that is the point of the step.
 
 Every step prints reply, seconds and evidence, and fails on `"hang"`. The step
@@ -321,7 +324,7 @@ loop continues. `validate_tcp_connect_params` (`__main__.py:72`) accepts `True`/
 a warning), never used as a dict key. Same for `host`/`port` types, already
 covered by `validate_tcp_connect_params`.
 
-Agent (`agent.py:610, 731, 769`) and proxy (`tunnel.py:867`) get the same
+Agent (`agent.py:610`, the loop at `:769`, and the registration frame at `:731`) and proxy (`tunnel.py:867`) get the same
 guard (`isinstance(data, dict)` else warn and skip); no shared helper, so
 `shared_auth` (a non-editable path dependency) is untouched.
 
@@ -409,9 +412,20 @@ for a live stream); the receive loop never dies.
   `_json_loads` unguarded, so one malformed frame (`orjson` or `json` decode
   error, a `ValueError`) ends the loop. It now catches `ValueError` per frame,
   warns and continues. Checked the others: relay loops (`__main__.py:613,
-  934`) and the agent (`agent.py:610, 731, 769`) already catch
-  `json.JSONDecodeError` per frame and continue, so they need no change for
-  syntax errors (only for non-objects, above).
+  934`) and the agent's `handle_message` (`agent.py:610`) and receive loop
+  (`:769`) already catch `json.JSONDecodeError` per frame and continue, so they
+  need no change for syntax errors (only for non-objects, above). The agent's
+  **registration frame is the exception**: `agent.py:727-731` parses the first
+  frame inside a `try` that catches only `asyncio.TimeoutError`, so a malformed
+  or non-object first frame unwinds with a traceback. The parse gets syntax
+  and object validation; on a malformed or non-object first frame the agent
+  logs a warning and returns `(False, 0.0)` (the same clean end-of-session
+  result as an unexpected first message at `agent.py:743`), so the normal
+  reconnect path runs. It is not an auth failure (no 401/403 handling, the
+  failure counter is untouched). Test: `test_agent_malformed.py` feeds a
+  fake websocket whose first frame is invalid JSON, then `[1]`, then `null`:
+  each ends the session with `(False, 0.0)`, logs the warning, raises nothing and
+  does not call the auth-failure callback.
 
 Tests, bidirectional (every case also covers `stream_id` null, a list and a 129-character value, and a `success:false` result with `error: null` (relay: dropped; proxy fed directly: normalised to `Unknown error`, connect still ends in the pinned 0x04); proxy additionally malformed JSON syntax followed by a valid message that is still processed): relay `test_relay_malformed.py` (tcp_data with
 `None`/int/list data both directions, results with non-bool `success`,
