@@ -640,75 +640,72 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
                     )
                     continue
 
-                try:
-                    response = _parse_message(msg.data, f"agent {user_email}")
-                    if response is None:
+                response = _parse_message(msg.data, f"agent {user_email}")
+                if response is None:
+                    continue
+                msg_type = response.get("type")
+
+                # Respond to heartbeat with ack (immune to proxy interference)
+                if msg_type == "heartbeat":
+                    await safe_ws_send(ws, json.dumps({"type": "heartbeat_ack"}))
+                    continue
+
+                if msg_type in ("tcp_connect_result", "tcp_data", "tcp_close"):
+                    # TCP tunnel message - forward to tunnel client
+                    stream_id = response.get("stream_id")
+                    if not _valid_stream_id(stream_id):
+                        logger.warning(f"Invalid stream_id from agent {user_email}")
                         continue
-                    msg_type = response.get("type")
-
-                    # Respond to heartbeat with ack (immune to proxy interference)
-                    if msg_type == "heartbeat":
-                        await safe_ws_send(ws, json.dumps({"type": "heartbeat_ack"}))
+                    if msg_type == "tcp_data" and not isinstance(response.get("data"), str):
+                        logger.warning(f"Invalid tcp_data payload from agent {user_email}")
+                        continue
+                    if msg_type == "tcp_connect_result" and not _valid_connect_result(response):
+                        logger.warning(
+                            f"Invalid tcp_connect_result from agent {user_email}"
+                        )
                         continue
 
-                    if msg_type in ("tcp_connect_result", "tcp_data", "tcp_close"):
-                        # TCP tunnel message - forward to tunnel client
-                        stream_id = response.get("stream_id")
-                        if not _valid_stream_id(stream_id):
-                            logger.warning(f"Invalid stream_id from agent {user_email}")
-                            continue
-                        if msg_type == "tcp_data" and not isinstance(response.get("data"), str):
-                            logger.warning(f"Invalid tcp_data payload from agent {user_email}")
-                            continue
-                        if msg_type == "tcp_connect_result" and not _valid_connect_result(response):
+                    # Get stream data under lock and update activity
+                    async with _state_lock:
+                        stream_data = tcp_streams.get(stream_id)
+                        # Verify stream ownership - agent can only
+                        # forward data for its own streams
+                        if stream_data and (
+                            stream_data.get("user_email") != user_email
+                            or stream_data.get("agent_ws") is not ws
+                        ):
                             logger.warning(
-                                f"Invalid tcp_connect_result from agent {user_email}"
+                                f"Stream {stream_id} ownership denied "
+                                f"for agent {user_email}"
                             )
-                            continue
+                            stream_data = None
+                        tunnel_ws = stream_data.get("tunnel_ws") if stream_data else None
+                        if stream_data and msg_type == "tcp_data":
+                            stream_data["last_activity"] = time.monotonic()
 
-                        # Get stream data under lock and update activity
-                        async with _state_lock:
-                            stream_data = tcp_streams.get(stream_id)
-                            # Verify stream ownership - agent can only
-                            # forward data for its own streams
-                            if stream_data and (
-                                stream_data.get("user_email") != user_email
-                                or stream_data.get("agent_ws") is not ws
-                            ):
-                                logger.warning(
-                                    f"Stream {stream_id} ownership denied "
-                                    f"for agent {user_email}"
-                                )
-                                stream_data = None
-                            tunnel_ws = stream_data.get("tunnel_ws") if stream_data else None
-                            if stream_data and msg_type == "tcp_data":
-                                stream_data["last_activity"] = time.monotonic()
-
-                        if tunnel_ws:
-                            # Apply global bandwidth limit if enabled
-                            if _global_bandwidth_limiter and msg_type == "tcp_data":
-                                await _global_bandwidth_limiter.acquire(
-                                    min(len(msg.data), _bytes_per_sec)
-                                )
-                            await safe_ws_send(tunnel_ws, msg.data)
-
-                            # Clean up closed streams and streams whose connect failed
-                            if msg_type == "tcp_close" or (
-                                msg_type == "tcp_connect_result"
-                                and response["success"] is False
-                            ):
-                                async with _state_lock:
-                                    tcp_streams.pop(stream_id, None)
-
-                    else:
-                        # Log unknown message types for debugging
-                        if msg_type and msg_type != "heartbeat":
-                            logger.warning(
-                                f"Unknown message type '{msg_type}' from agent {user_email}"
+                    if tunnel_ws:
+                        # Apply global bandwidth limit if enabled
+                        if _global_bandwidth_limiter and msg_type == "tcp_data":
+                            await _global_bandwidth_limiter.acquire(
+                                min(len(msg.data), _bytes_per_sec)
                             )
+                        await safe_ws_send(tunnel_ws, msg.data)
 
-                except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON from agent {user_email}")
+                        # Clean up closed streams and streams whose connect failed
+                        if msg_type == "tcp_close" or (
+                            msg_type == "tcp_connect_result"
+                            and response["success"] is False
+                        ):
+                            async with _state_lock:
+                                tcp_streams.pop(stream_id, None)
+
+                else:
+                    # Log unknown message types for debugging
+                    if msg_type and msg_type != "heartbeat":
+                        logger.warning(
+                            f"Unknown message type '{msg_type}' from agent {user_email}"
+                        )
+
             elif msg.type == WSMsgType.ERROR:
                 logger.error(f"WebSocket error from {user_email}: {ws.exception()}")
     finally:
@@ -998,25 +995,22 @@ async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
                     continue
                 await message_limiter.acquire()
 
-                try:
-                    data = _parse_message(msg.data, f"tunnel client {tunnel_key}")
-                    if data is None:
-                        continue
-                    msg_type = data.get("type")
+                data = _parse_message(msg.data, f"tunnel client {tunnel_key}")
+                if data is None:
+                    continue
+                msg_type = data.get("type")
 
-                    if msg_type == "tcp_connect":
-                        await _handle_tcp_connect(ws, data, tunnel_key, user_email, stream_limiter, msg.data)
-                    elif msg_type == "tcp_data":
-                        await _handle_tcp_data(data, tunnel_key, msg.data)
-                    elif msg_type == "tcp_close":
-                        await _handle_tcp_close(data, tunnel_key, msg.data)
-                    elif msg_type:
-                        logger.warning(
-                            f"Unknown message type '{msg_type}' from {tunnel_key}"
-                        )
+                if msg_type == "tcp_connect":
+                    await _handle_tcp_connect(ws, data, tunnel_key, user_email, stream_limiter, msg.data)
+                elif msg_type == "tcp_data":
+                    await _handle_tcp_data(data, tunnel_key, msg.data)
+                elif msg_type == "tcp_close":
+                    await _handle_tcp_close(data, tunnel_key, msg.data)
+                elif msg_type:
+                    logger.warning(
+                        f"Unknown message type '{msg_type}' from {tunnel_key}"
+                    )
 
-                except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON from tunnel client {tunnel_key}")
 
             elif msg.type == WSMsgType.ERROR:
                 logger.error(f"WebSocket error from tunnel client {tunnel_key}: {ws.exception()}")

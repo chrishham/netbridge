@@ -84,3 +84,33 @@ async def test_invalid_connect_results_are_dropped(client, fields):
     await agent.send(type="tcp_connect_result", stream_id="s1", success=True)
     good = await tunnel.expect("tcp_connect_result", stream_id="s1")
     assert good["success"] is True                   # the invalid ones were never forwarded
+
+
+@pytest.mark.parametrize("data", [None, 1, [1]])
+async def test_tunnel_tcp_data_with_non_str_data_is_not_forwarded(client, data, caplog):
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "s1")
+    await tunnel.send(type="tcp_data", stream_id="s1", data=data)
+    await tunnel.send(type="tcp_data", stream_id="s1", data="AA==")
+    got = await agent.expect("tcp_data", stream_id="s1")
+    assert got["data"] == "AA=="                     # only the valid frame arrived
+    assert [m["data"] for m in agent.seen if m.get("type") == "tcp_data"] == ["AA=="]
+    assert "Invalid tcp_data payload from tunnel client" in caplog.text
+    assert not tunnel.ws.closed
+    _no_traceback(caplog)
+
+
+@pytest.mark.parametrize("sid", [None, [1], "x" * 129])
+@pytest.mark.parametrize("type_", ["tcp_connect_result", "tcp_data", "tcp_close"])
+async def test_agent_bad_stream_id_is_dropped_and_loop_continues(client, sid, type_, caplog):
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "s1")
+    await agent.send(type=type_, stream_id=sid, success=True, data="AA==")
+    await agent.send(type="heartbeat")
+    await agent.expect("heartbeat_ack")
+    assert "Invalid stream_id from agent" in caplog.text
+    assert not [m for m in tunnel.seen if m.get("type") in ("tcp_connect_result", "tcp_data", "tcp_close")]
+    assert "s1" in mod.tcp_streams
+    _no_traceback(caplog)
