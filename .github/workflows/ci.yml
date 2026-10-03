@@ -178,6 +178,13 @@ jobs:
         run: >
           uv run --project e2e python -m netbridge_e2e --mode source
           --target-hostname netbridge-e2e-target --work "$RUNNER_TEMP/e2e"
+          --coverage "$RUNNER_TEMP/e2e/coverage"
+
+      - name: E2E coverage summary
+        if: always()
+        run: |
+          f="$RUNNER_TEMP/e2e/coverage/summary.md"
+          if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
 
       - uses: actions/upload-artifact@v7
         if: always()

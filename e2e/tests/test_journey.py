@@ -104,3 +104,57 @@ def test_install_failure_becomes_named_step(tmp_path):
     assert j.run() == 1
     assert j.results[-1]["step"] == "install_agent"
     assert "RuntimeError: existing installation" in j.results[-1]["detail"]
+
+
+def test_coverage_flag_parses_in_source_mode(tmp_path):
+    args = journey.parse_args(["--mode", "source", "--coverage", str(tmp_path / "cov")])
+    assert args.coverage == str(tmp_path / "cov")
+
+
+def test_coverage_flag_rejected_in_exe_mode(monkeypatch):
+    monkeypatch.setattr(journey, "IS_WINDOWS", True)
+    with pytest.raises(SystemExit):
+        journey.parse_args(["--mode", "exe", "--coverage", "x"])
+
+
+def test_summary_includes_coverage(tmp_path, monkeypatch):
+    args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
+    j = journey.Journey(args)
+    monkeypatch.setattr(j, "_journey", lambda: None)
+    monkeypatch.setattr(j.cov, "finalize", lambda: {"total": 12.5, "packages": {}, "warnings": []})
+    assert j.run() == 0
+    summary = json.loads((tmp_path / "e2e-summary.json").read_text())
+    assert summary["coverage"]["total"] == 12.5
+
+
+def test_coverage_prepare_failure_runs_uninstrumented(tmp_path, monkeypatch):
+    args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
+    j = journey.Journey(args)
+
+    def boom():
+        raise OSError("read-only")
+
+    monkeypatch.setattr(j.cov, "prepare", boom)
+    seen = {}
+
+    def first_step():  # the "network" step runs right after the coverage preamble
+        seen["cov"] = j.cov
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(journey.netinfo, "private_ipv4", first_step)
+    j.run()
+    assert seen["cov"] is None
+    summary = json.loads((tmp_path / "e2e-summary.json").read_text())
+    assert "coverage disabled" in summary["coverage"]["warnings"][0]
+
+
+def test_coverage_failure_never_changes_exit_code(tmp_path, monkeypatch):
+    args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
+    j = journey.Journey(args)
+    monkeypatch.setattr(j, "_journey", lambda: None)
+
+    def boom():
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(j.cov, "finalize", boom)
+    assert j.run() == 0

@@ -126,3 +126,75 @@ def test_exe_install_refuses_an_existing_run_value(tmp_path, monkeypatch):
     comp.cleanup()
     # The fake module should be cleaned up after the test
     monkeypatch.delitem(sys.modules, "netbridge_e2e.winsys", raising=False)
+
+
+class FakeCov:
+    def __init__(self):
+        self.warnings = []
+
+    def wrap(self, project, module_args):
+        return ["COV", project, *module_args]
+
+    def warn(self, msg):
+        self.warnings.append(msg)
+
+
+def captured_argv(monkeypatch):
+    seen = {}
+
+    class FakeProc:
+        def __init__(self, name, argv, log_path, env=None, **kw):
+            seen[name] = argv
+
+        def start(self):
+            return self
+
+    monkeypatch.setattr(stack, "Proc", FakeProc)
+    monkeypatch.setattr(stack, "port_in_use", lambda port: False)
+    return seen
+
+
+def test_relay_argv_under_coverage(tmp_path, monkeypatch):
+    seen = captured_argv(monkeypatch)
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}, cov=FakeCov()).start()
+    assert seen["relay"][:4] == ["COV", "relay", "-m", "relay"]
+    assert "--no-auth" in seen["relay"]
+
+
+def test_relay_argv_without_coverage_is_unchanged(tmp_path, monkeypatch):
+    seen = captured_argv(monkeypatch)
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}).start()
+    assert seen["relay"][:3] == ["uv", "run", "--project"]
+
+
+def test_relay_image_is_not_instrumented(tmp_path, monkeypatch):
+    seen = captured_argv(monkeypatch)
+    monkeypatch.setattr(stack.subprocess, "run", lambda *a, **k: None)
+    fake = FakeCov()
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}, image="img", cov=fake).start()
+    assert seen["relay"][0] == "docker"
+    assert fake.warnings == ["relay runs from a docker image: not instrumented"]
+
+
+def test_wrap_failure_falls_back_to_uninstrumented_argv(tmp_path, monkeypatch):
+    seen = captured_argv(monkeypatch)
+
+    class BrokenCov(FakeCov):
+        def wrap(self, project, module_args):
+            return None
+
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}, cov=BrokenCov()).start()
+    stack.SourceAgent(tmp_path, "ws://x", env={}, cov=BrokenCov()).start()
+    stack.SourceProxy(tmp_path, "ws://x", 1, 2, env={}, cov=BrokenCov()).start()
+    assert seen["relay"][:3] == ["uv", "run", "--project"]
+    assert seen["agent"][:3] == ["uv", "run", "--project"]
+    assert seen["proxy"][:3] == ["uv", "run", "--project"]
+
+
+def test_agent_and_proxy_argv_under_coverage(tmp_path, monkeypatch):
+    seen = captured_argv(monkeypatch)
+    stack.SourceAgent(tmp_path, "ws://x", env={}, cov=FakeCov()).start()
+    stack.SourceProxy(tmp_path, "ws://x", 1, 2, env={}, cov=FakeCov()).start()
+    assert seen["agent"] == ["COV", "netbridge-agent", "-m", "netbridge_agent", "--console"]
+    assert seen["proxy"][:5] == ["COV", "socks-proxy", "-m", "socks_proxy", "serve"]
+    assert "--no-tray" in seen["proxy"]

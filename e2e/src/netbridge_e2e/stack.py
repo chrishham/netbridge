@@ -43,9 +43,12 @@ def _poll(predicate, timeout: float, alive=None, interval: float = 0.5):
 
 
 class Relay:
-    def __init__(self, logs_dir: Path, port: int, blocked_port: int, env: dict, image: str | None = None):
+    def __init__(self, logs_dir: Path, port: int, blocked_port: int, env: dict, image: str | None = None, cov=None):
         self.port = port
         self.image = image
+        self._cov = None if image else cov
+        if image and cov:
+            cov.warn("relay runs from a docker image: not instrumented")
         self._logs_dir = logs_dir
         self._relay_env = dict(NETBRIDGE_ALLOW_NO_AUTH="true", NETBRIDGE_ALLOWED_TENANTS=TEST_TENANT,
                                RELAY_BLOCKED_PORTS=str(blocked_port))
@@ -71,7 +74,7 @@ class Relay:
             argv = ["docker", "run", "--rm", "--name", self._container, "--network", "host", *env_args,
                     self.image, ".venv/bin/python", *relay_args]
         else:
-            argv = _uv("relay", "python", *relay_args)
+            argv = (self._cov and self._cov.wrap("relay", relay_args)) or _uv("relay", "python", *relay_args)
         self.proc = Proc("relay", argv, self._logs_dir / f"relay-{self._runs}.log", env=self._env).start()
 
     def _remove_container(self) -> None:
@@ -130,9 +133,10 @@ class _Component:
 class SourceAgent(_Component):
     """Agent from source in --console mode (same NetBridgeApp as the tray, minus the icon)."""
 
-    def __init__(self, work: Path, relay_url: str, env: dict):
+    def __init__(self, work: Path, relay_url: str, env: dict, cov=None):
         self.name = "agent"
         self._relay_url = relay_url
+        self._cov = cov
         localappdata = work / "localappdata"
         self.app_dir = localappdata / "NetBridge"
         self._stdout = work / "logs" / "agent-stdout.log"
@@ -145,17 +149,19 @@ class SourceAgent(_Component):
         return f"source agent, config in {self.app_dir}"
 
     def start(self) -> None:
-        argv = _uv("netbridge-agent", "python", "-m", "netbridge_agent", "--console")
+        module = ["-m", "netbridge_agent", "--console"]
+        argv = (self._cov and self._cov.wrap("netbridge-agent", module)) or _uv("netbridge-agent", "python", *module)
         self.proc = Proc("agent", argv, self._stdout, env=self._env).start()
 
 
 class SourceProxy(_Component):
     """`netbridge-socks serve` from source, config dir isolated from the user's."""
 
-    def __init__(self, work: Path, relay_url: str, socks_port: int, http_port: int, env: dict):
+    def __init__(self, work: Path, relay_url: str, socks_port: int, http_port: int, env: dict, cov=None):
         self.name = "proxy"
-        self._argv = _uv("socks-proxy", "netbridge-socks", "serve", "--relay", relay_url, "--host", "127.0.0.1",
-                         "--port", str(socks_port), "--http-port", str(http_port), "--no-tray")
+        self._serve = ["serve", "--relay", relay_url, "--host", "127.0.0.1", "--port", str(socks_port),
+                       "--http-port", str(http_port), "--no-tray"]
+        self._cov = cov
         self._stdout = work / "logs" / "proxy-stdout.log"
         self._env = dict(env, XDG_CONFIG_HOME=str(work / "xdg-config"))
         self.logs = LogWatch(self._stdout)
@@ -164,7 +170,10 @@ class SourceProxy(_Component):
         return "source proxy, CLI flags only"
 
     def start(self) -> None:
-        self.proc = Proc("proxy", self._argv, self._stdout, env=self._env).start()
+        # python -m socks_proxy runs the same main() as the netbridge-socks entry point
+        argv = ((self._cov and self._cov.wrap("socks-proxy", ["-m", "socks_proxy", *self._serve]))
+                or _uv("socks-proxy", "netbridge-socks", *self._serve))
+        self.proc = Proc("proxy", argv, self._stdout, env=self._env).start()
 
 
 class ExeComponent(_Component):
