@@ -3,7 +3,12 @@
 Every socket carries a timeout: a proxy that hangs fails the step instead
 of hanging the gate.
 """
+import base64
+import hashlib
+import json
+import os
 import socket
+import struct
 import threading
 import time
 import urllib.parse
@@ -13,6 +18,14 @@ Address = tuple[str, int]
 
 class ProxyError(Exception):
     """The proxy refused the request (SOCKS5 reply code / HTTP status, -1 = protocol error)."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(f"{message} (code {code})")
+        self.code = code
+
+
+class ClientError(Exception):
+    """WebSocket connection failed (HTTP status, body)."""
 
     def __init__(self, code: int, message: str):
         super().__init__(f"{message} (code {code})")
@@ -128,3 +141,171 @@ def wait_closed(sock: socket.socket, timeout: float) -> bool:
         except OSError:
             return True
     return False
+
+
+def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: float = 10) -> tuple[int, str]:
+    """Perform WebSocket upgrade handshake. Returns (status, body up to 4 KiB); closes the connection."""
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        # Generate WebSocket key
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+
+        # Build request
+        headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host}:{port}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {ws_key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        if token:
+            headers.append(f"Authorization: {token}")
+        headers.append("")
+        headers.append("")
+
+        sock.sendall("\r\n".join(headers).encode())
+
+        # Read response
+        status, headers_dict = _read_head(sock)
+
+        # Read body if present (up to 4 KiB)
+        body = ""
+        if "content-length" in headers_dict:
+            body_len = min(int(headers_dict["content-length"]), 4096)
+            if body_len > 0:
+                body = recv_exact(sock, body_len).decode("utf-8", errors="replace")
+
+        return status, body
+    finally:
+        sock.close()
+
+
+class WsClient:
+    """Minimal WebSocket client (RFC 6455)."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+
+    @classmethod
+    def connect(cls, host: str, port: int, path: str, token: str | None, timeout: float = 10) -> "WsClient":
+        """Connect and perform WebSocket handshake. Raises ClientError on non-101."""
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            # Generate WebSocket key
+            ws_key = base64.b64encode(os.urandom(16)).decode()
+
+            # Build request
+            headers = [
+                f"GET {path} HTTP/1.1",
+                f"Host: {host}:{port}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {ws_key}",
+                "Sec-WebSocket-Version: 13",
+            ]
+            if token:
+                headers.append(f"Authorization: {token}")
+            headers.append("")
+            headers.append("")
+
+            sock.sendall("\r\n".join(headers).encode())
+
+            # Read response
+            status, headers_dict = _read_head(sock)
+
+            if status != 101:
+                # Read error body
+                body = ""
+                if "content-length" in headers_dict:
+                    body_len = min(int(headers_dict["content-length"]), 4096)
+                    if body_len > 0:
+                        body = recv_exact(sock, body_len).decode("utf-8", errors="replace")
+                sock.close()
+                raise ClientError(status, body)
+
+            # Verify Sec-WebSocket-Accept
+            expected_accept = base64.b64encode(
+                hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+            ).decode()
+            actual_accept = headers_dict.get("sec-websocket-accept", "")
+            if actual_accept != expected_accept:
+                sock.close()
+                raise ClientError(-1, f"Invalid Sec-WebSocket-Accept: {actual_accept}")
+
+            return cls(sock)
+        except BaseException:
+            sock.close()
+            raise
+
+    def send_json(self, obj: dict) -> None:
+        """Send JSON as a masked text frame."""
+        payload = json.dumps(obj).encode("utf-8")
+        self._send_frame(1, payload, masked=True)
+
+    def recv_json(self, timeout: float) -> dict:
+        """Receive JSON, skipping pings (auto-ponged). Raises on close frame."""
+        self.sock.settimeout(timeout)
+        while True:
+            opcode, payload = self._recv_frame()
+            if opcode == 1:  # text
+                return json.loads(payload.decode("utf-8"))
+            elif opcode == 8:  # close
+                raise ConnectionError("WebSocket closed by server")
+            elif opcode == 9:  # ping
+                self._send_frame(10, payload, masked=True)  # send pong
+                continue
+            elif opcode == 10:  # pong
+                continue
+            else:
+                raise ConnectionError(f"Unexpected opcode {opcode}")
+
+    def close(self) -> None:
+        """Send close frame and close socket."""
+        try:
+            self._send_frame(8, b"", masked=True)
+        except OSError:
+            pass
+        self.sock.close()
+
+    def _send_frame(self, opcode: int, payload: bytes, masked: bool = False) -> None:
+        """Send a WebSocket frame."""
+        header = bytearray([0x80 | opcode])  # FIN=1
+        payload_len = len(payload)
+
+        if payload_len <= 125:
+            header.append(payload_len)
+        elif payload_len <= 65535:
+            header.append(126)
+            header += struct.pack("!H", payload_len)
+        else:
+            header.append(127)
+            header += struct.pack("!Q", payload_len)
+
+        if masked:
+            header[1] |= 0x80
+            mask_key = os.urandom(4)
+            header += mask_key
+            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+        self.sock.sendall(header + payload)
+
+    def _recv_frame(self) -> tuple[int, bytes]:
+        """Receive a WebSocket frame. Returns (opcode, payload)."""
+        header = recv_exact(self.sock, 2)
+        opcode = header[0] & 0x0F
+        masked = (header[1] & 0x80) != 0
+        payload_len = header[1] & 0x7F
+
+        if payload_len == 126:
+            payload_len = struct.unpack("!H", recv_exact(self.sock, 2))[0]
+        elif payload_len == 127:
+            payload_len = struct.unpack("!Q", recv_exact(self.sock, 8))[0]
+
+        mask_key = recv_exact(self.sock, 4) if masked else None
+        payload = recv_exact(self.sock, payload_len) if payload_len > 0 else b""
+
+        if masked and mask_key:
+            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+        return opcode, payload
