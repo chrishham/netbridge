@@ -443,7 +443,11 @@ async def cleanup_stale_streams(app: web.Application) -> None:
             tunnel_ws = data.get("tunnel_ws")
 
             async with _state_lock:
-                tcp_streams.pop(stream_id, None)
+                # Re-check: the stream may have seen traffic since the scan
+                if (tcp_streams.get(stream_id) is not data
+                        or time.monotonic() - data["last_activity"] <= STREAM_TIMEOUT):
+                    continue
+                tcp_streams.pop(stream_id)
             agent_ws = data.get("agent_ws")
 
             close_msg = json.dumps({

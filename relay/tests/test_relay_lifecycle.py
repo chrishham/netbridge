@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -40,6 +41,13 @@ class RelayServer(TestServer):
 async def client():
     async with TestClient(RelayServer(mod.create_app())) as c:
         yield c
+
+
+@pytest.fixture
+def fast_sweep(monkeypatch):
+    """Sweep every 10 ms (set before the app starts its sweep task)."""
+    monkeypatch.setattr(mod, "STREAM_TIMEOUT", 5)
+    monkeypatch.setattr(mod, "STREAM_CLEANUP_INTERVAL", 0.01)
 
 
 class Peer:
@@ -174,3 +182,42 @@ async def test_old_stream_data_not_forwarded_to_replacement(client, hold_cleanup
     assert all(m.get("stream_id") != "s1" for m in agent_b.seen)
     await tunnel.close()
     await agent_b.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_rechecks_before_closing(fast_sweep, monkeypatch):
+    tunnel_ws, agent_ws = AsyncMock(closed=False), AsyncMock(closed=False)
+    stale = time.monotonic() - 100
+    mod.bridge_agents[USER] = agent_ws
+    mod.tcp_streams["s1"] = {
+        "user_email": USER, "tunnel_key": "k", "tunnel_ws": tunnel_ws, "agent_ws": agent_ws,
+        "created_at": stale, "last_activity": stale,
+    }
+
+    class RefreshingLock:
+        """Refreshes s1 between the sweep's scan (1st acquire) and its removal (2nd acquire)."""
+
+        def __init__(self):
+            self.lock, self.acquired = asyncio.Lock(), 0
+
+        async def __aenter__(self):
+            self.acquired += 1
+            if self.acquired == 2:
+                mod.tcp_streams["s1"]["last_activity"] = time.monotonic()
+            await self.lock.acquire()
+
+        async def __aexit__(self, *exc):
+            self.lock.release()
+
+    lock = RefreshingLock()
+    monkeypatch.setattr(mod, "_state_lock", lock)
+    sweep = asyncio.create_task(mod.cleanup_stale_streams(MagicMock()))
+    try:
+        await wait_until(lambda: lock.acquired >= 3)  # removal step done, next scan started
+    finally:
+        sweep.cancel()
+        await asyncio.gather(sweep, return_exceptions=True)
+
+    assert "s1" in mod.tcp_streams
+    tunnel_ws.send_str.assert_not_called()
+    agent_ws.send_str.assert_not_called()
