@@ -1,9 +1,11 @@
+import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
-from netbridge_agent.agent import AgentState, handle_message
+from netbridge_agent.agent import AgentState, connect_and_run, handle_message
 
 
 def _ws():
@@ -49,3 +51,30 @@ async def test_tcp_data_with_bad_data_closes_the_stream(data, mock_writer, mock_
     await handle_message(state, _ws(), json.dumps({"type": "tcp_data", "stream_id": "s1", "data": data}))
     assert "s1" not in state.active_streams
     mock_writer.close.assert_called()
+
+
+def _fake_session(first_frame):
+    ws = MagicMock(closed=False)
+    ws.receive = AsyncMock(return_value=MagicMock(type=aiohttp.WSMsgType.TEXT, data=first_frame))
+    ws.close = AsyncMock()
+    ws.send_str = AsyncMock()
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=ws)
+    session.__aexit__ = AsyncMock()
+    client = MagicMock()
+    client.ws_connect = MagicMock(return_value=session)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock()
+    return client
+
+
+@pytest.mark.parametrize("frame", ["{not json", "[1]", "null", "42", '"x"'])
+async def test_malformed_registration_ends_the_session_cleanly(frame, caplog):
+    on_status = MagicMock()
+    with patch("netbridge_agent.agent.aiohttp.ClientSession", return_value=_fake_session(frame)), \
+         patch("netbridge_agent.agent.create_tunnel_connector"), \
+         patch("netbridge_agent.agent.build_auth_headers", return_value={}):
+        result = await connect_and_run(AgentState(), "ws://relay/ws", None, None, "tok", asyncio.Event(), on_status, None)
+    assert result == (False, 0.0)
+    on_status.assert_not_called()                           # not connected, and not an auth failure
+    assert "registration" in caplog.text.lower()

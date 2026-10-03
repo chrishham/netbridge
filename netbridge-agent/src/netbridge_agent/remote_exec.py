@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import socket
+from collections.abc import Callable
 
 from aiohttp import web
 
@@ -185,6 +186,8 @@ async def handle_exec(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "invalid JSON body"}, status=400
             )
+        if not isinstance(body, dict):
+            return web.json_response({"error": "JSON object required"}, status=400)
 
         cmd = body.get("cmd")
         if not cmd:
@@ -238,6 +241,8 @@ async def handle_exec_stream(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "invalid JSON body"}, status=400
             )
+        if not isinstance(body, dict):
+            return web.json_response({"error": "JSON object required"}, status=400)
 
         cmd = body.get("cmd")
         if not cmd:
@@ -320,7 +325,7 @@ async def handle_plugins(request: web.Request) -> web.Response:
 async def handle_plugins_reload(request: web.Request) -> web.Response:
     """Trigger re-discovery of plugins. Called after install/uninstall."""
     try:
-        reload_fn = request.app.get("_plugin_reload_callback")
+        reload_fn = request.app.get(PLUGIN_RELOAD_CALLBACK)
         if not reload_fn:
             return web.json_response(
                 {"error": "reload not available"}, status=501
@@ -399,7 +404,7 @@ async def handle_plugin_uninstall(request: web.Request) -> web.Response:
         shutil.rmtree(plugin_dir)
         LOG.info("Deleted plugin directory: %s", plugin_dir)
 
-        reload_fn = request.app.get("_plugin_reload_callback")
+        reload_fn = request.app.get(PLUGIN_RELOAD_CALLBACK)
         added, removed = [], []
         if reload_fn:
             added, removed = await reload_fn()
@@ -422,12 +427,16 @@ async def exec_gate_middleware(request, handler):
     """Block /files, /exec, and /health when remote exec is disabled."""
     gated_prefixes = ("/files", "/exec", "/health")
     if any(request.path.startswith(p) for p in gated_prefixes):
-        if not request.app.get("_remote_exec_enabled", False):
+        if not request.app.get(REMOTE_EXEC_ENABLED, False):
             return web.json_response(
                 {"error": "Remote exec is disabled — enable it from the VDI system tray"},
                 status=403,
             )
     return await handler(request)
+
+
+REMOTE_EXEC_ENABLED = web.AppKey("remote_exec_enabled", bool)
+PLUGIN_RELOAD_CALLBACK = web.AppKey("plugin_reload_callback", Callable)
 
 
 def create_app() -> web.Application:

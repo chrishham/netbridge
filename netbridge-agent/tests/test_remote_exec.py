@@ -6,14 +6,14 @@ import os
 import pytest
 from aiohttp.test_utils import TestClient
 
-from netbridge_agent.remote_exec import create_app
+from netbridge_agent.remote_exec import PLUGIN_RELOAD_CALLBACK, REMOTE_EXEC_ENABLED, create_app
 
 
 @pytest.fixture
 async def client(aiohttp_client):
     """Create a test client for the remote_exec app with exec enabled."""
     app = create_app()
-    app["_remote_exec_enabled"] = True
+    app[REMOTE_EXEC_ENABLED] = True
     return await aiohttp_client(app)
 
 
@@ -252,7 +252,7 @@ class TestPluginsReload:
 
         app = create_app()
         reload_mock = AsyncMock(return_value=(["netbridge-new"], ["netbridge-old"]))
-        app["_plugin_reload_callback"] = reload_mock
+        app[PLUGIN_RELOAD_CALLBACK] = reload_mock
 
         c = await aiohttp_client(app)
         resp = await c.post("/plugins/reload")
@@ -291,8 +291,17 @@ class TestExecGateMiddleware:
 
     async def test_gated_routes_open_when_enabled(self, aiohttp_client):
         app = create_app()
-        app["_remote_exec_enabled"] = True
+        app[REMOTE_EXEC_ENABLED] = True
         c = await aiohttp_client(app)
 
         resp = await c.get("/health")
         assert resp.status == 200
+
+
+@pytest.mark.parametrize("path", ["/exec", "/exec/stream"])
+@pytest.mark.parametrize("body", ["[1]", '"x"', "null", "42"])
+async def test_exec_rejects_non_object_body(client, path, body, caplog):
+    resp = await client.post(path, data=body, headers={"Content-Type": "application/json"})
+    assert resp.status == 400
+    assert await resp.json() == {"error": "JSON object required"}
+    assert "Traceback" not in caplog.text

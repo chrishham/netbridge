@@ -39,6 +39,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+filterwarnings = ["error::aiohttp.web_exceptions.NotAppKeyWarning"]
 addopts = "--allow-hosts=127.0.0.1,::1,localhost"
 
 [tool.coverage.run]

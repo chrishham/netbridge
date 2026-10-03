@@ -923,7 +923,13 @@ async def connect_and_run(
             try:
                 msg = await asyncio.wait_for(ws.receive(), timeout=10.0)
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
+                    try:
+                        data = json.loads(msg.data)
+                    except ValueError:
+                        data = None
+                    if not isinstance(data, dict):
+                        logger.warning("Malformed registration frame from relay")
+                        return False, 0.0
                     if data.get("type") == "registered":
                         logger.info(f"Connected to relay (session: {session_id})")
                         connected_at = time.monotonic()

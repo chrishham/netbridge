@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 from .config import Config, ensure_app_dirs, get_log_path, get_log_dir, get_app_dir, APP_NAME, APP_VERSION
 from .tray import TrayIcon, Status, TRAY_AVAILABLE
+from .remote_exec import PLUGIN_RELOAD_CALLBACK, REMOTE_EXEC_ENABLED
 
 REMOTE_EXEC_TIMEOUT = 3600  # 1 hour auto-disable
 
@@ -446,7 +447,7 @@ class NetBridgeApp:
                 self.tray.set_remote_exec(False)
             return
 
-        self._exec_app["_remote_exec_enabled"] = True
+        self._exec_app[REMOTE_EXEC_ENABLED] = True
         logger.info("Remote exec gate opened")
 
         if self._remote_exec_timer:
@@ -463,7 +464,7 @@ class NetBridgeApp:
             self._remote_exec_timer.cancel()
             self._remote_exec_timer = None
         if hasattr(self, '_exec_app') and self._exec_app is not None:
-            self._exec_app["_remote_exec_enabled"] = False
+            self._exec_app[REMOTE_EXEC_ENABLED] = False
             logger.info("Remote exec gate closed")
 
     async def _remote_exec_auto_disable(self) -> None:
@@ -731,7 +732,7 @@ class NetBridgeApp:
 
         from .remote_exec import create_app as create_exec_app
         self._exec_app = create_exec_app()
-        self._exec_app["_plugin_reload_callback"] = self._reload_plugins
+        self._exec_app[PLUGIN_RELOAD_CALLBACK] = self._reload_plugins
         await self._intercept_server.register_app("netbridge-exec", self._exec_app)
 
         await self._reload_plugins()
