@@ -5,12 +5,14 @@
 
 install → connect (relay pairs agent and proxy, fake az used) → SOCKS5 /
 HTTP CONNECT / HTTP forward / 5 MiB / 20 parallel streams → relay port
-filter → relay restart and reconnect → uninstall (exe mode).
+filter → relay restart and reconnect → link faults through in-process fault
+proxies (cut, blackhole, relay unreachable, agent down) → uninstall (exe mode).
 """
 import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -22,8 +24,9 @@ from pathlib import Path
 
 from . import clients, fakeaz, netinfo
 from .cov import E2ECoverage
+from .faultproxy import FaultProxy
 from .procs import IS_WINDOWS
-from .stack import CONNECTED, PROXY_READY, RELAY_SESSION, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
+from .stack import CLIENT_TUNING, CONNECTED, PROXY_READY, RELAY_SESSION, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
 from .targets import PAGE, PAYLOAD_SHA256, Targets
 
 
@@ -41,6 +44,7 @@ class Journey:
         self.http = ("127.0.0.1", args.http_port)
         self.cov = E2ECoverage(Path(args.coverage).resolve()) if args.coverage else None
         self.coverage: dict | None = None
+        self._agent_up = 0.0  # monotonic start of the agent's current relay session
 
     # --- bookkeeping -------------------------------------------------------
 
@@ -123,7 +127,7 @@ class Journey:
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
             env.pop(var, None)
         no_proxy = f"127.0.0.1,localhost,{ip}"
-        env.update(NO_PROXY=no_proxy, no_proxy=no_proxy)
+        env.update(NO_PROXY=no_proxy, no_proxy=no_proxy, **CLIENT_TUNING)
 
         self.check("fake_az", lambda: self._check_fake_az(env))
         busy = [p for p in (a.relay_port, a.socks_port, a.http_port) if netinfo.port_in_use(p)]
@@ -146,7 +150,14 @@ class Journey:
         relay.start()
         self.step("relay_up", relay.wait_ready(180), f"{relay.url} {'' if relay.alive() else relay.logs.tail()}")
 
-        agent, proxy = self._components(relay.url, ip, targets, env)
+        agent_link = FaultProxy(("127.0.0.1", relay.port), "agent")
+        proxy_link = FaultProxy(("127.0.0.1", relay.port), "proxy")
+        for link in (agent_link, proxy_link):
+            self.cleanups.append(link.close)
+            link.start()
+        self.step("fault_links_up", True, f"agent via :{agent_link.port}, proxy via :{proxy_link.port}")
+
+        agent, proxy = self._components(agent_link.url, proxy_link.url, ip, targets, env)
         for comp in (agent, proxy):
             self.cleanups.append(comp.cleanup)
             self.cleanups.append(lambda c=comp: c.collect_logs(logs))  # runs before cleanup
@@ -163,6 +174,8 @@ class Journey:
         for comp, marker in ((agent, CONNECTED), (proxy, PROXY_READY)):
             m = comp.logs.wait_for(marker, 120, since=start_marks[comp.name], alive=comp.alive)
             self.step(f"{comp.name}_connected", m is not None, m.group(0) if m else comp.logs.tail())
+            if comp is agent:
+                self._agent_up = time.monotonic()
         paired = relay.wait_paired(30)
         self.step("relay_paired", paired is not None, json.dumps(paired or relay.status()))
 
@@ -174,6 +187,7 @@ class Journey:
         self._traffic(ip, targets, relay)
         self._filter(ip, targets, relay)
         self._reconnect(relay, agent, proxy, ip, targets)
+        self._faults(relay, agent, proxy, ip, targets, agent_link, proxy_link)
 
         if a.mode == "exe":
             for comp in (agent, proxy):
@@ -192,14 +206,14 @@ class Journey:
         left = fakeaz.token_seconds_left(json.loads(out.stdout)["accessToken"])
         return left > 600, f"{az} (token valid {left:.0f}s)"
 
-    def _components(self, relay_url: str, ip: str, targets: Targets, env: dict):
+    def _components(self, agent_url: str, proxy_url: str, ip: str, targets: Targets, env: dict):
         a = self.args
         if a.mode == "source":
-            return (SourceAgent(self.work, relay_url, env, cov=self.cov),
-                    SourceProxy(self.work, relay_url, a.socks_port, a.http_port, env, cov=self.cov))
-        return (make_exe_agent(Path(a.agent_exe), relay_url, env, self.work,
+            return (SourceAgent(self.work, agent_url, env, cov=self.cov),
+                    SourceProxy(self.work, proxy_url, a.socks_port, a.http_port, env, cov=self.cov))
+        return (make_exe_agent(Path(a.agent_exe), agent_url, env, self.work,
                                console=a.agent_console, allow_existing=a.allow_existing_install),
-                make_exe_proxy(Path(a.proxy_exe), relay_url, a.socks_port, a.http_port,
+                make_exe_proxy(Path(a.proxy_exe), proxy_url, a.socks_port, a.http_port,
                                env, self.work, allow_existing=a.allow_existing_install))
 
     def _socks_get(self, host: str, targets: Targets, path: str = "/", timeout: float = 15.0) -> tuple[int, bytes]:
@@ -281,27 +295,200 @@ class Journey:
         relay.start()
         self.step("relay_restarted", relay.wait_ready(60), relay.url)
         start = time.monotonic()
-        deadline = start + 60  # the spec's reconnect promise
+        recovered, last = self._wait_traffic(ip, targets, relay, start + 60)  # the spec's reconnect promise
+        took = time.monotonic() - start
+        self.step("reconnect", recovered,
+                  f"traffic flows again {took:.0f}s after the relay came back" if recovered
+                  else f"no working tunnel within 60s of the relay coming back ({last}; relay {relay.status()})")
+        self._agent_up = time.monotonic()
+        for comp in (agent, proxy):
+            m = comp.logs.wait_for(RELAY_SESSION, 10, since=marks[comp.name])
+            self.step(f"{comp.name}_reconnected", m is not None, m.group(0) if m else comp.logs.tail())
+
+    def _wait_traffic(self, ip: str, targets: Targets, relay: Relay, deadline: float) -> tuple[bool, str]:
+        """Poll until relay pairs and an HTTP GET through the tunnel succeeds by the absolute deadline."""
         last = "never paired"
-        recovered = False
         while (left := deadline - time.monotonic()) > 0:
             if relay.wait_paired(min(5, left)):
                 try:
                     status, body = self._socks_get(ip, targets, timeout=max(1.0, min(15.0, deadline - time.monotonic())))
                     if status == 200 and body == PAGE:
-                        recovered = time.monotonic() <= deadline
-                        break
+                        on_time = time.monotonic() <= deadline
+                        return on_time, "traffic flows" if on_time else "traffic flowed only after the deadline"
                     last = f"HTTP {status}"
                 except Exception as e:  # noqa: BLE001 — retried until the deadline
                     last = f"{type(e).__name__}: {e}"
             time.sleep(min(2, max(0, deadline - time.monotonic())))
-        took = time.monotonic() - start
-        self.step("reconnect", recovered,
-                  f"traffic flows again {took:.0f}s after the relay came back" if recovered
-                  else f"no working tunnel within 60s of the relay coming back ({last}; relay {relay.status()})")
-        for comp in (agent, proxy):
-            m = comp.logs.wait_for(RELAY_SESSION, 10, since=marks[comp.name])
-            self.step(f"{comp.name}_reconnected", m is not None, m.group(0) if m else comp.logs.tail())
+        return False, last
+
+
+    # --- link faults -------------------------------------------------------
+
+    def _agent_sessions(self, agent) -> int:
+        return len(re.findall(RELAY_SESSION, agent.logs.text()))
+
+    def _await_agent_session(self, agent, min_age: float = 65.0) -> None:
+        # the agent resets its reconnect delay only after a 60 s session; if it reconnected
+        # on its own while we waited, the session is new and the wait starts over
+        seen = self._agent_sessions(agent)
+        while (wait := self._agent_up + min_age - time.monotonic()) > 0:
+            time.sleep(min(wait, 5))
+            now = self._agent_sessions(agent)
+            if now != seen:
+                seen, self._agent_up = now, time.monotonic()
+
+    def _open_echo(self, ip: str, targets: Targets):
+        s = clients.socks5_connect(self.socks, ip, targets.echo_port, timeout=15)
+        if clients.echo_roundtrip(s, b"fault-probe\n") != b"fault-probe\n":
+            s.close()
+            raise RuntimeError("echo round trip failed before the fault")
+        return s
+
+    def _attempt(self, ip: str, targets: Targets, limit: float) -> tuple[str, str, float]:
+        """One SOCKS CONNECT, capped at `limit` seconds wall-clock (socket timeouts are per operation).
+
+        Returns (kind, detail, finished_at): kind is 'refused' (reply 0x04), 'reply' (another SOCKS
+        error reply), 'error' (transport error, no reply), 'ok' (connected) or 'hang'.
+        """
+        start = time.monotonic()
+        out: dict = {}
+
+        def run():
+            try:
+                s = clients.socks5_connect(self.socks, ip, targets.echo_port, timeout=limit)
+            except clients.ProxyError as e:
+                out["r"] = ("refused" if e.code == 0x04 else "reply"), f"SOCKS reply {e.code:#04x}"
+            except OSError as e:
+                out["r"] = "error", f"{type(e).__name__}: {e}"
+            else:
+                s.close()
+                out["r"] = "ok", "connected"
+            out["at"] = time.monotonic()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(limit)
+        if "r" not in out:
+            return "hang", f"no SOCKS reply within {limit:.0f}s", time.monotonic()
+        kind, detail = out["r"]
+        return kind, f"{detail} after {out['at'] - start:.1f}s", out["at"]
+
+    def _fails_fast(self, ip, targets, deadline: float, per_attempt: float = 10.0) -> tuple[bool, str]:
+        last = "no attempt"
+        while (left := deadline - time.monotonic()) > 0:
+            kind, last, at = self._attempt(ip, targets, min(per_attempt, left))
+            if kind == "refused":
+                return at <= deadline, last
+            if kind != "ok":
+                return False, last
+            time.sleep(min(1, max(0, deadline - time.monotonic())))  # still connected through a link that has not noticed yet
+        return False, f"never refused before the deadline (last: {last})"
+
+    def _evidence(self, relay, *comps) -> str:
+        tails = "; ".join(f"{c.name} log: ...{c.logs.tail(400)!r}" for c in comps)
+        return f"relay {relay.status()}; {tails}"
+
+    def _inject(self, link: FaultProxy, how: str) -> tuple[float, int]:
+        before = link.active()
+        n = link.cut() if how == "cut" else link.blackhole()
+        if before < 1 or n < 1:
+            raise RuntimeError(f"{link.name} link: {before} active, {how} affected {n} (nothing to fault)")
+        return time.monotonic(), n
+
+    def _faults(self, relay, agent, proxy, ip, targets, agent_link, proxy_link) -> None:
+        def recovered(t0, budget, comp=None, marker=None, mark=None):
+            ok, detail = self._wait_traffic(ip, targets, relay, t0 + budget)
+            if ok and comp is not None:
+                # the log line must be there by the same deadline (timeout 0 still checks once)
+                m = comp.logs.wait_for(marker, max(0.0, t0 + budget - time.monotonic()), since=mark)
+                ok, detail = m is not None, (f"{detail}; {m.group(0)}" if m else f"{detail}; no new '{marker}' log line")
+            ok = ok and time.monotonic() <= t0 + budget
+            took = f"{detail} ({time.monotonic() - t0:.0f}s after the fault)"
+            return ok, took if ok else f"{took}; {self._evidence(relay, agent, proxy)}"
+
+        def with_evidence(check):
+            ok, detail = check()
+            return ok, detail if ok else f"{detail}; {self._evidence(relay, agent, proxy)}"
+
+        # 1-2: agent link cut
+        self._await_agent_session(agent)
+        mark = agent.logs.mark()
+        echo = self._open_echo(ip, targets)
+        t0, n = self._inject(agent_link, "cut")
+        ended = clients.wait_closed(echo, 15)
+        echo.close()
+        self.step("agent_cut_ends_streams", ended, f"{n} link(s) cut; open stream ended: {ended} "
+                  f"after {time.monotonic() - t0:.1f}s" + ("" if ended else f"; {self._evidence(relay, agent, proxy)}"))
+        self.check("agent_cut_recovers", lambda: recovered(t0, 45, agent, CONNECTED, mark))
+        self._agent_up = time.monotonic()
+
+        # 3-4: proxy link cut (the agent is unaffected)
+        mark = proxy.logs.mark()
+        echo = self._open_echo(ip, targets)
+        t0, n = self._inject(proxy_link, "cut")
+        ended = clients.wait_closed(echo, 5)
+        echo.close()
+        self.step("proxy_cut_ends_streams", ended, f"{n} link(s) cut; open stream ended: {ended} "
+                  f"after {time.monotonic() - t0:.1f}s" + ("" if ended else f"; {self._evidence(relay, agent, proxy)}"))
+        self.check("proxy_cut_recovers", lambda: recovered(t0, 45, proxy, RELAY_SESSION, mark))
+
+        # 5: agent link blackholed (half-open)
+        self._await_agent_session(agent)
+        echo = self._open_echo(ip, targets)
+        t0, n = self._inject(agent_link, "blackhole")
+        probe: dict = {}
+        worker = threading.Thread(target=lambda: probe.update(r=self._attempt(ip, targets, 28)), daemon=True)
+        worker.start()
+        ended = clients.wait_closed(echo, max(0.0, t0 + 45 - time.monotonic()))
+        echo.close()
+        ended_after = time.monotonic() - t0
+        worker.join(max(0.0, t0 + 30 - time.monotonic()))
+        kind, how, at = probe.get("r", ("hang", "no SOCKS reply within 30s", time.monotonic()))
+        # the promise: a SOCKS error reply (not a hang, not a bare reset) within 30 s of the fault
+        replied = kind in ("refused", "reply") and at <= t0 + 30
+        ok, traffic = recovered(t0, 75)
+        self.step("agent_blackhole_detected", ended and replied and ok,
+                  f"stream ended: {ended} after {ended_after:.1f}s; CONNECT during blackhole: {how}; {traffic}"
+                  + ("" if ended and replied else f"; {self._evidence(relay, agent, proxy)}"))
+        self._agent_up = time.monotonic()
+
+        # 6: relay unreachable for both clients
+        self._await_agent_session(agent)
+        for link in (agent_link, proxy_link):
+            link.refuse(True)
+        t0 = time.monotonic()
+        counts = [link.cut() for link in (agent_link, proxy_link)]
+        if min(counts) < 1:
+            raise RuntimeError(f"relay_unreachable: cut affected {counts} (nothing to fault)")
+        self.check("relay_unreachable_fails_fast", lambda: with_evidence(lambda: self._fails_fast(ip, targets, t0 + 20)))
+        for link in (agent_link, proxy_link):
+            link.refuse(False)
+        t1 = time.monotonic()
+        self.check("relay_reachable_recovers", lambda: recovered(t1, 90))
+        self._agent_up = time.monotonic()
+
+        # 7: agent process down, then restarted
+        agent.stop()
+        t0 = time.monotonic()
+
+        def agent_down():
+            ok, detail = self._fails_fast(ip, targets, t0 + 15)
+            agents, linked = (relay.status() or {}).get("agents"), proxy_link.active()
+            # the refusal must come from "no agent", not from a proxy that lost the relay
+            return ok and agents == 0 and linked >= 1, f"{detail}; relay sees {agents} agent(s); proxy link {linked}"
+
+        self.check("agent_down_fails_fast", lambda: with_evidence(agent_down))
+        mark = agent.logs.mark()
+        agent.start()
+        t1 = time.monotonic()
+
+        def restarted():
+            ok, detail = recovered(t1, 60, agent, CONNECTED, mark)
+            agents = (relay.status() or {}).get("agents")
+            return ok and agents == 1, f"{detail}; relay sees {agents} agent(s)"
+
+        self.check("agent_restarted", restarted)
+        self._agent_up = time.monotonic()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

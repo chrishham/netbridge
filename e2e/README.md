@@ -34,6 +34,8 @@ Ports: `--relay-port` (18080), `--socks-port` (11080), `--http-port` (13128); th
 
 ## Steps
 
-`fake_az` → `ports_free` → `targets_up` → `relay_up` → `install_agent` / `install_proxy` → `*_started` → `*_connected` (agent status / proxy's end-to-end probe) → `relay_paired` → `az_called` → `socks5_http` → `socks5_dns` (with `--target-hostname`) → `http_connect` → `http_forward` → `bulk_payload` (5 MiB, sha256) → `concurrency` (20 simultaneous streams) → `relay_filter` (`RELAY_BLOCKED_PORTS`) → `relay_restarted` → `reconnect` → `*_reconnected` → `uninstall_*` (exe mode; the driver clicks "Yes" on the confirmation).
+`fake_az` → `ports_free` → `targets_up` → `relay_up` → `fault_links_up` → `install_agent` / `install_proxy` → `*_started` → `*_connected` (agent status / proxy's end-to-end probe) → `relay_paired` → `az_called` → `socks5_http` → `socks5_dns` (with `--target-hostname`) → `http_connect` → `http_forward` → `bulk_payload` (5 MiB, sha256) → `concurrency` (20 simultaneous streams) → `relay_filter` (`RELAY_BLOCKED_PORTS`) → `relay_restarted` → `reconnect` → `*_reconnected` → `agent_cut_ends_streams` → `agent_cut_recovers` → `proxy_cut_ends_streams` → `proxy_cut_recovers` → `agent_blackhole_detected` → `relay_unreachable_fails_fast` → `relay_reachable_recovers` → `agent_down_fails_fast` → `agent_restarted` → `uninstall_*` (exe mode; the driver clicks "Yes" on the confirmation).
+
+Both clients reach the relay through in-process fault proxies, so the fault steps can cut, blackhole or refuse each link; heartbeats are shortened to 10 s for the run.
 
 Driver unit tests: `cd e2e && uv run pytest`.

@@ -24,6 +24,10 @@ TEST_TENANT = "11111111-1111-1111-1111-111111111111"
 CONNECTED = r"Status changed: \S+ -> connected"
 PROXY_READY = r"Bridge agent reachable - tunnel is working end to end"
 RELAY_SESSION = r"Connected to relay \(session: \w+\)"
+# fault steps: detect a half-open link in ~15 s, and never throttle fault-driven reconnects from 127.0.0.1
+FAULT_TUNING = {"RELAY_HEARTBEAT_INTERVAL": "10", "RELAY_RATE_CONNECTIONS_PER_MIN": "600",
+                "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "600"}
+CLIENT_TUNING = {"NETBRIDGE_CLIENT_HEARTBEAT_INTERVAL": "10"}
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -51,7 +55,7 @@ class Relay:
             cov.warn("relay runs from a docker image: not instrumented")
         self._logs_dir = logs_dir
         self._relay_env = dict(NETBRIDGE_ALLOW_NO_AUTH="true", NETBRIDGE_ALLOWED_TENANTS=TEST_TENANT,
-                               RELAY_BLOCKED_PORTS=str(blocked_port))
+                               RELAY_BLOCKED_PORTS=str(blocked_port), **FAULT_TUNING)
         self._env = dict(env, **self._relay_env)
         self._container = f"netbridge-e2e-relay-{port}"
         self._runs = 0

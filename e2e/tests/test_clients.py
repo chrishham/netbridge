@@ -1,3 +1,6 @@
+import socket
+import struct
+import threading
 import time
 
 import pytest
@@ -70,3 +73,44 @@ def test_http_forward_get(targets):
         assert clients.http_forward_get(proxy.address, url) == (200, PAGE)
     finally:
         proxy.close()
+
+
+def _pair():
+    srv = socket.create_server(("127.0.0.1", 0))
+    client = socket.create_connection(srv.getsockname(), timeout=2)
+    peer, _ = srv.accept()
+    srv.close()
+    return client, peer
+
+
+def test_wait_closed_sees_peer_close():
+    client, peer = _pair()
+    peer.sendall(b"discarded")
+    threading.Timer(0.2, peer.close).start()
+    start = time.monotonic()
+    try:
+        assert clients.wait_closed(client, 2) is True
+        assert time.monotonic() - start < 1
+    finally:
+        client.close()
+
+
+def test_wait_closed_times_out_while_peer_stays_open():
+    client, peer = _pair()
+    start = time.monotonic()
+    try:
+        assert clients.wait_closed(client, 0.3) is False
+        assert 0.25 <= time.monotonic() - start < 1
+    finally:
+        client.close()
+        peer.close()
+
+
+def test_wait_closed_sees_peer_reset():
+    client, peer = _pair()
+    peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # close() sends RST
+    peer.close()
+    try:
+        assert clients.wait_closed(client, 2) is True
+    finally:
+        client.close()
