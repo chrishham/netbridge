@@ -276,6 +276,7 @@ class TestSendToRelay:
     async def test_send_success(self):
         ws = MagicMock()
         ws.closed = False
+        ws.closed = False
         ws.send_str = AsyncMock()
         result = await send_to_relay(ws, {"type": "heartbeat"})
         assert result is True
@@ -614,3 +615,40 @@ class TestMappedFormCidrEntries:
     async def test_mapped_form_allow_entry_allows(self, host):
         assert (await validate_destination(host, 80, allowed_destinations=["::ffff:10.0.0.0/104"]))[0] is True
         assert (await validate_destination("11.1.2.3", 80, allowed_destinations=["::ffff:10.0.0.0/104"]))[0] is False
+
+
+# ---------------------------------------------------------------------------
+# magic-host (intercept) failures
+# ---------------------------------------------------------------------------
+
+
+class TestMagicHostUnavailable:
+    @staticmethod
+    async def _connect(state):
+        ws = MagicMock()
+        ws.closed = False
+        ws.send_str = AsyncMock()
+        msg = json.dumps({"type": "tcp_connect", "stream_id": "s1", "host": "netbridge-exec", "port": 80})
+        await handle_message(state, ws, msg)
+        return json.loads(ws.send_str.call_args.args[0])
+
+    async def test_service_not_available(self):
+        state = AgentState()
+        state.get_intercept_server = lambda: MagicMock(port_for=lambda h: None)
+        sent = await self._connect(state)
+        assert sent["success"] is False
+        assert sent["error"] == "Service netbridge-exec is not available"
+
+    async def test_intercept_not_configured(self):
+        state = AgentState()
+        state.get_intercept_server = None
+        sent = await self._connect(state)
+        assert sent["success"] is False
+        assert sent["error"] == "Intercept server is not configured"
+
+    async def test_intercept_not_running(self):
+        state = AgentState()
+        state.get_intercept_server = lambda: None
+        sent = await self._connect(state)
+        assert sent["success"] is False
+        assert sent["error"] == "Intercept server is not running"

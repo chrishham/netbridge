@@ -129,6 +129,10 @@ def load_proxy_credentials() -> Optional[tuple[str, str]]:
         logger.warning(f"Failed to read proxy creds: {e}")
         return None
 
+    if not isinstance(data, dict):
+        logger.warning("Proxy creds file is not a JSON object")
+        return None
+
     username = data.get("username")
     if not username:
         return None
