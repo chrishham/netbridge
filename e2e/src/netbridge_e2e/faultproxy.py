@@ -28,7 +28,6 @@ class _Conn:
         self.upstream = upstream
         self.state = "open"  # open | blackholed | closed
         self.lock = threading.Lock()
-        self.threads: list[threading.Thread] = []
 
     def kill(self) -> bool:
         with self.lock:
@@ -58,8 +57,9 @@ class FaultProxy:
 
     def _spawn(self, target, name, into, *args) -> None:
         t = threading.Thread(target=target, args=args, name=name, daemon=True)
+        with self._lock:  # recorded before it runs, so close() can always join it
+            into.append(t)
         t.start()
-        into.append(t)
 
     def _accept_loop(self) -> None:
         while not self._closed:
@@ -68,7 +68,7 @@ class FaultProxy:
                 if not ready:
                     continue
                 client, _ = self._lsock.accept()
-            except (OSError, ValueError):  # ValueError: select on a closed socket (negative fd)
+            except (OSError, ValueError):  # ValueError: listener closed by close() mid-select
                 break
             if self._refuse:  # relay unreachable: the TCP handshake works, then nothing
                 _close(client)
@@ -86,7 +86,7 @@ class FaultProxy:
                     break
                 self._conns.add(conn)
             for src, dst in ((client, up), (up, client)):
-                self._spawn(self._pump, f"fault-{self.name}-pump", conn.threads, conn, src, dst)
+                self._spawn(self._pump, f"fault-{self.name}-pump", self._threads, conn, src, dst)
 
     def _pump(self, conn: _Conn, src: socket.socket, dst: socket.socket) -> None:
         try:
@@ -133,8 +133,10 @@ class FaultProxy:
             return
         self._closed = True
         _close(self._lsock)
-        conns = self._live()
-        for c in conns:
+        for c in self._live():
             c.kill()
-        for t in self._threads + [t for c in conns for t in c.threads]:
-            t.join(2)
+        with self._lock:  # no thread is spawned after _closed is set (the accept loop checks it under the lock)
+            threads = list(self._threads)
+        for t in threads:
+            if t is not threading.current_thread():
+                t.join(2)

@@ -153,21 +153,27 @@ def test_close_is_idempotent_and_stops_threads(echo_server):
     assert wait_until(lambda: threading.active_count() <= before, timeout=3)
 
 
-def test_close_while_listener_selects(echo_server):
-    exceptions = []
-    old_hook = threading.excepthook
+def test_close_while_listener_selects(echo_server, monkeypatch):
+    import netbridge_e2e.faultproxy as fpmod
+    real_select = fpmod.select.select
+    entered = threading.Event()
 
-    def record(args):
-        exceptions.append(args)
+    def spy(r, w, x, timeout):
+        entered.set()
+        return real_select(r, w, x, timeout)
 
-    try:
-        threading.excepthook = record
-        for _ in range(20):
-            p = FaultProxy(echo_server, "race")
+    monkeypatch.setattr(fpmod.select, "select", spy)
+    for _ in range(20):  # close() lands while the accept loop sits in select(); no thread may die
+        p = FaultProxy(echo_server, "race")
+        errors = []
+        threading.excepthook = lambda a: errors.append(a)
+        try:
+            entered.clear()
             p.start()
+            assert entered.wait(2)
             p.close()
             for t in p._threads:
-                t.join(1)
-        assert not exceptions, f"Unhandled exceptions in threads: {exceptions}"
-    finally:
-        threading.excepthook = old_hook
+                t.join(2)
+        finally:
+            threading.excepthook = threading.__excepthook__
+        assert not errors
