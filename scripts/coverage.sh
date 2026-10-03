@@ -6,6 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 compare="${1:-origin/main}"
 status=0
+rm -f coverage.xml .coverage.combined  # diff-cover must never run on an earlier report
 
 for comp in shared relay netbridge-agent socks-proxy socks-proxy-win e2e; do
   echo "== $comp"

@@ -108,8 +108,43 @@ def test_main_fails_when_combine_fails(root, monkeypatch):
 
     def broken(args, cwd):
         if args[0] == "combine":
-            raise subprocess.CalledProcessError(1, args)
+            return subprocess.CompletedProcess(args, 1, "", "boom")
         return real(args, cwd)
 
     monkeypatch.setattr(cr, "run_coverage", broken)
     assert cr.main(["--root", str(root)]) != 0
+
+
+def test_main_fails_when_a_step_exits_2(root, monkeypatch, capsys):
+    make_component(root, "alpha", 0, run_both=True)
+    real = cr.run_coverage
+
+    def two(args, cwd):
+        if args[0] == "xml":
+            return subprocess.CompletedProcess(args, 2, "", "")
+        return real(args, cwd)
+
+    monkeypatch.setattr(cr, "run_coverage", two)
+    assert cr.main(["--root", str(root)]) != 0
+    assert "coverage xml failed" in capsys.readouterr().err
+
+
+def test_main_reports_a_corrupt_component_and_combines_the_rest(root, monkeypatch, capsys):
+    alpha = make_component(root, "alpha", 0, run_both=True)
+    make_component(root, "beta", 0, run_both=True)
+    (alpha / ".coverage").write_bytes(b"garbage, not sqlite")
+    combined = []
+    real = cr.run_coverage
+
+    def spy(args, cwd):
+        if args[0] == "combine":
+            combined.extend(args)
+        return real(args, cwd)
+
+    monkeypatch.setattr(cr, "run_coverage", spy)
+    assert cr.main(["--root", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "| alpha | — | 0 | error |" in out
+    assert "| beta | 100.00% | 0 | ok |" in out
+    assert not any("alpha" in a for a in combined)
+    assert 'filename="beta/src/pkg_beta/__init__.py"' in (root / "coverage.xml").read_text()

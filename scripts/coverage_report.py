@@ -34,11 +34,13 @@ def component_total(comp_dir: Path) -> float:
     # floor from appending "Coverage failure: ..." to stdout (the floor is pytest-cov's job)
     r = run_coverage(["report", "--data-file=.coverage", "--format=total", "--precision=2", "--fail-under=0"], comp_dir)
     if r.returncode != 0:
-        raise RuntimeError(f"coverage report in {comp_dir} failed: {r.stderr.strip()}")
+        raise RuntimeError(f"coverage report in {comp_dir} failed: {r.stderr.strip() or r.stdout.strip()}")
     return float(r.stdout.strip())
 
 
-def make_row(comp: str, pct: float | None, floor: float | None) -> dict:
+def make_row(comp: str, pct: float | None, floor: float | None, error: bool = False) -> dict:
+    if error:
+        return {"comp": comp, "pct": None, "floor": floor, "status": "error", "hint": ""}
     if pct is None:
         return {"comp": comp, "pct": None, "floor": floor, "status": "no data", "hint": ""}
     if floor is None:
@@ -67,11 +69,17 @@ def main(argv: list[str] | None = None) -> int:
         comp_dir = root / comp
         data = comp_dir / ".coverage"
         floor = read_floor(comp_dir) if (comp_dir / "pyproject.toml").exists() else None
-        if data.exists():
-            data_files.append(str(data))
-            rows.append(make_row(comp, component_total(comp_dir), floor))
-        else:
+        if not data.exists():
             rows.append(make_row(comp, None, floor))
+            continue
+        try:
+            pct = component_total(comp_dir)
+        except (RuntimeError, ValueError) as e:  # an unreadable file is reported, and kept out of combine
+            print(e, file=sys.stderr)
+            rows.append(make_row(comp, None, floor, error=True))
+            continue
+        data_files.append(str(data))
+        rows.append(make_row(comp, pct, floor))
 
     table = render(rows)
     print(table)
@@ -80,20 +88,16 @@ def main(argv: list[str] | None = None) -> int:
             f.write(table)
 
     if not data_files:
-        print("no component produced coverage data", file=sys.stderr)
+        print("no component produced usable coverage data", file=sys.stderr)
         return 1
     # data files hold absolute paths under this checkout; reporting from the root makes them repo-relative
     steps = (["combine", "--keep", f"--data-file={COMBINED}", *data_files],
              ["xml", f"--data-file={COMBINED}", "-o", "coverage.xml"],
              ["html", f"--data-file={COMBINED}", "-d", "htmlcov"])
     for args in steps:
-        try:
-            r = run_coverage(args, root)
-        except subprocess.CalledProcessError as e:
-            print(f"coverage {args[0]} failed: {e}", file=sys.stderr)
-            return 1
-        if r.returncode not in (0, 2):
-            print(f"coverage {args[0]} failed: {r.stderr.strip()}", file=sys.stderr)
+        r = run_coverage(args, root)
+        if r.returncode != 0:
+            print(f"coverage {args[0]} failed: {r.stderr.strip() or r.stdout.strip()}", file=sys.stderr)
             return 1
     return 0
 
