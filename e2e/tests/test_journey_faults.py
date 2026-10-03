@@ -384,6 +384,19 @@ def test_faults_all_steps_pass(j, monkeypatch, clock):
     assert j._agent_up == clock.now
 
 
+def test_faults_agent_down_budget_starts_after_stop_returns(j, monkeypatch, clock):
+    w = World(j, monkeypatch)
+    real_stop = w.agent.stop
+
+    def slow_stop():  # Windows: taskkill + a cold PowerShell query before stop() returns
+        clock.now += 20
+        real_stop()
+
+    w.agent.stop = slow_stop
+    w.run(j)
+    assert all(r["ok"] for r in j.results), j.results
+
+
 def test_faults_agent_cut_stream_never_ends(j, monkeypatch, clock):
     w = World(j, monkeypatch, stream_ends=False)
     w.agent.logs.lines.append("agent evidence line")

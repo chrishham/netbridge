@@ -477,8 +477,10 @@ class Journey:
         self._agent_up = time.monotonic()
 
         # 7: agent process down, then restarted
-        t0 = time.monotonic()
         agent.stop()
+        # stop() returns once the process is dead; on Windows it also runs taskkill and a cold
+        # PowerShell query, which must not eat the 15 s "refused once the agent is down" budget
+        t0 = time.monotonic()
 
         def agent_down():
             ok, detail = self._fails_fast(ip, targets, t0 + 15)
