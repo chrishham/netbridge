@@ -348,7 +348,8 @@ class Journey:
             time.sleep(min(wait, 5, give_up - time.monotonic()))
             now = self._agent_sessions(agent)
             if now != seen:
-                seen, self._agent_up = now, time.monotonic()
+                seen = self._agent_up_sessions = now
+                self._agent_up = time.monotonic()
 
     def _open_echo(self, ip: str, targets: Targets):
         s = clients.socks5_connect(self.socks, ip, targets.echo_port, timeout=15)
