@@ -190,13 +190,24 @@ def test_upstream_down_closes_client():
         p.close()
 
 
-def test_close_while_listener_selects(echo_server):
-    for _ in range(20):  # close() races the accept loop's select(); no thread may die with an exception
+def test_close_while_listener_selects(echo_server, monkeypatch):
+    import netbridge_e2e.faultproxy as fpmod
+    real_select = fpmod.select.select
+    entered = threading.Event()
+
+    def spy(r, w, x, timeout):
+        entered.set()
+        return real_select(r, w, x, timeout)
+
+    monkeypatch.setattr(fpmod.select, "select", spy)
+    for _ in range(20):  # close() lands while the accept loop sits in select(); no thread may die
         p = FaultProxy(echo_server, "race")
         errors = []
         threading.excepthook = lambda a: errors.append(a)
         try:
+            entered.clear()
             p.start()
+            assert entered.wait(2)
             p.close()
             for t in p._threads:
                 t.join(2)
@@ -254,7 +265,6 @@ class _Conn:
         self.upstream = upstream
         self.state = "open"  # open | blackholed | closed
         self.lock = threading.Lock()
-        self.threads: list[threading.Thread] = []
 
     def kill(self) -> bool:
         with self.lock:
@@ -284,8 +294,9 @@ class FaultProxy:
 
     def _spawn(self, target, name, into, *args) -> None:
         t = threading.Thread(target=target, args=args, name=name, daemon=True)
+        with self._lock:  # recorded before it runs, so close() can always join it
+            into.append(t)
         t.start()
-        into.append(t)
 
     def _accept_loop(self) -> None:
         while not self._closed:
@@ -312,7 +323,7 @@ class FaultProxy:
                     break
                 self._conns.add(conn)
             for src, dst in ((client, up), (up, client)):
-                self._spawn(self._pump, f"fault-{self.name}-pump", conn.threads, conn, src, dst)
+                self._spawn(self._pump, f"fault-{self.name}-pump", self._threads, conn, src, dst)
 
     def _pump(self, conn: _Conn, src: socket.socket, dst: socket.socket) -> None:
         try:
@@ -359,11 +370,13 @@ class FaultProxy:
             return
         self._closed = True
         _close(self._lsock)
-        conns = self._live()
-        for c in conns:
+        for c in self._live():
             c.kill()
-        for t in self._threads + [t for c in conns for t in c.threads]:
-            t.join(2)
+        with self._lock:  # no thread is spawned after _closed is set (the accept loop checks it under the lock)
+            threads = list(self._threads)
+        for t in threads:
+            if t is not threading.current_thread():
+                t.join(2)
 ```
 
 - [ ] **Step 4: Run tests**
@@ -408,7 +421,8 @@ Read first: `stream.py` (whole), `tunnel.py` `connect` (≈ lines 670–760), `_
 ### Task 3: relay — stream owner for the whole life (bug 2), stale-sweep recheck (bug 3), lifecycle tests
 
 **Files:**
-- Modify: `relay/src/relay/__main__.py` (`StreamInfo`, `_handle_tcp_connect`, agent handler `handle_websocket` message forwarding and `finally`, `_handle_tcp_data`, `_handle_tcp_close`, `handle_tunnel` `finally`, `cleanup_stale_streams`)
+- Modify: `relay/src/relay/__main__.py` (`StreamInfo`, `_handle_tcp_connect`, agent handler `handle_websocket` message forwarding and `finally` → `_cleanup_agent`, `_handle_tcp_data`, `_handle_tcp_close`, `handle_tunnel` `finally`, `cleanup_stale_streams`)
+- Modify: `relay/tests/test_relay.py` (stream fixtures that build `tcp_streams` entries by hand must now include `agent_ws`)
 - Create: `relay/tests/test_relay_lifecycle.py`
 
 **Interfaces:**
@@ -419,7 +433,7 @@ Read first: `__main__.py` lines ≈ 380–480 (state, sweep), 520–660 (agent h
 - [ ] **Step 1: Failing/coverage tests** in `relay/tests/test_relay_lifecycle.py`, driving the real app with `aiohttp.test_utils.TestServer`/`TestClient` (loopback only) in no-auth mode (set the module's no-auth flag/env exactly as `test_relay.py` does), resetting module state in a fixture:
   1. `test_agent_disconnect_closes_its_streams` — connect agent (`/ws`, read `registered`), tunnel (`/tunnel`); tunnel sends `tcp_connect` (agent receives it); agent closes → tunnel receives `tcp_close` with `reason == "agent_disconnected"` for that stream; `/status` shows 0 agents.
   2. `test_tunnel_disconnect_notifies_agent` — tunnel with an open stream closes → agent receives `tunnel_client_disconnected`.
-  3. `test_replacement_keeps_new_agent_and_its_streams` (bug 2) — agent A registers; tunnel opens stream S1 (routed to A); **hold A's cleanup**: patch the relay so A's handler blocks at the start of its `finally` on an `asyncio.Event` (e.g. wrap `safe_ws_send`/the cleanup entry with a hook that awaits the event only for A's websocket) — without the hold, S2 could be created after A's cleanup already ran and the old bug would pass; agent B (same user) connects → A is closed by the relay; tunnel opens S2 (routed to B) while A's cleanup is held; release the event; after A's handler finished: B is still in `bridge_agents`, S2 still in `tcp_streams`, S1 is gone and the tunnel received `tcp_close`/`agent_disconnected` for S1 only. Verify RED against the unfixed code (S2 deleted).
+  3. `test_replacement_keeps_new_agent_and_its_streams` (bug 2) — agent A registers; tunnel opens stream S1 (routed to A); **hold A's cleanup**: first extract the agent handler's `finally` body into `async def _cleanup_agent(ws, user_email)` (pure move, no behaviour change, in the bug-2 commit), then in the test monkeypatch `_cleanup_agent` with a wrapper that, for A's websocket only, awaits an `asyncio.Event` *before* calling the real function — so nothing has been removed yet; the test asserts B is registered and S2 exists before setting the event — without the hold, S2 could be created after A's cleanup already ran and the old bug would pass; agent B (same user) connects → A is closed by the relay; tunnel opens S2 (routed to B) while A's cleanup is held; release the event; after A's handler finished: B is still in `bridge_agents`, S2 still in `tcp_streams`, S1 is gone and the tunnel received `tcp_close`/`agent_disconnected` for S1 only. Verify RED against the unfixed code (S2 deleted).
   4. `test_old_stream_data_not_forwarded_to_replacement` (bug 2) — hold A's cleanup open (or send before A's handler exits) and have the tunnel send `tcp_data` for S1 after B registered: B must never receive a message with `stream_id == S1`.
   5. `test_stale_sweep_closes_idle_streams_only` — patch `STREAM_CLEANUP_INTERVAL` to ~0.01 and `STREAM_TIMEOUT` small; one idle stream, one with fresh `last_activity`; run the sweep task briefly: idle one gets `tcp_close reason=idle_timeout` on both sides and is removed; fresh one stays.
   6. `test_stale_sweep_rechecks_before_closing` (bug 3) — force the interleaving: make the sweep's scan see the stream as stale, then refresh `last_activity` before the removal (e.g. wrap `_state_lock` or patch `time.monotonic`/`safe_ws_send` so the refresh happens between scan and pop); the stream must survive and no `tcp_close` is sent for it.
@@ -507,11 +521,18 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
 - [ ] **Step 4: `_faults`** — implement in `journey.py` (helpers are methods):
 
 ```python
-    def _await_agent_session(self, min_age: float = 65.0) -> None:
-        # the agent resets its reconnect delay only after a 60 s session
-        wait = self._agent_up + min_age - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
+    def _agent_sessions(self, agent) -> int:
+        return len(re.findall(RELAY_SESSION, agent.logs.text()))
+
+    def _await_agent_session(self, agent, min_age: float = 65.0) -> None:
+        # the agent resets its reconnect delay only after a 60 s session; if it reconnected
+        # on its own while we waited, the session is new and the wait starts over
+        seen = self._agent_sessions(agent)
+        while (wait := self._agent_up + min_age - time.monotonic()) > 0:
+            time.sleep(min(wait, 5))
+            now = self._agent_sessions(agent)
+            if now != seen:
+                seen, self._agent_up = now, time.monotonic()
 
     def _open_echo(self, ip: str, targets: Targets):
         s = clients.socks5_connect(self.socks, ip, targets.echo_port, timeout=15)
@@ -583,7 +604,7 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
             return ok, took if ok else f"{took}; {self._evidence(relay, agent, proxy)}"
 
         # 1-2: agent link cut
-        self._await_agent_session()
+        self._await_agent_session(agent)
         mark = agent.logs.mark()
         echo = self._open_echo(ip, targets)
         t0, n = self._inject(agent_link, "cut")
@@ -605,7 +626,7 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
         self.check("proxy_cut_recovers", lambda: recovered(t0, 45, proxy, RELAY_SESSION, mark))
 
         # 5: agent link blackholed (half-open)
-        self._await_agent_session()
+        self._await_agent_session(agent)
         echo = self._open_echo(ip, targets)
         t0, n = self._inject(agent_link, "blackhole")
         probe: dict = {}
@@ -624,7 +645,7 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
         self._agent_up = time.monotonic()
 
         # 6: relay unreachable for both clients
-        self._await_agent_session()
+        self._await_agent_session(agent)
         for link in (agent_link, proxy_link):
             link.refuse(True)
         t0 = time.monotonic()
@@ -661,7 +682,7 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
         self._agent_up = time.monotonic()
 ```
 
-  Notes: `CONNECTED` and `RELAY_SESSION` already exist in `stack.py`; import `threading` and `FaultProxy` in `journey.py` as needed. Blackhole: the CONNECT may get `0x04` or another SOCKS error reply depending on which side notices first — the promise is "a SOCKS error reply within 30 s", so `refused` and `reply` pass; `ok` (connected through the dead agent), `error` (bare reset, no reply) and `hang` fail. `_fails_fast` failures should also carry `self._evidence(...)` in their detail (wrap the check lambdas accordingly). If the real run shows a deadline is not met, first check whether it is a product defect (report it); do not silently widen deadlines — any change to a deadline must be justified in the report with measured numbers.
+  Notes: `CONNECTED` and `RELAY_SESSION` already exist in `stack.py`; import `re`, `threading` and `FaultProxy` in `journey.py` as needed. Blackhole: the CONNECT may get `0x04` or another SOCKS error reply depending on which side notices first — the promise is "a SOCKS error reply within 30 s", so `refused` and `reply` pass; `ok` (connected through the dead agent), `error` (bare reset, no reply) and `hang` fail. `_fails_fast` failures should also carry `self._evidence(...)` in their detail (wrap the check lambdas accordingly). If the real run shows a deadline is not met, first check whether it is a product defect (report it); do not silently widen deadlines — any change to a deadline must be justified in the report with measured numbers.
 
 - [ ] **Step 5: README** — append the new steps after `*_reconnected` in the `## Steps` sequence of `e2e/README.md`, and one sentence: "Both clients reach the relay through in-process fault proxies, so the fault steps can cut, blackhole or refuse each link; heartbeats are shortened to 10 s for the run."
 - [ ] **Step 6: Driver tests** — `cd e2e && uv run pytest -q` all pass.
