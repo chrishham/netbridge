@@ -170,7 +170,7 @@ async def test_failed_result_from_a_foreign_agent_does_not_release(client, monke
     assert "s1" in mod.tcp_streams
 ```
 
-Add to the same file: tcp_close forwarded and removes; ownership denied (other agent socket) dropped with `ownership denied` in caplog; oversized message (`RELAY_MAX_MESSAGE_SIZE` patched to 100) dropped; unknown type warns; invalid JSON warns and loop continues; bandwidth limiter acquired only for `tcp_data` (patch `mod._global_bandwidth_limiter` with an `AsyncMock` having `acquire`, `mod._bytes_per_sec = 1000`).
+Add to the same file: tcp_close forwarded and removes; ownership denied (other agent socket) dropped with `ownership denied` in caplog; oversized message dropped (patch `mod.MAX_MESSAGE_SIZE` to 100 AFTER the websocket is connected, because `web.WebSocketResponse(max_msg_size=MAX_MESSAGE_SIZE)` reads it at connect time and aiohttp would close the socket on an oversized frame before the loop's own `len(msg.data) > MAX_MESSAGE_SIZE` check at `__main__.py:605` runs; the env var name `RELAY_MAX_MESSAGE_SIZE` is only the source of the default at `:120`); unknown type warns; invalid JSON warns and loop continues; bandwidth limiter acquired only for `tcp_data` (patch `mod._global_bandwidth_limiter` with an `AsyncMock` having `acquire`, `mod._bytes_per_sec = 1000`).
 
 Port bool test (`test_destinations.py`): `validate_tcp_connect_params("h", True)` and `("h", False)` return `(False, "Port must be an integer")`.
 
@@ -481,7 +481,7 @@ async def test_mixed_allowlist_answer_only_dials_the_allowed_ip_even_when_it_fai
 
     monkeypatch.setattr(asyncio, "open_connection", fake_open)
     state, ws = AgentState(), _ws()
-    state.allowed_destinations = ["8.8.8.0/24"]              # use the state/config field handle_tcp_connect reads (check agent.py:470-480)
+    state.allowed_destinations = ["8.8.8.0/24"]              # the field handle_tcp_connect passes to the policy (agent.py:480)
     await handle_message(state, ws, json.dumps({"type": "tcp_connect", "stream_id": "s1", "host": "mix.test", "port": 80}))
     await asyncio.gather(*state.pending_connections.values())
     assert opened == ["8.8.8.8"]                              # 1.1.1.1 never dialled, not even as a fallback
@@ -604,6 +604,7 @@ async def test_cancel_between_connect_and_registration_closes_the_writer(monkeyp
 - Test: `netbridge-agent/tests/test_agent_malformed.py` (registration cases), `netbridge-agent/tests/test_remote_exec.py` (400 cases; update key usage at lines 16, 255, 294)
 
 **Interfaces:**
+- `remote_exec.py` needs `from collections.abc import Callable` added to its imports (it has none today) for the `PLUGIN_RELOAD_CALLBACK` key type.
 - Produces in `remote_exec.py`: `REMOTE_EXEC_ENABLED = web.AppKey("remote_exec_enabled", bool)`, `PLUGIN_RELOAD_CALLBACK = web.AppKey("plugin_reload_callback", Callable)`; all `app["_remote_exec_enabled"]` / `app["_plugin_reload_callback"]` uses switch to them (`app.py` and tests import them).
 
 ```python
@@ -1435,7 +1436,7 @@ def test_wait_streams_zero_unreadable_status_is_not_zero(j, clock):
 ```
 
 - [ ] **Step 1:** Write the tests; run `cd e2e && uv run pytest tests/test_targets.py tests/test_stack.py tests/test_clients.py tests/test_journey_errors.py -q`; expected FAIL (missing attributes and options).
-- [ ] **Step 2:** Implement. `Targets.__init__`: `self._refused = socket.socket(); self._refused.bind((host, 0)); self.refused_port = self._refused.getsockname()[1]` (never `listen`); close it in `close()`. `install_plugin_fixtures`: `shutil.copytree(FIXTURES / name, plugins_dir / name)` for `probe` and `broken`, then `plugin.py` text `.replace("__NONCE__", nonce)`; `plugins_dir` properties and `add_plugins` as in Interfaces; `SourceAgent.cleanup` = `self.stop()` then `shutil.rmtree` of the remembered dirs (`ignore_errors=True`). `_fail_case`, `_wait_streams_zero` and the `fakeproxy.py` change exactly as above. Make sure the new fixture files ship with the package (`pyproject.toml` of `e2e` uses the default src layout; add `[tool.setuptools.package-data]`/hatch include only if `uv run pytest` cannot find `plugin_fixtures` from the editable install, which it can).
+- [ ] **Step 2:** Implement. `targets.py`: add `import socket` (it imports only `hashlib, socketserver, threading, http.server` today). `Targets.__init__`: `self._refused = socket.socket(); self._refused.bind((host, 0)); self.refused_port = self._refused.getsockname()[1]` (never `listen`); close it in `close()`. `install_plugin_fixtures`: `shutil.copytree(FIXTURES / name, plugins_dir / name)` for `probe` and `broken`, then `plugin.py` text `.replace("__NONCE__", nonce)`; `plugins_dir` properties and `add_plugins` as in Interfaces; `SourceAgent.cleanup` = `self.stop()` then `shutil.rmtree` of the remembered dirs (`ignore_errors=True`). `_fail_case`, `_wait_streams_zero` and the `fakeproxy.py` change exactly as above. Make sure the new fixture files ship with the package (`pyproject.toml` of `e2e` uses the default src layout; add `[tool.setuptools.package-data]`/hatch include only if `uv run pytest` cannot find `plugin_fixtures` from the editable install, which it can).
 - [ ] **Step 3:** `cd e2e && uv run pytest -q`; green. **Step 4: Commit** "Add the refused-port target, plugin fixtures, fake-proxy options and failure-case helpers to the e2e driver".
 
 ---
@@ -1720,8 +1721,9 @@ def _plugin_world(monkeypatch, *, body=BODY, plugins=("e2e-probe",), loaded=True
     if skipped:
         agent.logs.lines.append("Skipping plugin broken: manifest missing entry_point")
     sock = FakeSock()
-    monkeypatch.setattr(clients, "socks5_connect", lambda *a, **k: sock)
-    monkeypatch.setattr(clients, "http_connect", lambda *a, **k: sock)
+    # the steps use `with clients.socks5_connect(...) as s`; FakeSock is not a context manager
+    monkeypatch.setattr(clients, "socks5_connect", lambda *a, **k: contextlib.closing(sock))
+    monkeypatch.setattr(clients, "http_connect", lambda *a, **k: contextlib.closing(sock))
 
     def http_get(s, host, path="/"):
         if path == "/plugins":
@@ -1733,7 +1735,7 @@ def _plugin_world(monkeypatch, *, body=BODY, plugins=("e2e-probe",), loaded=True
     return agent, start
 ```
 
-(`FakeSock` is imported at the top of the file from `tests.test_journey_faults`; also add `import json` to the imports.)
+(`FakeSock` is imported at the top of the file from `tests.test_journey_faults`; also add `import contextlib` and `import json` to the imports.)
 
 ```python
 def test_plugin_steps_pass_against_a_correct_agent(j, monkeypatch):
@@ -1772,7 +1774,7 @@ def test_plugins_listed_fails_when_the_broken_plugin_is_listed(j, monkeypatch):
 ```
 
 - [ ] **Step 1:** Append the tests; `cd e2e && uv run pytest tests/test_journey_errors.py -q`; expected FAIL (`_plugins` missing).
-- [ ] **Step 2:** Implement `_plugins`, the `plugins_installed` step (needs `import secrets, json` at the top of `journey.py` if absent) and the two call sites exactly as above; `agent.add_plugins` runs before `comp.start()` so the agent loads the plugins at start.
+- [ ] **Step 2:** Implement `_plugins`, the `plugins_installed` step (add `import secrets` at the top of `journey.py`; `json` is already imported there) and the two call sites exactly as above; `agent.add_plugins` runs before `comp.start()` so the agent loads the plugins at start.
 - [ ] **Step 3:** `cd e2e && uv run pytest -q`; green. Run the source journey: `cd e2e && uv run python -m netbridge_e2e --mode source --target-hostname netbridge-e2e-target --work /tmp/e2e` (locally omit `--target-hostname`); `plugins_installed`, `plugin_loaded_log`, `plugin_routable`, `plugins_listed` all PASS. Exe mode runs in `e2e-windows.yml`: if the frozen app cannot import the fixture plugin, the step detail carries the agent log tail; fix forward in that workflow run, do not skip the step.
 - [ ] **Step 4: Commit** "Prove plugins load and route in the e2e stack".
 
