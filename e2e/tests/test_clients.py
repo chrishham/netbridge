@@ -1,5 +1,6 @@
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -108,7 +109,8 @@ def test_wait_closed_times_out_while_peer_stays_open():
 
 def test_wait_closed_sees_peer_reset():
     client, peer = _pair()
-    peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # close() sends RST
+    linger = struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0)  # Windows LINGER is two u_shorts
+    peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)  # close() sends RST
     peer.close()
     try:
         assert clients.wait_closed(client, 2) is True
