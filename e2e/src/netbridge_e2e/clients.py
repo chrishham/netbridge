@@ -247,11 +247,9 @@ class WsClient:
         """Receive JSON, skipping pings (auto-ponged). Raises on close frame or after `timeout` overall."""
         deadline = time.monotonic() + timeout
         while True:
-            left = deadline - time.monotonic()
-            if left <= 0:
+            if time.monotonic() >= deadline:
                 raise TimeoutError(f"no message within {timeout:g}s")
-            self.sock.settimeout(left)
-            opcode, payload = self._recv_frame()
+            opcode, payload = self._recv_frame(deadline)
             if opcode == 1:  # text
                 return json.loads(payload.decode("utf-8"))
             elif opcode == 8:  # close
@@ -294,20 +292,36 @@ class WsClient:
 
         self.sock.sendall(header + payload)
 
-    def _recv_frame(self) -> tuple[int, bytes]:
+    def _read(self, n: int, deadline: float | None) -> bytes:
+        """recv_exact, but every recv gets only the time left before `deadline`."""
+        if deadline is None:
+            return recv_exact(self.sock, n)
+        buf = bytearray()
+        while len(buf) < n:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("websocket receive deadline passed")
+            self.sock.settimeout(left)
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError(f"connection closed after {len(buf)}/{n} bytes")
+            buf += chunk
+        return bytes(buf)
+
+    def _recv_frame(self, deadline: float | None = None) -> tuple[int, bytes]:
         """Receive a WebSocket frame. Returns (opcode, payload)."""
-        header = recv_exact(self.sock, 2)
+        header = self._read(2, deadline)
         opcode = header[0] & 0x0F
         masked = (header[1] & 0x80) != 0
         payload_len = header[1] & 0x7F
 
         if payload_len == 126:
-            payload_len = struct.unpack("!H", recv_exact(self.sock, 2))[0]
+            payload_len = struct.unpack("!H", self._read(2, deadline))[0]
         elif payload_len == 127:
-            payload_len = struct.unpack("!Q", recv_exact(self.sock, 8))[0]
+            payload_len = struct.unpack("!Q", self._read(8, deadline))[0]
 
-        mask_key = recv_exact(self.sock, 4) if masked else None
-        payload = recv_exact(self.sock, payload_len) if payload_len > 0 else b""
+        mask_key = self._read(4, deadline) if masked else None
+        payload = self._read(payload_len, deadline) if payload_len > 0 else b""
 
         if masked and mask_key:
             payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))

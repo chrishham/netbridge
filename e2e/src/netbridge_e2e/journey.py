@@ -375,6 +375,8 @@ class Journey:
             stream_id = str(uuid.uuid4())
             ws.send_json({"type": "tcp_connect", "stream_id": stream_id, "host": ip, "port": targets.http_port})
             reply = ws.recv_json(10)
+            if reply.get("stream_id") != stream_id:
+                return {"success": None, "error": f"reply for another stream: {reply}"}
             if reply.get("success") is True:
                 ws.send_json({"type": "tcp_close", "stream_id": stream_id})
             return reply

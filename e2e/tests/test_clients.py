@@ -449,7 +449,7 @@ def test_ws_recv_json_deadline_is_overall_not_per_frame(monkeypatch):
     try:
         ws = clients.WsClient(a)
 
-        def ping():
+        def ping(deadline=None):
             time.sleep(0.05)
             return 9, b""
 
@@ -462,3 +462,26 @@ def test_ws_recv_json_deadline_is_overall_not_per_frame(monkeypatch):
     finally:
         a.close()
         b.close()
+
+
+def test_ws_recv_json_deadline_bounds_a_trickled_frame():
+    """A frame trickled one byte at a time must not outlive the deadline."""
+    class Trickle:
+        data = b"\x81\x7e\x00\x64" + b"a" * 100
+
+        def __init__(self):
+            self.pos = 0
+
+        def settimeout(self, t):
+            pass
+
+        def recv(self, n):
+            time.sleep(0.05)
+            self.pos += 1
+            return self.data[self.pos - 1:self.pos]
+
+    ws = clients.WsClient(Trickle())
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        ws.recv_json(0.3)
+    assert time.monotonic() - start < 1
