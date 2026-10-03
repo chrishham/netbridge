@@ -32,9 +32,15 @@ class ClientError(Exception):
         self.code = code
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
+def recv_exact(sock: socket.socket, n: int, deadline: float | None = None) -> bytes:
+    """n bytes; with a monotonic `deadline`, every recv gets only the time left."""
     buf = bytearray()
     while len(buf) < n:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("receive deadline passed")
+            sock.settimeout(left)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise ConnectionError(f"connection closed after {len(buf)}/{n} bytes")
@@ -64,11 +70,11 @@ def socks5_connect(proxy: Address, dest_host: str, dest_port: int, timeout: floa
         raise
 
 
-def _read_head(sock: socket.socket) -> tuple[int, dict[str, str]]:
+def _read_head(sock: socket.socket, deadline: float | None = None) -> tuple[int, dict[str, str]]:
     # byte by byte: never consume tunnel bytes that follow the header
     head = bytearray()
     while not head.endswith(b"\r\n\r\n"):
-        head += recv_exact(sock, 1)
+        head += recv_exact(sock, 1, deadline)
         if len(head) > 65536:
             raise ProxyError(-1, "response header too large")
     lines = head.decode("iso-8859-1").split("\r\n")
@@ -145,6 +151,7 @@ def wait_closed(sock: socket.socket, timeout: float) -> bool:
 
 def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: float = 10) -> tuple[int, str]:
     """WebSocket upgrade with `Authorization: Bearer <token>` (none if token is None). Returns (status, body up to 4 KiB); closes the connection."""
+    deadline = time.monotonic() + timeout
     sock = socket.create_connection((host, port), timeout=timeout)
     try:
         # Generate WebSocket key
@@ -167,14 +174,14 @@ def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: floa
         sock.sendall("\r\n".join(headers).encode())
 
         # Read response
-        status, headers_dict = _read_head(sock)
+        status, headers_dict = _read_head(sock, deadline)
 
         # Read body if present (up to 4 KiB)
         body = ""
         if "content-length" in headers_dict:
             body_len = min(int(headers_dict["content-length"]), 4096)
             if body_len > 0:
-                body = recv_exact(sock, body_len).decode("utf-8", errors="replace")
+                body = recv_exact(sock, body_len, deadline).decode("utf-8", errors="replace")
 
         return status, body
     finally:
@@ -190,6 +197,7 @@ class WsClient:
     @classmethod
     def connect(cls, host: str, port: int, path: str, token: str | None, timeout: float = 10) -> "WsClient":
         """Handshake with `Authorization: Bearer <token>` (none if token is None). Raises ClientError on non-101."""
+        deadline = time.monotonic() + timeout
         sock = socket.create_connection((host, port), timeout=timeout)
         try:
             # Generate WebSocket key
@@ -212,7 +220,7 @@ class WsClient:
             sock.sendall("\r\n".join(headers).encode())
 
             # Read response
-            status, headers_dict = _read_head(sock)
+            status, headers_dict = _read_head(sock, deadline)
 
             if status != 101:
                 # Read error body
@@ -220,7 +228,7 @@ class WsClient:
                 if "content-length" in headers_dict:
                     body_len = min(int(headers_dict["content-length"]), 4096)
                     if body_len > 0:
-                        body = recv_exact(sock, body_len).decode("utf-8", errors="replace")
+                        body = recv_exact(sock, body_len, deadline).decode("utf-8", errors="replace")
                 sock.close()
                 raise ClientError(status, body)
 
@@ -233,6 +241,7 @@ class WsClient:
                 sock.close()
                 raise ClientError(-1, f"Invalid Sec-WebSocket-Accept: {actual_accept}")
 
+            sock.settimeout(timeout)  # the handshake deadline must not shrink later sends
             return cls(sock)
         except BaseException:
             sock.close()
@@ -293,20 +302,7 @@ class WsClient:
         self.sock.sendall(header + payload)
 
     def _read(self, n: int, deadline: float | None) -> bytes:
-        """recv_exact, but every recv gets only the time left before `deadline`."""
-        if deadline is None:
-            return recv_exact(self.sock, n)
-        buf = bytearray()
-        while len(buf) < n:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise TimeoutError("websocket receive deadline passed")
-            self.sock.settimeout(left)
-            chunk = self.sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError(f"connection closed after {len(buf)}/{n} bytes")
-            buf += chunk
-        return bytes(buf)
+        return recv_exact(self.sock, n, deadline)
 
     def _recv_frame(self, deadline: float | None = None) -> tuple[int, bytes]:
         """Receive a WebSocket frame. Returns (opcode, payload)."""

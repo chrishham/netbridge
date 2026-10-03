@@ -485,3 +485,36 @@ def test_ws_recv_json_deadline_bounds_a_trickled_frame():
     with pytest.raises(TimeoutError):
         ws.recv_json(0.3)
     assert time.monotonic() - start < 1
+
+
+def test_ws_upgrade_deadline_bounds_a_trickled_response():
+    """A relay trickling its HTTP response must not outlive the upgrade timeout."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    stop = threading.Event()
+
+    def trickle():
+        conn, _ = srv.accept()
+        with conn:
+            conn.recv(4096)
+            for b in b"HTTP/1.1 401 Unauthorized\r\nX-Pad: " + b"a" * 1000:
+                if stop.is_set():
+                    return
+                try:
+                    conn.sendall(bytes([b]))
+                except OSError:
+                    return
+                time.sleep(0.05)
+
+    t = threading.Thread(target=trickle, daemon=True)
+    t.start()
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            clients.ws_upgrade("127.0.0.1", srv.getsockname()[1], "/ws", None, timeout=0.4)
+        assert time.monotonic() - start < 1.5
+    finally:
+        stop.set()
+        srv.close()
+        t.join(2)
