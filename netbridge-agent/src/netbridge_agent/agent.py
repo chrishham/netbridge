@@ -403,7 +403,7 @@ async def open_tcp_connection(
         reader, writer = await connect_via_proxy(
             proxy_host, proxy_port, host, port, proxy_auth, timeout
         )
-    elif addresses:
+    elif addresses is not None:
         reader, writer = await _dial_addresses(addresses, port, timeout)
     else:
         reader, writer = await asyncio.wait_for(
@@ -728,7 +728,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "type": "tcp_connect_result",
                 "stream_id": stream_id,
                 "success": False,
-                "error": str(e),
+                "error": str(e) or type(e).__name__,
             }, silent=True)
             logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {e}")
 
