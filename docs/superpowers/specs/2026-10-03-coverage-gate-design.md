@@ -125,8 +125,9 @@ not by widening the allow-list; if a test truly needs an exemption it uses the
 Keep a single `test` job (all components' installs share one runner; the
 tests themselves take ~40 s total). Changes:
 
-- Add `concurrency: {group: ci-${{ github.ref }}, cancel-in-progress: true}`
-  at workflow level.
+- Add workflow-level `concurrency` (group per workflow+ref) that cancels
+  superseded runs on pull requests only; every push to main keeps its own
+  complete run so each main commit has a coverage report.
 - Checkout with `fetch-depth: 0` (diff-cover needs `origin/main`).
 - One step per component, now including `socks-proxy-win`, each running
   `uv run pytest --cov --cov-report=xml --junitxml=junit.xml`. Every test step

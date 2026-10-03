@@ -196,9 +196,9 @@ for d in shared relay netbridge-agent socks-proxy socks-proxy-win; do echo "== $
 
 For each failure caused by `SocketConnectBlockedError`: the test was reaching a real host. Replace that with a monkeypatched/fake transport or a local server bound to `127.0.0.1`. Only when the test's purpose genuinely requires a non-loopback socket (e.g. it asserts on a connect error to an unroutable address), mark it `@pytest.mark.enable_socket` with a one-line comment why. Expected end state: same pass counts as before plus 2 per component.
 
-- [ ] **Step 6: Re-check floors**
+- [ ] **Step 6: Re-measure and set the final floors**
 
-Run Task 1 Step 4's loop. Coverage must not drop below the floors set in Task 1 (fixes replace real I/O with fakes, so totals may shift slightly). If a total moved below its floor, the fix lost coverage — restore it rather than lowering the floor.
+Run Task 1 Step 4's loop. The spec wants the initial floors from the final baseline, so set every `fail_under` to `floor(measured)` again — raising floors whose totals went up. If a total moved *below* its Task 1 floor, the fix lost coverage — restore it rather than lowering the floor.
 
 - [ ] **Step 7: Commit**
 
@@ -759,6 +759,17 @@ def test_python_resolves_the_component_venv(tmp_path, monkeypatch):
     assert e._python("relay") == "/x/relay/.venv/bin/python"
     assert len(calls) == 1  # cached per project
     assert calls[0][:4] == ["uv", "run", "--project", str(cov.REPO / "relay")]
+    assert "coverage.Coverage(config_file=" in calls[0][-2] and calls[0][-1] == str(e.rcfile)
+
+
+def test_python_probe_rejects_a_broken_rcfile(tmp_path, monkeypatch):
+    e = cov.E2ECoverage(tmp_path / "cov")
+    e.prepare()
+    e.rcfile.write_text("[run]\nbranch = notabool\n")
+    # the driver's own venv stands in for a component venv: same probe, real coverage
+    monkeypatch.setattr(cov, "_uv", lambda project, *args: [sys.executable, *args[1:]])
+    assert e.wrap("relay", ["-m", "relay"]) is None
+    assert any("not instrumented" in w for w in e.warnings)
 
 
 def drive(c, src_root: Path, pkg: str):
@@ -860,9 +871,13 @@ class E2ECoverage:
 
     def _python(self, project: str) -> str:
         if project not in self._pythons:
-            out = subprocess.run(_uv(project, "python", "-c", "import sys; print(sys.executable)"),
+            # one call resolves the venv interpreter AND proves coverage imports there and
+            # parses the rcfile, so a broken setup falls back instead of killing the child
+            probe = ("import sys, coverage; coverage.Coverage(config_file=sys.argv[1]); "
+                     "print(sys.executable)")
+            out = subprocess.run(_uv(project, "python", "-c", probe, str(self.rcfile)),
                                  capture_output=True, text=True, check=True, timeout=600)
-            self._pythons[project] = out.stdout.strip()
+            self._pythons[project] = out.stdout.strip().splitlines()[-1]
         return self._pythons[project]
 
     def wrap(self, project: str, module_args: list[str]) -> list[str] | None:
@@ -885,7 +900,10 @@ class E2ECoverage:
         for pkg, pct in result["packages"].items():
             if pct is None:
                 self.warn(f"no coverage data for {pkg}")
-        self._write_markdown(result)
+        try:
+            self._write_markdown(result)
+        except OSError as e:
+            self.warn(f"cannot write summary.md: {e}")
         return result
 
     def _coverage(self, *args: str) -> subprocess.CompletedProcess:
