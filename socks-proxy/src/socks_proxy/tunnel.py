@@ -133,6 +133,13 @@ def _accepted_kwargs(callback: Callable) -> Optional[set[str]]:
     }
 
 
+MAX_STREAM_ID_LENGTH = 128
+
+
+def _valid_stream_id(v) -> bool:
+    return isinstance(v, str) and 0 < len(v) <= MAX_STREAM_ID_LENGTH
+
+
 def classify_connect_error(error: str) -> Optional[bool]:
     """Decide what a failed tunnel connect says about the bridge agent.
 
@@ -739,11 +746,19 @@ class TunnelManager:
             self._release_semaphore_for_stream(handler)
             raise
 
+        if not isinstance(result.get("success"), bool):
+            async with self._lock:
+                self.streams.pop(stream_id, None)
+            self._release_semaphore_for_stream(handler)
+            raise ConnectionError("Invalid connect result")
+
         if not result.get("success"):
             async with self._lock:
                 self.streams.pop(stream_id, None)
             self._release_semaphore_for_stream(handler)
-            error = result.get("error", "Unknown error")
+            error = result.get("error")
+            if not isinstance(error, str):
+                error = "Unknown error"
             evidence = classify_connect_error(error)
             if evidence is not None:
                 # This destination got past every relay-side check, so it is a
@@ -864,7 +879,15 @@ class TunnelManager:
         try:
             async for msg in self.ws:
                 if msg.type == WSMsgType.TEXT:
-                    await self._handle_message(_json_loads(msg.data))
+                    try:
+                        data = _json_loads(msg.data)
+                    except ValueError:
+                        logger.warning("Invalid JSON from relay")
+                        continue
+                    if not isinstance(data, dict):
+                        logger.warning("Non-object frame from relay")
+                        continue
+                    await self._handle_message(data)
                 elif msg.type == WSMsgType.ERROR:
                     logger.error(f"WebSocket error: {self.ws.exception()}")
                     break
@@ -893,7 +916,7 @@ class TunnelManager:
         msg_type = data.get("type")
         stream_id = data.get("stream_id")
 
-        if not stream_id:
+        if not _valid_stream_id(stream_id):
             return
 
         handler = self.streams.get(stream_id)
@@ -903,11 +926,24 @@ class TunnelManager:
         if msg_type == "tcp_connect_result":
             # Connection response
             if not handler.connect_future.done():
-                handler.connect_future.set_result(data)
+                if not isinstance(data.get("success"), bool):
+                    handler.connect_future.set_exception(
+                        ConnectionError("Invalid connect result")
+                    )
+                else:
+                    handler.connect_future.set_result(data)
 
         elif msg_type == "tcp_data":
             # Data from remote
-            raw_data = base64.b64decode(data.get("data", ""))
+            payload = data.get("data")
+            try:
+                if not isinstance(payload, str):
+                    raise ValueError("data is not a string")
+                raw_data = base64.b64decode(payload, validate=True)
+            except ValueError:
+                logger.warning(f"Invalid tcp_data for stream {stream_id[:8]}, closing")
+                await self.close_stream(stream_id)
+                return
             if not await handler.receive_data(raw_data):
                 # Stream is stalled or closed, will be cleaned up by cleanup loop
                 pass
