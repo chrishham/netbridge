@@ -27,7 +27,7 @@
 ## Review Focus
 
 - A component whose coverage is exactly at/just below its floor (e.g. 46.6% vs floor 47) must fail — pinned by Task 1 Step 6 (precision check) and Task 3's `test_hint_uses_two_decimals`.
-- `coverage report` exits 2 when below `fail_under` but still prints the total; the report script must still read the number — pinned in Task 3 `test_below_floor_still_reports_total`.
+- `coverage report` exits 2 and appends "Coverage failure: ..." to stdout when below `fail_under`; the report script must still read the number (it passes `--fail-under=0`) — pinned in Task 3 `test_below_floor_still_reports_total`.
 - A reused e2e `--work`/`--coverage` dir with stale `.coverage.*` files must not inflate totals and must not delete `coveragerc` — pinned in Task 5 `test_prepare_removes_only_data_files`.
 - A component that dies or is SIGKILLed during the journey produces no data; it must show as a warning, not a crash — pinned in Task 5 `test_finalize_warns_for_packages_without_data` and `test_finalize_never_raises`.
 - `shared_auth` code runs from each venv's `site-packages` copy; e2e results must map it back to `shared/src/shared_auth` — pinned in Task 5 `test_rcfile_maps_site_packages_shared_auth`.
@@ -384,9 +384,10 @@ def read_floor(comp_dir: Path) -> float | None:
 
 
 def component_total(comp_dir: Path) -> float:
-    # cwd = component so its pyproject [tool.coverage] applies; exit 2 just means "below fail_under"
-    r = run_coverage(["report", "--data-file=.coverage", "--format=total", "--precision=2"], comp_dir)
-    if r.returncode not in (0, 2):
+    # cwd = component so its pyproject [tool.coverage] applies; --fail-under=0 keeps a missed
+    # floor from appending "Coverage failure: ..." to stdout (the floor is pytest-cov's job)
+    r = run_coverage(["report", "--data-file=.coverage", "--format=total", "--precision=2", "--fail-under=0"], comp_dir)
+    if r.returncode != 0:
         raise RuntimeError(f"coverage report in {comp_dir} failed: {r.stderr.strip()}")
     return float(r.stdout.strip())
 
@@ -668,7 +669,7 @@ git commit -m "Gate CI on coverage floors and diff coverage, run socks-proxy-win
   - `class E2ECoverage(dir: Path, repo: Path = REPO)` with:
     - `prepare() -> None` — mkdir, delete only `.coverage` / `.coverage.*` in dir, write `dir/coveragerc`
     - `rcfile: Path` attribute
-    - `wrap(project: str, module_args: list[str]) -> list[str]` — `[<venv python>, "-m", "coverage", "run", "--rcfile=<rcfile>", *module_args]`
+    - `wrap(project: str, module_args: list[str]) -> list[str] | None` — `[<venv python>, "-m", "coverage", "run", "--rcfile=<rcfile>", *module_args]`; returns `None` (and records a warning) if the interpreter cannot be resolved, so the caller falls back to its uninstrumented argv
     - `warn(msg: str) -> None` — record a warning
     - `finalize() -> dict` — never raises; returns `{"total": float | None, "packages": {pkg: float | None}, "warnings": [str]}` and writes `dir/summary.md`
 
@@ -706,11 +707,11 @@ def c(tmp_path, fake_repo, monkeypatch):
 
 def test_prepare_removes_only_data_files(c):
     c.dir.mkdir(parents=True)
-    for name in (".coverage", ".coverage.host.1.x", "summary.md", "keep.txt"):
+    for name in (".coverage", ".coverage.host.1.x", ".coveragerc-old", "summary.md", "keep.txt"):
         (c.dir / name).write_text("stale")
     c.prepare()
     left = sorted(p.name for p in c.dir.iterdir())
-    assert left == ["coveragerc", "keep.txt", "summary.md"]
+    assert left == [".coveragerc-old", "coveragerc", "keep.txt", "summary.md"]
 
 
 def test_rcfile_content(c, fake_repo):
@@ -732,6 +733,17 @@ def test_wrap(c):
     c.prepare()
     argv = c.wrap("relay", ["-m", "relay", "--no-auth"])
     assert argv == [sys.executable, "-m", "coverage", "run", f"--rcfile={c.rcfile}", "-m", "relay", "--no-auth"]
+
+
+def test_wrap_failure_returns_none_and_warns(c, monkeypatch):
+    c.prepare()
+
+    def broken(project):
+        raise subprocess.CalledProcessError(1, ["uv"])
+
+    monkeypatch.setattr(c, "_python", broken)
+    assert c.wrap("relay", ["-m", "relay"]) is None
+    assert any("relay" in w and "not instrumented" in w for w in c.warnings)
 
 
 def test_python_resolves_the_component_venv(tmp_path, monkeypatch):
@@ -836,8 +848,8 @@ class E2ECoverage:
 
     def prepare(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        for f in self.dir.glob(".coverage*"):  # a reused dir must not count an earlier run
-            f.unlink()
+        for f in [self.dir / ".coverage", *self.dir.glob(".coverage.*")]:  # a reused dir must not count an earlier run
+            f.unlink(missing_ok=True)
         # shared_auth is a non-editable copy in each venv's site-packages
         paths = "".join(f"{pkg} =\n    {self.repo / rel}\n    */site-packages/{pkg}\n" for pkg, rel in PACKAGES.items())
         self.rcfile.write_text(
@@ -853,8 +865,13 @@ class E2ECoverage:
             self._pythons[project] = out.stdout.strip()
         return self._pythons[project]
 
-    def wrap(self, project: str, module_args: list[str]) -> list[str]:
-        return [self._python(project), "-m", "coverage", "run", f"--rcfile={self.rcfile}", *module_args]
+    def wrap(self, project: str, module_args: list[str]) -> list[str] | None:
+        try:
+            python = self._python(project)
+        except Exception as e:  # noqa: BLE001 — report-only: caller runs uninstrumented
+            self.warn(f"{project}: cannot resolve venv python ({type(e).__name__}: {e}); not instrumented")
+            return None
+        return [python, "-m", "coverage", "run", f"--rcfile={self.rcfile}", *module_args]
 
     def warn(self, msg: str) -> None:
         self.warnings.append(msg)
@@ -993,6 +1010,21 @@ def test_relay_image_is_not_instrumented(tmp_path, monkeypatch):
     assert fake.warnings == ["relay runs from a docker image: not instrumented"]
 
 
+def test_wrap_failure_falls_back_to_uninstrumented_argv(tmp_path, monkeypatch):
+    seen = captured_argv(monkeypatch)
+
+    class BrokenCov(FakeCov):
+        def wrap(self, project, module_args):
+            return None
+
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}, cov=BrokenCov()).start()
+    stack.SourceAgent(tmp_path, "ws://x", env={}, cov=BrokenCov()).start()
+    stack.SourceProxy(tmp_path, "ws://x", 1, 2, env={}, cov=BrokenCov()).start()
+    assert seen["relay"][:3] == ["uv", "run", "--project"]
+    assert seen["agent"][:3] == ["uv", "run", "--project"]
+    assert seen["proxy"][:3] == ["uv", "run", "--project"]
+
+
 def test_agent_and_proxy_argv_under_coverage(tmp_path, monkeypatch):
     seen = captured_argv(monkeypatch)
     stack.SourceAgent(tmp_path, "ws://x", env={}, cov=FakeCov()).start()
@@ -1023,7 +1055,7 @@ In `Relay.start`, replace the non-image branch:
 
 ```python
         else:
-            argv = self._cov.wrap("relay", relay_args) if self._cov else _uv("relay", "python", *relay_args)
+            argv = (self._cov and self._cov.wrap("relay", relay_args)) or _uv("relay", "python", *relay_args)
 ```
 
 `SourceAgent.__init__(self, work, relay_url, env, cov=None)` stores `self._cov = cov`; `start`:
@@ -1031,7 +1063,7 @@ In `Relay.start`, replace the non-image branch:
 ```python
     def start(self) -> None:
         module = ["-m", "netbridge_agent", "--console"]
-        argv = self._cov.wrap("netbridge-agent", module) if self._cov else _uv("netbridge-agent", "python", *module)
+        argv = (self._cov and self._cov.wrap("netbridge-agent", module)) or _uv("netbridge-agent", "python", *module)
         self.proc = Proc("agent", argv, self._stdout, env=self._env).start()
 ```
 
@@ -1044,8 +1076,8 @@ In `Relay.start`, replace the non-image branch:
     ...
     def start(self) -> None:
         # python -m socks_proxy runs the same main() as the netbridge-socks entry point
-        argv = (self._cov.wrap("socks-proxy", ["-m", "socks_proxy", *self._serve]) if self._cov
-                else _uv("socks-proxy", "netbridge-socks", *self._serve))
+        argv = ((self._cov and self._cov.wrap("socks-proxy", ["-m", "socks_proxy", *self._serve]))
+                or _uv("socks-proxy", "netbridge-socks", *self._serve))
         self.proc = Proc("proxy", argv, self._stdout, env=self._env).start()
 ```
 
@@ -1082,6 +1114,27 @@ def test_summary_includes_coverage(tmp_path, monkeypatch):
     assert summary["coverage"]["total"] == 12.5
 
 
+def test_coverage_prepare_failure_runs_uninstrumented(tmp_path, monkeypatch):
+    args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
+    j = journey.Journey(args)
+
+    def boom():
+        raise OSError("read-only")
+
+    monkeypatch.setattr(j.cov, "prepare", boom)
+    seen = {}
+
+    def first_step():  # the "network" step runs right after the coverage preamble
+        seen["cov"] = j.cov
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(journey.netinfo, "private_ipv4", first_step)
+    j.run()
+    assert seen["cov"] is None
+    summary = json.loads((tmp_path / "e2e-summary.json").read_text())
+    assert "coverage disabled" in summary["coverage"]["warnings"][0]
+
+
 def test_coverage_failure_never_changes_exit_code(tmp_path, monkeypatch):
     args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
     j = journey.Journey(args)
@@ -1114,10 +1167,19 @@ Expected: FAIL — `unrecognized arguments: --coverage`.
       p.error("--coverage works in source mode only")
   ```
 - `Journey.__init__`: `self.cov = E2ECoverage(Path(args.coverage).resolve()) if args.coverage else None` and `self.coverage: dict | None = None` (import `from .cov import E2ECoverage`).
-- `_journey`: right after `logs.mkdir(...)`, `if self.cov: self.cov.prepare()`. Pass `cov=self.cov` to `Relay(...)`, and in `_components` to `SourceAgent(...)` and `SourceProxy(...)`.
+- `_journey`: right after `logs.mkdir(...)`:
+  ```python
+        if self.cov:
+            try:
+                self.cov.prepare()
+            except Exception as e:  # noqa: BLE001 — report-only: run uninstrumented
+                print(f"coverage disabled: {type(e).__name__}: {e}", flush=True)
+                self.coverage = {"total": None, "packages": {}, "warnings": [f"coverage disabled: {type(e).__name__}: {e}"]}
+                self.cov = None
+  ``` Pass `cov=self.cov` to `Relay(...)`, and in `_components` to `SourceAgent(...)` and `SourceProxy(...)`.
 - `run`, inside `finally`, after the cleanup loop and before `_write_summary`:
   ```python
-            if self.cov:  # processes are stopped now, so their data is flushed
+            if self.cov:  # processes are stopped now, so their data is flushed (None if prepare failed)
                 try:
                     self.coverage = self.cov.finalize()
                 except Exception as e:  # noqa: BLE001 — report-only
