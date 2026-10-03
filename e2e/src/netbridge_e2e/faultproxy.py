@@ -83,9 +83,11 @@ class FaultProxy:
             up.settimeout(None)
             conn = _Conn(client, up)
             with self._lock:
-                if self._closed:
+                if self._closed or self._refuse:
                     conn.kill()
-                    break
+                    if self._closed:
+                        break
+                    continue
                 self._conns.add(conn)
             for src, dst in ((client, up), (up, client)):
                 self._spawn(self._pump, f"fault-{self.name}-pump", self._threads, conn, src, dst)

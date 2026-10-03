@@ -186,3 +186,25 @@ def test_no_thread_starts_after_close(echo_server):
     p._spawn(ran.set, "late-pump", p._threads)  # an accept loop racing close() must not start a pump
     assert not ran.wait(0.2) and p._threads == []
 
+
+def test_refuse_and_cut_racing_upstream_connect(echo_server, monkeypatch):
+    import netbridge_e2e.faultproxy as fpmod
+    real_create_connection = socket.create_connection
+
+    def race_create_connection(addr, timeout=None):
+        up = real_create_connection(addr, timeout=timeout)
+        # refuse(True) + cut() land between upstream connect and registration
+        fp.refuse(True)
+        fp.cut()
+        return up
+
+    monkeypatch.setattr(fpmod.socket, "create_connection", race_create_connection)
+    fp = FaultProxy(echo_server, "race")
+    fp.start()
+    try:
+        s = socket.create_connection(("127.0.0.1", fp.port), timeout=5)
+        assert ended(s, timeout=2)
+        assert wait_until(lambda: fp.active() == 0)
+    finally:
+        fp.close()
+

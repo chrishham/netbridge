@@ -45,6 +45,7 @@ class Journey:
         self.cov = E2ECoverage(Path(args.coverage).resolve()) if args.coverage else None
         self.coverage: dict | None = None
         self._agent_up = 0.0  # monotonic start of the agent's current relay session
+        self._agent_up_sessions = 0  # session count when _agent_up was last set
 
     # --- bookkeeping -------------------------------------------------------
 
@@ -177,6 +178,7 @@ class Journey:
             self.step(f"{comp.name}_connected", m is not None, m.group(0) if m else comp.logs.tail())
             if comp is agent:
                 self._agent_up = time.monotonic()
+                self._agent_up_sessions = self._agent_sessions(agent)
         paired = relay.wait_paired(30)
         self.step("relay_paired", paired is not None, json.dumps(paired or relay.status()))
 
@@ -302,6 +304,7 @@ class Journey:
                   f"traffic flows again {took:.0f}s after the relay came back" if recovered
                   else f"no working tunnel within 60s of the relay coming back ({last}; relay {relay.status()})")
         self._agent_up = time.monotonic()
+        self._agent_up_sessions = self._agent_sessions(agent)
         for comp in (agent, proxy):
             m = comp.logs.wait_for(RELAY_SESSION, 10, since=marks[comp.name])
             self.step(f"{comp.name}_reconnected", m is not None, m.group(0) if m else comp.logs.tail())
@@ -332,7 +335,11 @@ class Journey:
         # the agent resets its reconnect delay only after a 60 s session; if it reconnected
         # on its own while we waited, the session is new and the wait starts over.
         # Bounded: an agent that never holds a session (or dies) must not hang the job.
-        seen, give_up = self._agent_sessions(agent), time.monotonic() + max_wait
+        seen = self._agent_sessions(agent)
+        if seen != self._agent_up_sessions:
+            self._agent_up = time.monotonic()
+            self._agent_up_sessions = seen
+        give_up = time.monotonic() + max_wait
         while (wait := self._agent_up + min_age - time.monotonic()) > 0:
             if not agent.alive() or time.monotonic() >= give_up:
                 why = "agent exited" if not agent.alive() else f"no stable agent session after {max_wait:.0f}s"
@@ -427,6 +434,7 @@ class Journey:
                   f"after {time.monotonic() - t0:.1f}s" + ("" if ended else f"; {self._evidence(relay, agent, proxy)}"))
         self.check("agent_cut_recovers", lambda: recovered(t0, 45, agent, CONNECTED, mark))
         self._agent_up = time.monotonic()
+        self._agent_up_sessions = self._agent_sessions(agent)
 
         # 3-4: proxy link cut (the agent is unaffected)
         mark = proxy.logs.mark()
@@ -460,6 +468,7 @@ class Journey:
                   f"stream ended: {ended} after {ended_after:.1f}s; CONNECT during blackhole: {how}; {traffic}"
                   + ("" if ended and replied else f"; {self._evidence(relay, agent, proxy)}"))
         self._agent_up = time.monotonic()
+        self._agent_up_sessions = self._agent_sessions(agent)
 
         # 6: relay unreachable for both clients
         self._await_agent_session(relay, agent)
@@ -475,6 +484,7 @@ class Journey:
         t1 = time.monotonic()
         self.check("relay_reachable_recovers", lambda: recovered(t1, 90))
         self._agent_up = time.monotonic()
+        self._agent_up_sessions = self._agent_sessions(agent)
 
         # 7: agent process down, then restarted
         agent.stop()
@@ -500,6 +510,7 @@ class Journey:
 
         self.check("agent_restarted", restarted)
         self._agent_up = time.monotonic()
+        self._agent_up_sessions = self._agent_sessions(agent)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

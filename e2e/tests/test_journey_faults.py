@@ -301,6 +301,19 @@ def test_await_session_gives_up_when_the_agent_dies(j, clock):
     assert clock.sleeps == [5]
 
 
+def test_await_session_resets_if_reconnect_happened_before_call(j, clock):
+    agent = FakeComp("agent")
+    agent.connect()  # session 1
+    j._agent_up = clock.now
+    j._agent_up_sessions = j._agent_sessions(agent)
+    clock.now += 70  # 70 s pass
+    agent.connect()  # session 2 appears between last recovery and the call
+    call_time = clock.now
+    j._await_agent_session(FakeRelay(agent), agent)
+    # the full min_age (65 s) is waited from the call, not from the old _agent_up
+    assert clock.now == call_time + 65
+
+
 # --- _wait_traffic ---------------------------------------------------------------
 
 def test_wait_traffic_success(j, monkeypatch, clock):
