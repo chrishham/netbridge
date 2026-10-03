@@ -25,4 +25,15 @@ package = true
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24.0",
+    "pytest-cov>=7.1.0",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["src/socks_proxy"]
+
+[tool.coverage.report]
+fail_under = 46
+precision = 2
+show_missing = true
+skip_covered = true

@@ -32,8 +32,19 @@ dev = [
     "pytest>=9.0.3",
     "pytest-aiohttp>=1.1.0",
     "pytest-asyncio>=1.0.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
+source = ["src/netbridge_agent"]
+
+[tool.coverage.report]
+fail_under = 35
+precision = 2
+show_missing = true
+skip_covered = true

@@ -14,8 +14,19 @@ shared-auth = { path = "../shared" }
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
     "shared-auth",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["src/netbridge_e2e"]
+
+[tool.coverage.report]
+fail_under = 57
+precision = 2
+show_missing = true
+skip_covered = true
