@@ -37,7 +37,7 @@ branch = true
 source = ["src/socks_proxy"]
 
 [tool.coverage.report]
-fail_under = 50
+fail_under = 54
 precision = 2
 show_missing = true
 skip_covered = true
