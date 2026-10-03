@@ -161,7 +161,10 @@ margin):
    the client does not give up before the relay can answer) must not hang: it must return an
    error reply within 30 s of `t0` (fail-fast starts once the relay detects
    the dead agent, ~15–16 s, and the relay's `tcp_close` fails the pending
-   connect — see §4). Traffic must flow again within 75 s of `t0` (client
+   connect — see §4). The CONNECT is issued immediately after `t0`, ~15 s
+   before either side can notice the dead link, so the relay registers and
+   forwards it to the (dead) agent and it is pending when the relay's
+   cleanup sends `tcp_close` — that is the path under test. Traffic must flow again within 75 s of `t0` (client
    ping timeout ~15 s + reconnect delay ≤ 20 s through a fresh, unaffected
    connection).
 6. **`relay_unreachable_fails_fast`** — `refuse(True)` on both links, then
@@ -173,8 +176,10 @@ margin):
    unreachable, what the proxy maps a missing relay/agent to), not just any
    error.
 7. **`agent_down_fails_fast`** — stop the agent process. A SOCKS connect
-   must fail with a `ProxyError` within 15 s of the stop, each attempt
-   returning within 10 s. **`agent_restarted`** — start the agent again
+   must fail with `0x04` within 15 s of the stop, each attempt returning
+   within 10 s; at that moment relay `/status` must show 0 agents and the
+   proxy link must still have an active connection, so the refusal comes
+   from "no agent", not from a proxy disconnect. **`agent_restarted`** — start the agent again
    (same install/config); traffic within 60 s and relay `/status` shows
    exactly one agent.
 
@@ -244,7 +249,11 @@ Fakes live next to the tests that use them; no real timers (patch
     idle longer than `RELAY_STREAM_TIMEOUT`, leaves fresh streams alone, and
     does not close a stream whose activity is refreshed between the scan and
     the removal (bug 3; interleaving forced with a hook/patched lock).
-- **agent** (`netbridge-agent/tests/test_agent_reconnect.py`):
+- **agent** (`netbridge-agent/tests/test_agent_reconnect.py`) — the
+  reconnect wait is `asyncio.wait_for(stop_event.wait(), timeout=delay)`,
+  so the tests fake that wait (record the timeout, return at once) and feed
+  session durations through a faked `connect_and_run` return value instead
+  of a real clock:
   - a `FlakyConnector` fake (`fail_times=N`, then a fake websocket that
     closes after a configurable lifetime) proves the backoff sequence
     5, 10, 20, 40, 60, 60 for repeated short-lived connections and the reset
@@ -254,6 +263,8 @@ Fakes live next to the tests that use them; no real timers (patch
   - disconnect calls `close_all_streams` (target sockets closed, pending
     connects cancelled).
 - **socks-proxy** (`socks-proxy/tests/test_tunnel_reconnect.py`):
+  - a relay `tcp_close` for a stream whose connect is pending fails that
+    connect with `ConnectionError` at once;
   - `_receive_loop` ending (closed websocket) closes every StreamHandler,
     and a handler with a pending connect fails it immediately with
     `ConnectionError` (bug 1) — the SOCKS layer then answers `0x04`;
@@ -275,8 +286,9 @@ commit with a unit test, and the finding is listed in the final report.
 No new jobs. `ci.yml` `e2e-source`, `release-relay.yml` (image mode) and
 `e2e-windows.yml` (exe mode) already run the journey, so they gain the fault
 steps automatically. The e2e-source job timeout (20 min) is kept; the new
-steps add at most ~7 min in the worst case (sum of step deadlines), typically
-~2 min. `e2e-windows.yml` has 45 min.
+steps add at most ~8 min in the worst case (sum of step deadlines plus up
+to three 65 s session-age waits), typically ~4 min; the whole source journey
+stays well under 20 min. `e2e-windows.yml` has 45 min.
 
 ## Error handling
 
