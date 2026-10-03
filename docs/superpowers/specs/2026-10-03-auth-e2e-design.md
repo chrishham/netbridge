@@ -67,7 +67,8 @@ class AuthStub:
     tenant: str
     kid: str
     jwks_url: str                  # http://127.0.0.1:<port>/<tenant>/discovery/v2.0/keys
-    key_path: Path                 # PEM private key in the work dir, mode 0600
+    key_path: Path                 # PEM private key in a private temp dir OUTSIDE the work dir
+                                   #   (the work dir is uploaded as a CI artifact), mode 0600, removed by close()
     def start(self) -> None        # HTTP server thread serving the JWKS (only that path; 404 otherwise)
     def close(self) -> None
     def mint(self, *, upn="e2e@netbridge.test", lifetime=3600, **overrides) -> str
@@ -169,8 +170,11 @@ masked text frames out, text frames in; enough for one JSON request and its
 reply). The driver connects to `/tunnel` as `other@netbridge.test` and sends
 `{"type": "tcp_connect", "stream_id": <random>, "host": <target ip>, "port":
 <http port>}`; it must receive `tcp_connect_result` with `success: false` and
-the relay's "No bridge agent available" error within 10 s — the agent of
-`e2e@netbridge.test` is connected the whole time. Then, as a control, a
+the relay's "No bridge agent available" error within 10 s. To prove the
+precondition (the journey user's agent really is connected during the
+attempt), a SOCKS echo stream of the journey user is opened and round-tripped
+**before** the other-user attempt and round-tripped again **after** it, on the
+same connection. Then, as a control, a
 `WsClient` for `e2e@netbridge.test` sending the same request gets
 `success: true` (it is answered by the real agent; the driver then sends
 `tcp_close`).
@@ -196,8 +200,12 @@ the relay's "No bridge agent available" error within 10 s — the agent of
 - Journey step after `auth_user_isolation`: run
   `uv run --project security-tests python security-tests/pentest_suite.py
   ws://127.0.0.1:<relay> --token <stub.mint(upn="pentest@netbridge.test")>
-  --strict --skip rapid_connection_dos` with a 180 s timeout; pass if exit
-  code 0 (every non-skipped test passed). Its full
+  --strict --skip rapid_connection_dos --skip session_hijack --skip
+  stream_id_enumeration` with a 180 s timeout; pass if exit code 0 (every
+  non-skipped test passed). `session_hijack` and `stream_id_enumeration` are
+  skipped because they are not observable tests (one connection without a
+  separation check; a hard-coded pass): cross-user separation is proven by
+  `auth_user_isolation`, stream ownership by the relay unit tests from B. Its full
   output is saved to `<work>/logs/pentest.log` and the summary line goes in
   the step detail. Source mode only (needs the checkout); in exe mode the
   step records "skipped" with the reason. The journey passes
@@ -211,7 +219,12 @@ the relay's "No bridge agent available" error within 10 s — the agent of
   in-test, `_get_jwks` patched to return them, module caches reset:
   valid RS256 token accepted with identity; bad signature, unknown `kid`
   after one refetch (refetch happens exactly once), non-RS256 key `alg`,
-  missing identity → rejected; `NETBRIDGE_ALLOWED_USERS` (upn and oid) and
+  missing identity → rejected; **key rotation through the real cache**: a
+  loopback HTTP server stands in for the key endpoint (`_get_jwks_url`
+  patched to it, `_get_jwks` NOT mocked) serving key A, a token signed by A
+  is accepted (JWKS now cached); the server switches to key B (new kid); a
+  token signed by B is accepted after exactly one more fetch, and a token
+  signed by A afterwards is rejected; `NETBRIDGE_ALLOWED_USERS` (upn and oid) and
   `NETBRIDGE_ALLOWED_GROUPS` allow/deny.
 - **agent** (`netbridge-agent/tests/test_agent_auth.py`): `run_agent` with a
   faked `connect_and_run` raising `WSServerHandshakeError(401)`: token
