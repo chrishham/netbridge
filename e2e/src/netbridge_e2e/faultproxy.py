@@ -97,6 +97,8 @@ class FaultProxy:
                 if not ready:
                     continue
                 data = src.recv(65536)
+                # blackholed too: a FIN/close from either side ends both legs, so detection is
+                # whichever side's heartbeat times out first (intended)
                 if not data:
                     break
                 if conn.state == "open":  # blackholed: keep draining, forward nothing
