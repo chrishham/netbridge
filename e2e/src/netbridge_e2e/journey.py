@@ -39,6 +39,8 @@ OTHER_TENANT = "22222222-2222-2222-2222-222222222222"
 OTHER_USER = "other@netbridge.test"
 NO_AGENT = "No bridge agent available"
 PENTEST_USER = "pentest@netbridge.test"
+NXDOMAIN = "netbridge-e2e-nxdomain.invalid"
+LINK_LOCAL = "169.254.169.254"
 # not observable here: rate limits are raised on purpose (FAULT_TUNING), session_hijack makes one
 # connection without a separation check, stream_id_enumeration is a hard-coded pass
 PENTEST_SKIPS = ("rapid_connection_dos", "session_hijack", "stream_id_enumeration")
@@ -211,7 +213,8 @@ class Journey:
         self.step("az_called", n >= 2, f"{n} token requests went through the fake az")
 
         self._traffic(ip, targets, relay)
-        self._filter(ip, targets, relay)
+        self._filter(ip, targets, relay, agent)
+        self._errors(ip, targets, relay, agent)
         self.check("auth_user_isolation", lambda: self._user_isolation(relay, stub, ip, targets))
         self._pentest_step(relay, stub, env, logs)
         self._reconnect(relay, agent, proxy, ip, targets)
@@ -302,19 +305,77 @@ class Journey:
         self.check("bulk_payload", bulk_payload)
         self.check("concurrency", concurrency)
 
-    def _filter(self, ip: str, targets: Targets, relay: Relay) -> None:
+    def _filter(self, ip: str, targets: Targets, relay: Relay, agent) -> None:
         def blocked():
+            rmark, amark = relay.logs.mark(), agent.logs.mark()
             start = time.monotonic()
             try:
                 sock = clients.socks5_connect(self.socks, ip, targets.blocked_port, timeout=30)
             except clients.ProxyError as e:
-                logged = relay.logs.wait_for(rf"Blocked port {targets.blocked_port}\b", 5)
-                return logged is not None, (f"SOCKS5 reply {e.code} after {time.monotonic() - start:.1f}s, "
-                                            f"relay logged the block: {logged is not None}")
+                secs = time.monotonic() - start
+                logged = relay.logs.wait_for(rf"Blocked port {targets.blocked_port}\b", 5, since=rmark)
+                reached_agent = agent.logs.wait_for(r"Connected: .* -> .*:" + str(targets.blocked_port), 1, since=amark)
+                ok = e.code == 0x04 and logged is not None and reached_agent is None
+                return ok, (f"SOCKS5 reply {e.code:#04x} (want 0x04) after {secs:.1f}s, relay logged the block: "
+                            f"{logged is not None}, agent connected anyway: {reached_agent is not None}")
             sock.close()
             return False, f"connection to blocked port {targets.blocked_port} was allowed"
 
         self.check("relay_filter", blocked)
+
+    def _error_case(self, relay, agent, front_end: str, host: str, port: int, expect: int, budget: float,
+                    agent_log: str | None = None, relay_log: str | None = None,
+                    not_relay_log: str | None = None):
+        def run() -> tuple[bool, str]:
+            rmark, amark = relay.logs.mark(), agent.logs.mark()       # before the action
+            got, secs = self._fail_case(front_end, host, port, budget)
+            detail = f"{front_end} {host}:{port} -> {got!r} after {secs:.1f}s (expected {expect})"
+            if got != expect:
+                return False, detail
+            if agent_log:
+                hit = agent.logs.wait_for(agent_log, 5, since=amark)
+                detail += f"; agent log {agent_log!r}: {hit is not None}"
+                if hit is None:
+                    return False, detail
+            if relay_log:
+                hit = relay.logs.wait_for(relay_log, 5, since=rmark)
+                detail += f"; relay log {relay_log!r}: {hit is not None}"
+                if hit is None:
+                    return False, detail
+            if not_relay_log:
+                seen = relay.logs.wait_for(not_relay_log, 1, since=rmark)
+                detail += f"; relay logged {not_relay_log!r}: {seen is not None}"
+                if seen is not None:
+                    return False, detail
+            return True, detail
+        return run
+
+    def _errors(self, ip: str, targets: Targets, relay: Relay, agent) -> None:
+        self.check("errors_baseline_clean", lambda: self._wait_streams_zero(relay, within=10))
+        groups = [
+            ("refused", ip, targets.refused_port, 10, "Failed:", None, None,
+             ("socks5", "http_connect", "http_forward")),
+            ("dns_failure", NXDOMAIN, 80, 20, "Failed:", None, None,
+             ("socks5", "http_connect", "http_forward")),
+            ("agent_denies", LINK_LOCAL, 80, 10, "Destination denied", None, r"Blocked port",
+             ("socks5", "http_connect", "http_forward")),
+            ("blocked_port", ip, targets.blocked_port, 10, None, rf"Blocked port {targets.blocked_port}\b", None,
+             ("http_connect", "http_forward")),
+        ]
+        for name, host, port, budget, alog, rlog, not_rlog, fronts in groups:
+            for front in fronts:
+                expect = 4 if front == "socks5" else 502
+                self.check(f"{name}_{front}", self._error_case(
+                    relay, agent, front, host, port, expect, budget, alog, rlog, not_rlog))
+
+        def healthy():
+            status, body = self._socks_get(ip, targets)
+            if (status, body) != (200, PAGE):
+                return False, f"tunnel unhealthy after the error group: HTTP {status}, {len(body)} bytes"
+            ok, detail = self._wait_streams_zero(relay, within=5)
+            return ok, f"HTTP 200 after the errors; {detail}"
+
+        self.check("errors_leave_tunnel_healthy", healthy)
 
     # --- auth ----------------------------------------------------------------
 
