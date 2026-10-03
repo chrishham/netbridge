@@ -130,6 +130,14 @@ Rules for every fault step:
   connection (`link.active() >= 1`), and assert the injection affected at
   least one connection (`cut()`/`blackhole()` return value ≥ 1) — otherwise a
   spontaneous earlier disconnect could make the checks pass vacuously.
+- Agent backoff: the agent resets its reconnect delay only after a session
+  that lasted ≥ 60 s (`HEALTHY_CONNECTION_THRESHOLD`), otherwise the next
+  delay can already be 20–60 s. Before every fault that disconnects the agent
+  (steps 1, 5, 6), the driver waits until the agent's current session is at
+  least 65 s old (it records when it last observed the agent's
+  `Connected to relay` line / recovery), so each recovery starts from the 5 s
+  delay and the deadlines below hold. Proxy-only faults run inside those
+  waits where possible to keep the journey short.
 - The fault time `t0` is recorded once at injection; every deadline of that
   fault (stream end, recovery, log line) is measured from `t0`, not from the
   start of its own step.
@@ -148,7 +156,9 @@ margin):
 5. **`agent_blackhole_detected`** — open an echo stream,
    `agent_link.blackhole()`; the stream must end within 45 s (relay ping
    timeout → `agent_disconnected`). While the link is still blackholed, a new
-   SOCKS CONNECT issued right after `t0` must not hang: it must return an
+   SOCKS CONNECT issued right after `t0` (in a worker thread, concurrently
+   with waiting for the open stream to end, with a socket timeout of 28 s so
+   the client does not give up before the relay can answer) must not hang: it must return an
    error reply within 30 s of `t0` (fail-fast starts once the relay detects
    the dead agent, ~15–16 s, and the relay's `tcp_close` fails the pending
    connect — see §4). Traffic must flow again within 75 s of `t0` (client
@@ -189,11 +199,16 @@ its own commit:
    `finally` removes every stream of that user and notifies
    `agent_disconnected`, including streams created through the new agent.
    Fix: each stream records the agent websocket it was routed to
-   (`agent_ws`, set in `tcp_connect` from `bridge_agents[user]`). A closing
-   agent handler closes and notifies (`agent_disconnected`) only the streams
-   whose `agent_ws` is itself — so the old agent's streams end promptly and
-   the new agent's survive — and unregisters `bridge_agents[user]` only if it
-   still points at itself.
+   (`agent_ws`, set in `tcp_connect` from `bridge_agents[user]`), and that
+   recorded owner is used for the stream's whole life — tunnel→agent
+   `tcp_data`/`tcp_close` forwarding, the stale sweep's notifications and the
+   tunnel-disconnect notifications — instead of looking up the *current*
+   agent, so an old stream's bytes never reach a replacement agent. A
+   closing agent handler closes and notifies (`agent_disconnected`) only the
+   streams whose `agent_ws` is itself — the old agent's streams end promptly
+   and the new agent's survive — and unregisters `bridge_agents[user]` only if
+   it still points at itself. Agent→tunnel messages for a stream are accepted
+   only from its recorded owner.
 3. **Stale-stream sweep can close a stream that just became active**
    (relay). `cleanup_stale_streams` collects stale ids under the lock,
    releases it, then removes them without re-checking `last_activity`. Fix:
@@ -221,7 +236,10 @@ Fakes live next to the tests that use them; no real timers (patch
   - tunnel client disconnect → the agent receives `tunnel_client_disconnected`;
   - a second agent for the same user replaces the first: the first is
     closed, the replacement stays registered, and a stream created through
-    the replacement survives the first handler's cleanup (bug 2);
+    the replacement survives the first handler's cleanup, a stream opened
+    through the first agent is closed with `agent_disconnected`, and
+    `tcp_data` for that old stream sent during the handover is never
+    forwarded to the replacement (bug 2);
   - `cleanup_stale_streams` sends `idle_timeout` to both sides for a stream
     idle longer than `RELAY_STREAM_TIMEOUT`, leaves fresh streams alone, and
     does not close a stream whose activity is refreshed between the scan and
