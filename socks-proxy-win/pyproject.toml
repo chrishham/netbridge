@@ -27,10 +27,12 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=7.1.0",
+    "pytest-socket>=0.8.1",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--allow-hosts=127.0.0.1,::1,localhost"
 
 [tool.coverage.run]
 branch = true
