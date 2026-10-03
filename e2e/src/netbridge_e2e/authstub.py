@@ -141,8 +141,10 @@ class AuthStub:
     def close(self):
         """Stop the server and clean up resources."""
         if self._server:
-            self._server.shutdown()
-            self._server_thread.join(timeout=5)
+            if self._server_thread and self._server_thread.is_alive():
+                self._server.shutdown()  # blocks forever unless serve_forever is running
+                self._server_thread.join(timeout=5)
+            self._server.server_close()
             self._server = None
 
         # Remove key directory

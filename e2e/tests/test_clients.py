@@ -441,3 +441,24 @@ def test_ws_upgrade_against_real_relay(tmp_path):
             relay.stop()
     finally:
         auth.close()
+
+
+def test_ws_recv_json_deadline_is_overall_not_per_frame(monkeypatch):
+    """A relay that only ever pings must not keep recv_json waiting forever."""
+    a, b = socket.socketpair()
+    try:
+        ws = clients.WsClient(a)
+
+        def ping():
+            time.sleep(0.05)
+            return 9, b""
+
+        monkeypatch.setattr(ws, "_recv_frame", ping)
+        monkeypatch.setattr(ws, "_send_frame", lambda *args, **kw: None)
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            ws.recv_json(0.3)
+        assert time.monotonic() - start < 1
+    finally:
+        a.close()
+        b.close()

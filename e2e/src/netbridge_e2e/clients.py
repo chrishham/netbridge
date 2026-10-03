@@ -244,9 +244,13 @@ class WsClient:
         self._send_frame(1, payload, masked=True)
 
     def recv_json(self, timeout: float) -> dict:
-        """Receive JSON, skipping pings (auto-ponged). Raises on close frame."""
-        self.sock.settimeout(timeout)
+        """Receive JSON, skipping pings (auto-ponged). Raises on close frame or after `timeout` overall."""
+        deadline = time.monotonic() + timeout
         while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"no message within {timeout:g}s")
+            self.sock.settimeout(left)
             opcode, payload = self._recv_frame()
             if opcode == 1:  # text
                 return json.loads(payload.decode("utf-8"))
