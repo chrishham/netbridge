@@ -337,14 +337,31 @@ required"}` and no traceback, with unit tests for both routes (`[1]`, `"x"`,
 
 `NetBridgeApp` gets a separate app-lifetime event, `self._shutdown_event`,
 created once in `_async_main` and awaited there instead of `_stop_event`.
-`request_exit()` sets `_shutdown_event` (via `call_soon_threadsafe` as today)
-**and** the current per-connection `_stop_event` so an active agent stops;
-`_run_agent` keeps creating a fresh per-connection `_stop_event`. Disconnect
-from the tray keeps signalling only the per-connection event. Test
-(`test_app.py`): start `_async_main` with a fake `run_agent` that blocks on its
-stop event; after the agent has started (event replaced), `request_exit()` ends
-`_async_main` within a short timeout, the fake agent is stopped, and the
-intercept server is stopped; disconnect still leaves the app running.
+All three exit paths go through one helper `_signal_exit()`: it sets
+`_pending_exit`, signals `_shutdown_event` via `call_soon_threadsafe` when the
+loop and event exist, and also sets the current per-connection `_stop_event` so
+an active agent stops. It is called by `request_exit` (`app.py:540`),
+`request_restart` (`app.py:228`, after the new process is launched) and
+`request_install` (`app.py:327`, before `Installer.install_fresh`), each of
+which today signals only `_stop_event`. `_run_agent` keeps creating a fresh
+per-connection `_stop_event`; tray Disconnect keeps signalling only that one.
+
+An exit requested **before** the shutdown event exists (the tray can call
+`request_exit` while `_async_main` is still starting the intercept server and
+plugins) must not be lost: `_pending_exit` is already set by the helper, and
+`_async_main` checks it right after start-up and right before waiting, setting
+the shutdown event itself so the normal shutdown sequence still runs.
+
+Tests (`test_app.py`): start `_async_main` with a fake `run_agent` that blocks
+on its stop event; after the agent has started (event replaced) each of
+`request_exit`, `request_restart` (non-Windows: the platform check and Popen
+patched, so only the signalling is under test) and `request_install`
+(`Installer.install_fresh` and `os._exit` patched) ends `_async_main` within a
+short timeout, stops the fake agent and the intercept server; an exit
+requested before `_async_main` creates the event (called from another thread
+before the loop runs, and again between start-up steps via a fake intercept
+server that triggers it) still ends it; disconnect still leaves the app
+running.
 
 ### 3-bis. Field-type validation at every receiver
 
@@ -360,21 +377,32 @@ for a live stream); the receive loop never dies.
   warned and dropped before it is used as a key.
 - **Relay** (both loops): `tcp_data.data` must be `str`, else dropped and not
   forwarded (`__main__.py:623, 817`); `tcp_connect_result.success` must be
-  `bool` and `error` `str | None`, else the result is dropped with a warning
-  (the tunnel client then times out on its own side; an agent that sends garbage
-  results is misbehaving). `success:false` with `error` null or non-str is
-  valid and forwarded; the relay does not interpret `error`.
+  `bool`, else the result is dropped with a warning. Contract for `error`:
+  with `success:false` it **must be a `str`** (every real agent and relay-side
+  rejection sends one), otherwise the relay warns and drops the result (the
+  tunnel client then times out on its own side; a peer sending garbage results
+  is misbehaving); with `success:true` it may be absent or `null`, anything else
+  is dropped.
+- **Agent `tcp_connect`** (`handle_tcp_connect`, `agent.py:409`, which reads
+  `host`/`port` unchecked; `is_magic_hostname` calls `host.lower()`,
+  `intercept.py:28`): before any magic-host handling the agent requires `host`
+  to be a non-empty `str` and `port` a non-bool `int` in 1-65535; otherwise it
+  replies `tcp_connect_result{success:false, error:"Invalid host or port"}` for
+  the (valid) `stream_id` and the loop continues. Tests: `host: []`,
+  `host: null`, `port: true`, `port: "80"` (plus out-of-range ports).
 - **Agent** (`handle_tcp_data`, `agent.py:570`): `data` must be `str`
   (`len(None)` crashes before any size guard today); otherwise warn, close the
   stream, return. Invalid base64 is handled the same way.
 - **Proxy** (`tunnel.py:891`): `tcp_data.data` must be a `str` and decode as
-  base64 (`validate=True`), else warn and close that stream
-  (`handler.close()`, release the semaphore); an uncaught `b64decode` error
-  no longer ends the receive loop. `tcp_connect_result` is checked the same
-  way as in the relay (`success` bool, `error` str or None); an invalid result
-  fails that connect with `ConnectionError("Invalid connect result")`. For
-  `success:false` the proxy normalises a missing/None/non-str `error` to
-  `"Unknown error"` before `classify_connect_error` (which calls `.lower()`,
+  base64 (`validate=True`), else warn and close that stream through `TunnelManager.close_stream(stream_id)`
+  (`tunnel.py:760`), which closes the handler, pops it from `self.streams`,
+  releases the semaphore and sends `tcp_close` to the relay; an uncaught `b64decode` error
+  no longer ends the receive loop. `tcp_connect_result` requires `success` to be a
+  `bool`; an invalid result fails that connect with
+  `ConnectionError("Invalid connect result")`. The relay already enforces the
+  `error` contract above, so as a **defensive measure** (older or non-conforming
+  relay) the proxy normalises a missing or non-str `error` on `success:false`
+  to `"Unknown error"` before `classify_connect_error` (which calls `.lower()`,
   `tunnel.py:136`) and `TunnelConnectError` (`tunnel.py:742`), so the front
   ends still answer the pinned 0x04 / 502.
 - **Invalid JSON syntax:** the proxy's receive loop (`tunnel.py:867`) calls
@@ -385,13 +413,15 @@ for a live stream); the receive loop never dies.
   `json.JSONDecodeError` per frame and continue, so they need no change for
   syntax errors (only for non-objects, above).
 
-Tests, bidirectional (every case also covers `stream_id` null, a list and a 129-character value, and `success:false` with `error: null`; proxy additionally malformed JSON syntax followed by a valid message that is still processed): relay `test_relay_malformed.py` (tcp_data with
+Tests, bidirectional (every case also covers `stream_id` null, a list and a 129-character value, and a `success:false` result with `error: null` (relay: dropped; proxy fed directly: normalised to `Unknown error`, connect still ends in the pinned 0x04); proxy additionally malformed JSON syntax followed by a valid message that is still processed): relay `test_relay_malformed.py` (tcp_data with
 `None`/int/list data both directions, results with non-bool `success`,
-non-str `error`: dropped, connection stays up, next valid message works);
+`success:false` with non-str or missing `error` (dropped), `success:true` with
+`error: null` (accepted), connection stays up, next valid message works);
 `netbridge-agent/tests/test_agent_malformed.py` (`tcp_data` with
 `None`/int/non-base64 data); `socks-proxy/tests/test_tunnel_malformed.py`
-(bad base64, non-str data, bad result fields: receive loop survives, stream
-closed, later valid traffic still delivered).
+(bad base64, non-str data, bad result fields: receive loop survives; the stream
+is removed from `streams` **and** a `tcp_close` is sent on the websocket, both
+asserted; later valid traffic still delivered).
 
 ### 3a. Relay: release failed streams (F6a)
 
@@ -649,7 +679,7 @@ lines (it forces the guards and `AppKey` lines to be tested).
 | 21 | Guard legacy and `remote_exec` JSON parsing too; legacy test optional | relay/agent/proxy only | Shipped code paths with the same crash; remote_exec gets 400 instead of 500 |
 | 22 | `missing_service` is a unit test, not a journey step | journey step | The name is not magic, so the journey would test plain DNS |
 | 23 | Floors use `floor(measured)` | measured minus 1 | Matches `coverage_report.py:41` |
-| 25 | Fix F6d: separate app-shutdown event from the per-connection stop event | stop replacing `_stop_event` | Exit after the agent started is silently ignored today; a dedicated event keeps disconnect semantics intact |
+| 25 | Fix F6d: separate app-shutdown event from the per-connection stop event; one `_signal_exit()` for exit/restart/install; early exit honoured via `_pending_exit` | stop replacing `_stop_event` | Exit, restart and install after the agent started are silently ignored today; a dedicated event keeps disconnect semantics intact; an exit during start-up must not be lost |
 | 26 | `stream_id` (non-empty str, <= 128) and field types validated at every receiver; proxy normalises `error` and survives bad JSON syntax | relay-only checks | One bad frame must never end a receive loop or change the pinned 0x04/502 |
 | 27 | `validate_tcp_connect_params` uses `type(port) is int` | `isinstance` | `bool` is an `int` subclass |
 | 24 | Windows-only internals (DPAPI, `SendInput`, legacy) listed as uncovered | claim journey coverage | Nothing in CI exercises them; follow-up Windows unit job |
