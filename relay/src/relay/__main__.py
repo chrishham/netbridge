@@ -381,6 +381,8 @@ class StreamInfo(TypedDict):
     user_email: str
     tunnel_key: str
     tunnel_ws: web.WebSocketResponse
+    # The agent that opened the stream owns it for its whole life, even after a replacement
+    agent_ws: web.WebSocketResponse
     created_at: float
     last_activity: float
 
@@ -439,11 +441,10 @@ async def cleanup_stale_streams(app: web.Application) -> None:
         for stream_id, data in stale_tcp:
             # Notify both ends
             tunnel_ws = data.get("tunnel_ws")
-            user_email = data.get("user_email")
 
             async with _state_lock:
                 tcp_streams.pop(stream_id, None)
-                agent_ws = bridge_agents.get(user_email) if user_email else None
+            agent_ws = data.get("agent_ws")
 
             close_msg = json.dumps({
                 "type": "tcp_close",
@@ -515,6 +516,39 @@ async def authenticate_request(request: web.Request) -> tuple[bool, str]:
         return True, user_email
     except TokenValidationError as e:
         return False, str(e)
+
+
+async def _cleanup_agent(ws: web.WebSocketResponse, user_email: str) -> None:
+    """Drop a disconnected agent's streams (notifying their tunnels) and its registration."""
+    # Collect streams to remove and their tunnel WebSockets for notification
+    streams_to_notify: list[tuple[str, web.WebSocketResponse]] = []
+
+    async with _state_lock:
+        # Find streams opened through this agent (not through a replacement)
+        streams_to_remove = [
+            sid for sid, data in tcp_streams.items()
+            if data.get("agent_ws") is ws
+        ]
+
+        # Collect tunnel WebSockets to notify before removing streams
+        for sid in streams_to_remove:
+            stream_data = tcp_streams.pop(sid, None)
+            if stream_data:
+                tunnel_ws = stream_data.get("tunnel_ws")
+                if tunnel_ws:
+                    streams_to_notify.append((sid, tunnel_ws))
+
+        # Only remove if this is still the current agent for this user
+        if bridge_agents.get(user_email) is ws:
+            del bridge_agents[user_email]
+
+    # Notify tunnel clients about closed streams (outside lock)
+    for sid, tunnel_ws in streams_to_notify:
+        await safe_ws_send(tunnel_ws, json.dumps({
+            "type": "tcp_close",
+            "stream_id": sid,
+            "reason": "agent_disconnected",
+        }), silent=True)
 
 
 async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
@@ -589,7 +623,10 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
                             stream_data = tcp_streams.get(stream_id)
                             # Verify stream ownership - agent can only
                             # forward data for its own streams
-                            if stream_data and stream_data.get("user_email") != user_email:
+                            if stream_data and (
+                                stream_data.get("user_email") != user_email
+                                or stream_data.get("agent_ws") is not ws
+                            ):
                                 logger.warning(
                                     f"Stream {stream_id} ownership denied "
                                     f"for agent {user_email}"
@@ -624,37 +661,15 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
             elif msg.type == WSMsgType.ERROR:
                 logger.error(f"WebSocket error from {user_email}: {ws.exception()}")
     finally:
-        # Collect streams to remove and their tunnel WebSockets for notification
-        streams_to_notify: list[tuple[str, web.WebSocketResponse]] = []
-
-        async with _state_lock:
-            # Find streams associated with this agent
-            streams_to_remove = [
-                sid for sid, data in tcp_streams.items()
-                if data.get("user_email") == user_email
-            ]
-
-            # Collect tunnel WebSockets to notify before removing streams
-            for sid in streams_to_remove:
-                stream_data = tcp_streams.pop(sid, None)
-                if stream_data:
-                    tunnel_ws = stream_data.get("tunnel_ws")
-                    if tunnel_ws:
-                        streams_to_notify.append((sid, tunnel_ws))
-
-            # Only remove if this is still the current agent for this user
-            if bridge_agents.get(user_email) is ws:
-                del bridge_agents[user_email]
-
-        # Notify tunnel clients about closed streams (outside lock)
-        for sid, tunnel_ws in streams_to_notify:
-            await safe_ws_send(tunnel_ws, json.dumps({
-                "type": "tcp_close",
-                "stream_id": sid,
-                "reason": "agent_disconnected",
-            }), silent=True)
+        await _cleanup_agent(ws, user_email)
 
     return ws
+
+
+def _agent_alive(stream: StreamInfo) -> bool:
+    """Whether the agent that opened `stream` is still open and registered (no await, so atomic)."""
+    agent_ws = stream["agent_ws"]
+    return not agent_ws.closed and bridge_agents.get(stream["user_email"]) is agent_ws
 
 
 async def _handle_tcp_connect(
@@ -776,6 +791,7 @@ async def _handle_tcp_connect(
             "user_email": user_email,
             "tunnel_key": tunnel_key,
             "tunnel_ws": ws,
+            "agent_ws": agent_ws,
             "created_at": now,
             "last_activity": now,
         }
@@ -789,6 +805,7 @@ async def _handle_tcp_data(data: dict, tunnel_key: str, raw_msg: str) -> None:
     stream_id = data.get("stream_id")
 
     # Get stream info under lock and update activity
+    agent_gone = False
     async with _state_lock:
         tcp_data = tcp_streams.get(stream_id)
         if tcp_data:
@@ -798,21 +815,27 @@ async def _handle_tcp_data(data: dict, tunnel_key: str, raw_msg: str) -> None:
                     f"Stream {stream_id} access denied for {tunnel_key}"
                 )
                 tcp_data = None  # Block access
+            elif not _agent_alive(tcp_data):
+                # The stream's agent is gone; it cannot continue on another one
+                tcp_streams.pop(stream_id, None)
+                agent_gone = True
             else:
                 tcp_data["last_activity"] = time.monotonic()
 
-    if tcp_data:
+    if agent_gone:
+        await safe_ws_send(tcp_data["tunnel_ws"], json.dumps({
+            "type": "tcp_close",
+            "stream_id": stream_id,
+            "reason": "agent_disconnected",
+        }), silent=True)
+    elif tcp_data:
         # Apply global bandwidth limit if enabled
         if _global_bandwidth_limiter:
             await _global_bandwidth_limiter.acquire(
                 min(len(raw_msg), _bytes_per_sec)
             )
-        # Forward data to bridge agent
-        stream_user = tcp_data.get("user_email")
-        async with _state_lock:
-            agent_ws = bridge_agents.get(stream_user)
-        if agent_ws:
-            await safe_ws_send(agent_ws, raw_msg)
+        # Forward data to the agent that opened the stream
+        await safe_ws_send(tcp_data["agent_ws"], raw_msg)
 
 
 async def _handle_tcp_close(data: dict, tunnel_key: str, raw_msg: str) -> None:
@@ -832,13 +855,9 @@ async def _handle_tcp_close(data: dict, tunnel_key: str, raw_msg: str) -> None:
                 )
             tcp_data = None
 
-    if tcp_data:
-        # Forward close to bridge agent
-        stream_user = tcp_data.get("user_email")
-        async with _state_lock:
-            agent_ws = bridge_agents.get(stream_user)
-        if agent_ws:
-            await safe_ws_send(agent_ws, raw_msg)
+    # Forward close to the agent that opened the stream (nothing to tell a gone agent)
+    if tcp_data and _agent_alive(tcp_data):
+        await safe_ws_send(tcp_data["agent_ws"], raw_msg)
 
 
 async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
@@ -941,10 +960,7 @@ async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
             for sid in streams_to_remove:
                 stream_data = tcp_streams.pop(sid, None)
                 if stream_data:
-                    stream_user = stream_data.get("user_email")
-                    agent_ws = bridge_agents.get(stream_user)
-                    if agent_ws:
-                        streams_to_notify.append((sid, agent_ws))
+                    streams_to_notify.append((sid, stream_data["agent_ws"]))
 
             # Only remove if this is still the current tunnel client for this session
             if tunnel_clients.get(tunnel_key) is ws:
