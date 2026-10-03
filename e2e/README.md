@@ -17,7 +17,7 @@ for p in relay netbridge-agent socks-proxy e2e; do (cd "$p" && uv sync); done
 uv run --project e2e python -m netbridge_e2e --mode source --work /tmp/nb-e2e
 ```
 
-Add `--coverage DIR` (source mode) to run the relay, agent and proxy under
+Add `--coverage DIR` (source mode, not on Windows) to run the relay, agent and proxy under
 coverage: `DIR/summary.md` and the `coverage` key of `e2e-summary.json` show
 which product code the journey exercised, per package. It is report-only and
 never changes the result; CI's `e2e-source` job shows it in the run summary.

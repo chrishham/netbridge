@@ -322,12 +322,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--allow-existing-install", action="store_true",
                    help="exe mode: overwrite an existing installation (disposable machines only)")
     p.add_argument("--coverage", metavar="DIR",
-                   help="source mode: run relay, agent and proxy under coverage and report per package in DIR (report-only)")
+                   help="source mode, Linux/macOS: run relay, agent and proxy under coverage and report per package in DIR (report-only)")
     args = p.parse_args(argv)
     if args.relay_image and args.mode != "source":
         p.error("--relay-image works in source mode only (the image is a Linux container)")
     if args.coverage and args.mode != "source":
         p.error("--coverage works in source mode only")
+    if args.coverage and IS_WINDOWS:
+        # Proc.stop uses taskkill /F there and coverage's SIGTERM flush is Unix-only: no data would be written
+        p.error("--coverage is not supported on Windows")
     if args.mode == "exe":
         if not IS_WINDOWS:
             p.error("--mode exe runs on Windows only")

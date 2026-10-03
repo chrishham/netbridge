@@ -118,6 +118,13 @@ def test_coverage_flag_rejected_in_exe_mode(monkeypatch, capsys):
     assert "--coverage works in source mode only" in capsys.readouterr().err
 
 
+def test_coverage_flag_rejected_on_windows(monkeypatch, capsys):
+    monkeypatch.setattr(journey, "IS_WINDOWS", True)
+    with pytest.raises(SystemExit):
+        journey.parse_args(["--mode", "source", "--coverage", "x"])
+    assert "--coverage is not supported on Windows" in capsys.readouterr().err
+
+
 def test_summary_includes_coverage(tmp_path, monkeypatch):
     args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
     j = journey.Journey(args)
