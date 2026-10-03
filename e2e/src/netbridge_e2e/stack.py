@@ -44,7 +44,7 @@ def install_plugin_fixtures(plugins_dir: Path, nonce: str) -> list[Path]:
     dirs = []
     for name in ("probe", "broken"):
         dest = plugins_dir / name
-        shutil.copytree(FIXTURES / name, dest)
+        shutil.copytree(FIXTURES / name, dest, dirs_exist_ok=True)
         dirs.append(dest)
     probe = plugins_dir / "probe" / "plugin.py"
     probe.write_text(probe.read_text().replace("__NONCE__", nonce))

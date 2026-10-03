@@ -50,6 +50,8 @@ class Targets:
         self.http_port, self.echo_port, self.blocked_port = (s.server_address[1] for s in self._servers)
         # bound, never listen()ed: connects are refused, and nobody else can take the port
         self._refused = socket.socket()
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows: SO_REUSEADDR-less binds can still be stolen otherwise
+            self._refused.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         self._refused.bind((host, 0))
         self.refused_port = self._refused.getsockname()[1]
         for server in self._servers:

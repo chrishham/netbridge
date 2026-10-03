@@ -383,3 +383,11 @@ def test_fixture_plugins_work_with_the_agents_real_loader(tmp_path):
             return await (await c.get("/")).text()
 
     assert asyncio.run(fetch()) == "netbridge-e2e-plugin n0nce"
+
+
+def test_add_plugins_is_idempotent(tmp_path):
+    agent = stack.SourceAgent(tmp_path, "ws://127.0.0.1:1", env={})
+    agent.install()
+    agent.add_plugins("first")
+    agent.add_plugins("second")
+    assert "second" in (agent.plugins_dir / "probe" / "plugin.py").read_text()

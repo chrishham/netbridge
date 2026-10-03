@@ -563,6 +563,8 @@ class Journey:
                 out["r"] = e.code
             except OSError as e:
                 out["r"] = f"error:{type(e).__name__}"
+            except Exception as e:
+                out["r"] = f"unexpected:{type(e).__name__}"
 
         worker = threading.Thread(target=run, daemon=True)
         worker.start()

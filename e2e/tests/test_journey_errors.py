@@ -1,6 +1,5 @@
 import pytest
 
-from netbridge_e2e import clients, journey
 from netbridge_e2e.targets import Targets
 from tests import fakeproxy
 from tests.test_journey_faults import FakeComp, FakeSock, FakeTime, clock, j  # noqa: F401  (fixtures by name)
@@ -50,11 +49,19 @@ def test_fail_case_hang_is_capped_by_the_budget(j):
 
 
 def test_fail_case_transport_error_is_reported(j):
-    srv, addr = fakeproxy.silent_server()
-    srv.close()                                               # nothing listens any more
-    j.socks = addr
-    got, _ = j._fail_case("socks5", HOST, 80, 5)
+    with Targets("127.0.0.1") as t:
+        j.socks = ("127.0.0.1", t.refused_port)
+        got, _ = j._fail_case("socks5", HOST, 80, 5)
     assert str(got).startswith("error:")
+
+
+def test_fail_case_unexpected_exception_is_not_a_hang(j, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("netbridge_e2e.clients.socks5_connect", boom)
+    got, _ = j._fail_case("socks5", HOST, 80, 5)
+    assert got == "unexpected:RuntimeError"
 
 
 class StatusRelay:
