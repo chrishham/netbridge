@@ -3,6 +3,7 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from socks_proxy.stream import StreamHandler
@@ -148,3 +149,125 @@ async def test_socks_reply_is_host_unreachable_on_pending_close():
                 await handle_socks5_client(reader, writer, tunnel)
 
     assert sent_reply == REPLY_HOST_UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_end_closes_established_streams():
+    """When receive_loop ends, all established streams are closed."""
+    with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+        tm = TunnelManager("relay.com")
+
+    # Create two established streams
+    loop = asyncio.get_running_loop()
+    future1 = loop.create_future()
+    future1.set_result({"success": True})
+    handler1 = StreamHandler(stream_id="s1", connect_future=future1)
+
+    future2 = loop.create_future()
+    future2.set_result({"success": True})
+    handler2 = StreamHandler(stream_id="s2", connect_future=future2)
+
+    tm.streams = {"s1": handler1, "s2": handler2}
+
+    # Create fake websocket that ends immediately
+    fake_ws = AsyncMock()
+    fake_ws.__aiter__ = lambda self: self
+    fake_ws.__anext__ = AsyncMock(side_effect=StopAsyncIteration())
+    tm.ws = fake_ws
+
+    # Run receive_loop
+    await tm._receive_loop()
+
+    # Both handlers must be closed
+    assert handler1.closed is True
+    assert handler2.closed is True
+
+    # Both must return None when read
+    assert await handler1.read() is None
+    assert await handler2.read() is None
+
+
+@pytest.mark.asyncio
+async def test_reconnect_after_failed_handshakes():
+    """Reconnect retries with exponential backoff after handshake failures."""
+    import socks_proxy.tunnel as tunnel_module
+
+    with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+        tm = TunnelManager("relay.com")
+
+    # Track delays and connection attempts
+    recorded_delays = []
+    attempt_count = [0]
+    orig_sleep = tunnel_module.asyncio.sleep
+
+    async def fake_sleep(duration):
+        recorded_delays.append(duration)
+        # Yield control but don't actually sleep the full duration
+        await orig_sleep(0.001)
+
+    # Initial websocket that ends immediately (triggers reconnection)
+    initial_ws = AsyncMock()
+    initial_ws.closed = False
+    initial_ws.__aiter__ = lambda self: self
+    initial_ws.__anext__ = AsyncMock(side_effect=StopAsyncIteration())
+
+    # Patch ws_connect to fail 3 times then succeed
+    async def fake_ws_connect(*args, **kwargs):
+        attempt_count[0] += 1
+        if attempt_count[0] <= 3:
+            raise aiohttp.ClientError("handshake failed")
+        # Succeed on 4th attempt
+        ws = AsyncMock()
+        ws.closed = False
+        ws.__aiter__ = lambda self: self
+        ws.__anext__ = AsyncMock(side_effect=StopAsyncIteration())
+        return ws
+
+    # Set up initial connected state with ws that will end
+    tm._connected.set()
+    tm.ws = initial_ws
+    tm.session = AsyncMock()
+    tm.session.ws_connect = fake_ws_connect
+
+    # Patch sleep at module level
+    with patch.object(tunnel_module.asyncio, "sleep", fake_sleep):
+        # Run connection_loop
+        loop_task = asyncio.create_task(tm._connection_loop())
+
+        # Wait for 4 connection attempts
+        for _ in range(100):
+            if attempt_count[0] >= 4:
+                # Give it a moment to settle
+                await orig_sleep(0.01)
+                break
+            await orig_sleep(0.01)
+
+        # Stop the loop
+        tm._stopping = True
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+
+    # Filter for reconnect delays (>= 4s) - the shortest reconnect is RECONNECT_DELAY=5 with jitter
+    reconnect_delays = [d for d in recorded_delays if d >= 4.0]
+
+    # Should have exactly 3 reconnect delays (attempts 1, 2, 3 failed, 4th succeeded)
+    # Take only the first 3 if we got more due to timing
+    reconnect_delays = reconnect_delays[:3]
+
+    assert len(reconnect_delays) == 3, \
+        f"Expected 3 reconnect delays, got {len(reconnect_delays)}: {reconnect_delays}"
+
+    # Check delays are within expected range
+    # Initial: RECONNECT_DELAY=5, backoff factor=2, jitter up to 30%
+    # Attempt 1 fails: delay = 5 + jitter (0 to 1.5)
+    # Attempt 2 fails: delay = 10 + jitter (0 to 3.0)
+    # Attempt 3 fails: delay = 20 + jitter (0 to 6.0)
+    base_delays = [5, 10, 20]
+    for i, delay in enumerate(reconnect_delays):
+        base = base_delays[i]
+        max_delay = base * 1.3
+        assert base <= delay <= max_delay, \
+            f"Delay {delay} not in range [{base}, {max_delay}]"
