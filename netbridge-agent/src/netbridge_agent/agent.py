@@ -130,6 +130,19 @@ def _normalize_ip(addr):
     return addr
 
 
+def _in_deny_network(ip, net) -> bool:
+    """Deny-list match that also tries an IPv4 address in its ::ffff: form.
+
+    _normalize_network only rewrites mapped entries of /96 or narrower; a wider
+    IPv6 entry (e.g. ::ffff:0:0/95) still covers mapped addresses and must deny
+    them. Only used for deny entries: widening an allow entry would loosen policy.
+    """
+    if ip in net:
+        return True
+    return (isinstance(ip, ipaddress.IPv4Address) and isinstance(net, ipaddress.IPv6Network)
+            and ipaddress.IPv6Address(f"::ffff:{ip}") in net)
+
+
 def _normalize_network(net):
     """Rewrite an IPv4-mapped IPv6 network (::ffff:a.b.c.d/N, N >= 96) as IPv4.
 
@@ -243,9 +256,9 @@ async def select_destinations(
             except ValueError:
                 if host_ip is None and host_name == entry.rstrip(".").lower():
                     return [], f"Destination {host} is denied"
-        kept = [ip for ip in ips if not any(ip in n for n in deny_nets)]
+        kept = [ip for ip in ips if not any(_in_deny_network(ip, n) for n in deny_nets)]
         if ips and not kept:
-            net = next(n for n in deny_nets if ips[0] in n)
+            net = next(n for n in deny_nets if _in_deny_network(ips[0], n))
             return [], f"Destination {host} is denied (matches {net})"
         ips = kept
 

@@ -302,3 +302,17 @@ async def test_malformed_connect_reusing_a_live_id_gets_no_rejection(host, port,
     await handle_message(state, ws, _connect("A", host, port))
     ws.send_str.assert_not_awaited()
     assert "A" in state.active_streams
+
+
+@pytest.mark.parametrize("entry", ["::ffff:0:0/95", "::/0", "::ffff:10.0.0.0/104"])
+async def test_wide_ipv6_deny_entries_cover_mapped_ipv4(entry):
+    ips = [ipaddress.ip_address("10.1.2.3")]
+    got, err = await agent.select_destinations("x.test", 80, resolved=ips, allow_private=True,
+                                               denied_destinations=[entry])
+    assert got == [] and "denied" in err
+
+
+async def test_wide_ipv6_allow_entry_does_not_admit_ipv4():
+    ips = [ipaddress.ip_address("8.8.8.8")]
+    got, err = await agent.select_destinations("x.test", 80, resolved=ips, allowed_destinations=["::/0"])
+    assert got == [] and "not in the allowed" in err
