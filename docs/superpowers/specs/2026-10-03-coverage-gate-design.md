@@ -125,9 +125,11 @@ not by widening the allow-list; if a test truly needs an exemption it uses the
 Keep a single `test` job (all components' installs share one runner; the
 tests themselves take ~40 s total). Changes:
 
-- Add workflow-level `concurrency` (group per workflow+ref) that cancels
-  superseded runs on pull requests only; every push to main keeps its own
-  complete run so each main commit has a coverage report.
+- Add workflow-level `concurrency` that cancels superseded runs on pull
+  requests only (group per workflow+ref); every push to main keeps its own
+  complete run so each main commit has a coverage report (group per
+  workflow+sha, since a pending run in a shared group is cancelled even
+  with `cancel-in-progress: false`).
 - Checkout with `fetch-depth: 0` (diff-cover needs `origin/main`).
 - One step per component, now including `socks-proxy-win`, each running
   `uv run pytest --cov --cov-report=xml --junitxml=junit.xml`. Every test step
@@ -138,9 +140,10 @@ tests themselves take ~40 s total). Changes:
      `.coverage` data files into one repo-relative `coverage.xml`, and writes
      a per-component table plus "ratchet hints" to `$GITHUB_STEP_SUMMARY`.
   2. On `pull_request` only: `diff-cover coverage.xml
-     --compare-branch=origin/${{ github.base_ref }} --fail-under=80
-     --html-report diff-cover.html --markdown-report diff-cover.md`; the
-     markdown is appended to the step summary.
+     --compare-branch="origin/$BASE_REF" --fail-under=80
+     --html-report diff-cover.html --markdown-report diff-cover.md`, with
+     `BASE_REF` set from `github.base_ref` through `env:` (not interpolated
+     into the script); the markdown is appended to the step summary.
 - Upload artifact `coverage-and-junit` with `if: always()`: every
   component's `coverage.xml`, `junit.xml`, the combined `coverage.xml`, an
   `htmlcov/` of the combined data, and the diff-cover reports.
