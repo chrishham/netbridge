@@ -78,7 +78,6 @@ class TokenHolder:
             new_token = self.refresh_callback()
             if new_token:
                 self.token = new_token
-                self.failure_count = 0
                 return True
         except RuntimeError:
             self.failure_count += 1
