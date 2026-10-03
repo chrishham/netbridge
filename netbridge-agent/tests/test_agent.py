@@ -602,3 +602,15 @@ class TestIPv4MappedPolicy:
         infos = [(10, 1, 6, "", ("::ffff:127.0.0.1", 0, 0, 0))]
         with patch.object(loop, "getaddrinfo", AsyncMock(return_value=infos)):
             assert (await validate_destination("evil.example", 80))[0] is False
+
+
+class TestMappedFormCidrEntries:
+    @pytest.mark.parametrize("host", ["10.1.2.3", "::ffff:10.1.2.3"])
+    async def test_mapped_form_deny_entry_blocks_v4_and_mapped(self, host):
+        r = await validate_destination(host, 80, denied_destinations=["::ffff:10.0.0.0/104"])
+        assert r[0] is False
+
+    @pytest.mark.parametrize("host", ["10.1.2.3", "::ffff:10.1.2.3"])
+    async def test_mapped_form_allow_entry_allows(self, host):
+        assert (await validate_destination(host, 80, allowed_destinations=["::ffff:10.0.0.0/104"]))[0] is True
+        assert (await validate_destination("11.1.2.3", 80, allowed_destinations=["::ffff:10.0.0.0/104"]))[0] is False

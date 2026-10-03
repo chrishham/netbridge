@@ -127,6 +127,19 @@ def _normalize_ip(addr):
     return addr
 
 
+def _normalize_network(net):
+    """Rewrite an IPv4-mapped IPv6 network (::ffff:a.b.c.d/N, N >= 96) as IPv4.
+
+    Addresses are normalised to IPv4, and an IPv4Address is never in an
+    IPv6Network, so CIDR entries written in mapped form must be rewritten too.
+    """
+    if (isinstance(net, ipaddress.IPv6Network) and net.prefixlen >= 96
+            and net.network_address.ipv4_mapped is not None):
+        return ipaddress.ip_network(
+            f"{net.network_address.ipv4_mapped}/{net.prefixlen - 96}")
+    return net
+
+
 async def validate_destination(
     host: str,
     port: int,
@@ -197,7 +210,7 @@ async def validate_destination(
     if denied_destinations:
         for entry in denied_destinations:
             try:
-                net = ipaddress.ip_network(entry, strict=False)
+                net = _normalize_network(ipaddress.ip_network(entry, strict=False))
                 for ip in resolved_ips:
                     if ip in net:
                         return False, f"Destination {host} is denied (matches {net})"
@@ -210,7 +223,7 @@ async def validate_destination(
     if allowed_destinations:
         for entry in allowed_destinations:
             try:
-                net = ipaddress.ip_network(entry, strict=False)
+                net = _normalize_network(ipaddress.ip_network(entry, strict=False))
                 for ip in resolved_ips:
                     if ip in net:
                         return True, ""
