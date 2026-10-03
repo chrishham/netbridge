@@ -177,3 +177,12 @@ def test_close_while_listener_selects(echo_server, monkeypatch):
         finally:
             threading.excepthook = threading.__excepthook__
         assert not errors
+
+
+def test_no_thread_starts_after_close(echo_server):
+    p = FaultProxy(echo_server, "late")
+    p.close()
+    ran = threading.Event()
+    p._spawn(ran.set, "late-pump", p._threads)  # an accept loop racing close() must not start a pump
+    assert not ran.wait(0.2) and p._threads == []
+

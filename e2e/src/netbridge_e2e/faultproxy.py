@@ -57,9 +57,11 @@ class FaultProxy:
 
     def _spawn(self, target, name, into, *args) -> None:
         t = threading.Thread(target=target, args=args, name=name, daemon=True)
-        with self._lock:  # recorded before it runs, so close() can always join it
+        with self._lock:  # atomic with close(): every recorded thread is started, none starts after it
+            if self._closed:
+                return
             into.append(t)
-        t.start()
+            t.start()
 
     def _accept_loop(self) -> None:
         while not self._closed:
@@ -129,13 +131,14 @@ class FaultProxy:
         self._refuse = on
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._lock:  # _spawn() checks _closed under this lock, so no thread starts after this
+            if self._closed:
+                return
+            self._closed = True
         _close(self._lsock)
         for c in self._live():
             c.kill()
-        with self._lock:  # no thread is spawned after _closed is set (the accept loop checks it under the lock)
+        with self._lock:
             threads = list(self._threads)
         for t in threads:
             if t is not threading.current_thread():
