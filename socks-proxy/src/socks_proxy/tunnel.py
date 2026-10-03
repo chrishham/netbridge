@@ -726,7 +726,7 @@ class TunnelManager:
         # Wait for response
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError):
             async with self._lock:
                 self.streams.pop(stream_id, None)
             self._release_semaphore_for_stream(handler)
