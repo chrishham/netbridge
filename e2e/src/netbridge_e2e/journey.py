@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import clients, fakeaz, netinfo
+from .cov import E2ECoverage
 from .procs import IS_WINDOWS
 from .stack import CONNECTED, PROXY_READY, RELAY_SESSION, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
 from .targets import PAGE, PAYLOAD_SHA256, Targets
@@ -38,6 +39,8 @@ class Journey:
         self.cleanups: list = []
         self.socks = ("127.0.0.1", args.socks_port)
         self.http = ("127.0.0.1", args.http_port)
+        self.cov = E2ECoverage(Path(args.coverage).resolve()) if args.coverage else None
+        self.coverage: dict | None = None
 
     # --- bookkeeping -------------------------------------------------------
 
@@ -71,15 +74,27 @@ class Journey:
                     fn()
                 except Exception as e:  # noqa: BLE001
                     print(f"cleanup: {type(e).__name__}: {e}", flush=True)
+            if self.cov:  # processes are stopped now, so their data is flushed (None if prepare failed)
+                try:
+                    self.coverage = self.cov.finalize()
+                except Exception as e:  # noqa: BLE001 — report-only
+                    print(f"coverage: {type(e).__name__}: {e}", flush=True)
             self._write_summary(code)
         return code
 
     def _write_summary(self, code: int) -> None:
         summary = {"mode": self.args.mode, "ok": code == 0, "steps": self.results}
+        if self.coverage is not None:
+            summary["coverage"] = self.coverage
         (self.work / "e2e-summary.json").write_text(json.dumps(summary, indent=2))
         print("\n==== E2E summary ====")
         for r in self.results:
             print(f"  {'✓' if r['ok'] else '✗'} {r['step']}: {r['detail']}")
+        if self.coverage is not None:
+            if self.coverage.get("total") is not None:
+                print(f"E2E coverage: {self.coverage['total']:.2f}%")
+            for w in self.coverage.get("warnings", []):
+                print(f"  coverage warning: {w}")
 
     # --- the journey -------------------------------------------------------
 
@@ -87,6 +102,13 @@ class Journey:
         a = self.args
         logs = self.work / "logs"
         logs.mkdir(parents=True, exist_ok=True)
+        if self.cov:
+            try:
+                self.cov.prepare()
+            except Exception as e:  # noqa: BLE001 — report-only: run uninstrumented
+                print(f"coverage disabled: {type(e).__name__}: {e}", flush=True)
+                self.coverage = {"total": None, "packages": {}, "warnings": [f"coverage disabled: {type(e).__name__}: {e}"]}
+                self.cov = None
         calls_log = self.work / "az-calls.log"
         calls_log.write_text("")  # truncate stale data from reused --work dir
 
@@ -119,7 +141,7 @@ class Journey:
 
         self.check("targets_up", create_targets)
 
-        relay = Relay(logs, a.relay_port, targets.blocked_port, env, image=a.relay_image)
+        relay = Relay(logs, a.relay_port, targets.blocked_port, env, image=a.relay_image, cov=self.cov)
         self.cleanups.append(relay.stop)
         relay.start()
         self.step("relay_up", relay.wait_ready(180), f"{relay.url} {'' if relay.alive() else relay.logs.tail()}")
@@ -173,8 +195,8 @@ class Journey:
     def _components(self, relay_url: str, ip: str, targets: Targets, env: dict):
         a = self.args
         if a.mode == "source":
-            return (SourceAgent(self.work, relay_url, env),
-                    SourceProxy(self.work, relay_url, a.socks_port, a.http_port, env))
+            return (SourceAgent(self.work, relay_url, env, cov=self.cov),
+                    SourceProxy(self.work, relay_url, a.socks_port, a.http_port, env, cov=self.cov))
         return (make_exe_agent(Path(a.agent_exe), relay_url, env, self.work,
                                console=a.agent_console, allow_existing=a.allow_existing_install),
                 make_exe_proxy(Path(a.proxy_exe), relay_url, a.socks_port, a.http_port,
@@ -299,9 +321,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="exe mode: run the agent with --console instead of the tray")
     p.add_argument("--allow-existing-install", action="store_true",
                    help="exe mode: overwrite an existing installation (disposable machines only)")
+    p.add_argument("--coverage", metavar="DIR",
+                   help="source mode, Linux/macOS: run relay, agent and proxy under coverage and report per package in DIR (report-only)")
     args = p.parse_args(argv)
     if args.relay_image and args.mode != "source":
         p.error("--relay-image works in source mode only (the image is a Linux container)")
+    if args.coverage and args.mode != "source":
+        p.error("--coverage works in source mode only")
+    if args.coverage and IS_WINDOWS:
+        # Proc.stop uses taskkill /F there and coverage's SIGTERM flush is Unix-only: no data would be written
+        p.error("--coverage is not supported on Windows")
     if args.mode == "exe":
         if not IS_WINDOWS:
             p.error("--mode exe runs on Windows only")

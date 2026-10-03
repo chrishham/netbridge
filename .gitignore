@@ -20,6 +20,15 @@ wheels/
 .installed.cfg
 *.egg
 
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+diff-cover.html
+diff-cover.md
+
 # Virtual environments
 .venv/
 venv/

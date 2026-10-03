@@ -25,4 +25,19 @@ package = true
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24.0",
+    "pytest-cov>=7.1.0",
+    "pytest-socket>=0.8.1",
 ]
+
+[tool.pytest.ini_options]
+addopts = "--allow-hosts=127.0.0.1,::1,localhost"
+
+[tool.coverage.run]
+branch = true
+source = ["src/relay"]
+
+[tool.coverage.report]
+fail_under = 47
+precision = 2
+show_missing = true
+skip_covered = true
