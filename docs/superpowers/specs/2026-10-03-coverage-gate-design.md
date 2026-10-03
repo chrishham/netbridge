@@ -195,7 +195,7 @@ diff-cover failed.
 
 New driver option `--coverage DIR` (source mode only):
 
-- The driver writes `DIR/.coveragerc` with:
+- The driver writes `DIR/coveragerc` with:
 
   ```ini
   [run]
@@ -206,12 +206,13 @@ New driver option `--coverage DIR` (source mode only):
   data_file = DIR/.coverage
   ```
 
-- Before launching anything the driver deletes `DIR/.coverage*` (only
-  coverage-owned files), because work directories may be reused across runs
+- Before writing the rcfile and launching anything, the driver deletes only
+  coverage data files in DIR (`DIR/.coverage` and `DIR/.coverage.*`; the
+  rcfile is named `coveragerc`, without a dot, so it can never match), because work directories may be reused across runs
   and stale parallel data files would inflate totals or mask a component
   that produced no data.
 - `Relay` (non-image), `SourceAgent` and `SourceProxy` launch their module
-  through `<component venv python> -m coverage run --rcfile=DIR/.coveragerc
+  through `<component venv python> -m coverage run --rcfile=DIR/coveragerc
   -m <module> ...` instead of `uv run ... python -m <module>` / the console
   script. For the proxy that is `-m socks_proxy serve ...` (same `main` as the
   `netbridge-socks` entry point). Without `--coverage` the argv is unchanged.
@@ -233,9 +234,17 @@ New driver option `--coverage DIR` (source mode only):
   numbers in `e2e-summary.json` under `"coverage"`, and lists components that
   produced no data file as warnings. Coverage problems never change the
   journey's exit code.
+- The driver also writes `DIR/summary.md`: a markdown table with the total
+  and one row per instrumented package (`relay`, `netbridge_agent`,
+  `socks_proxy`, `shared_auth`), computed from the combined data with
+  `coverage json` (per-file numbers aggregated by top-level package), plus
+  the warnings. The same numbers go into `e2e-summary.json`.
 - `ci.yml` `e2e-source` passes `--coverage "$RUNNER_TEMP/e2e/coverage"`; the
-  existing always-uploaded report artifact picks it up, and a step appends
-  `coverage report --format=markdown` to the step summary.
+  existing always-uploaded report artifact picks it up, and a step with
+  `if: always()` appends `$RUNNER_TEMP/e2e/coverage/summary.md` (when it
+  exists) to `$GITHUB_STEP_SUMMARY`. All coverage commands run by the driver
+  pass `--rcfile` / `--data-file` explicitly, so they do not depend on the
+  working directory.
 
 ### 8. Error handling
 
