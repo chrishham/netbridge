@@ -190,13 +190,29 @@ def test_upstream_down_closes_client():
         p.close()
 
 
+def test_close_while_listener_selects(echo_server):
+    for _ in range(20):  # close() races the accept loop's select(); no thread may die with an exception
+        p = FaultProxy(echo_server, "race")
+        errors = []
+        threading.excepthook = lambda a: errors.append(a)
+        try:
+            p.start()
+            p.close()
+            for t in p._threads:
+                t.join(2)
+        finally:
+            threading.excepthook = threading.__excepthook__
+        assert not errors
+
+
 def test_close_is_idempotent_and_stops_threads(echo_server):
     before = threading.active_count()
     p = FaultProxy(echo_server, "t")
     p.start()
-    connect(p)
+    s = connect(p)  # keep it open so close() has a live connection to tear down
     p.close()
     p.close()
+    s.close()
     assert wait_until(lambda: threading.active_count() <= before, timeout=3)
 ```
 
@@ -278,7 +294,7 @@ class FaultProxy:
                 if not ready:
                     continue
                 client, _ = self._lsock.accept()
-            except OSError:
+            except (OSError, ValueError):  # ValueError: listener closed by close() mid-select
                 break
             if self._refuse:  # relay unreachable: the TCP handshake works, then nothing
                 _close(client)
@@ -403,7 +419,7 @@ Read first: `__main__.py` lines ≈ 380–480 (state, sweep), 520–660 (agent h
 - [ ] **Step 1: Failing/coverage tests** in `relay/tests/test_relay_lifecycle.py`, driving the real app with `aiohttp.test_utils.TestServer`/`TestClient` (loopback only) in no-auth mode (set the module's no-auth flag/env exactly as `test_relay.py` does), resetting module state in a fixture:
   1. `test_agent_disconnect_closes_its_streams` — connect agent (`/ws`, read `registered`), tunnel (`/tunnel`); tunnel sends `tcp_connect` (agent receives it); agent closes → tunnel receives `tcp_close` with `reason == "agent_disconnected"` for that stream; `/status` shows 0 agents.
   2. `test_tunnel_disconnect_notifies_agent` — tunnel with an open stream closes → agent receives `tunnel_client_disconnected`.
-  3. `test_replacement_keeps_new_agent_and_its_streams` (bug 2) — agent A registers; tunnel opens stream S1 (routed to A); agent B (same user) connects → A is closed by the relay; tunnel opens S2 (routed to B); after A's handler finished: B is still in `bridge_agents`, S2 still in `tcp_streams`, S1 is gone and the tunnel received `tcp_close`/`agent_disconnected` for S1 only.
+  3. `test_replacement_keeps_new_agent_and_its_streams` (bug 2) — agent A registers; tunnel opens stream S1 (routed to A); **hold A's cleanup**: patch the relay so A's handler blocks at the start of its `finally` on an `asyncio.Event` (e.g. wrap `safe_ws_send`/the cleanup entry with a hook that awaits the event only for A's websocket) — without the hold, S2 could be created after A's cleanup already ran and the old bug would pass; agent B (same user) connects → A is closed by the relay; tunnel opens S2 (routed to B) while A's cleanup is held; release the event; after A's handler finished: B is still in `bridge_agents`, S2 still in `tcp_streams`, S1 is gone and the tunnel received `tcp_close`/`agent_disconnected` for S1 only. Verify RED against the unfixed code (S2 deleted).
   4. `test_old_stream_data_not_forwarded_to_replacement` (bug 2) — hold A's cleanup open (or send before A's handler exits) and have the tunnel send `tcp_data` for S1 after B registered: B must never receive a message with `stream_id == S1`.
   5. `test_stale_sweep_closes_idle_streams_only` — patch `STREAM_CLEANUP_INTERVAL` to ~0.01 and `STREAM_TIMEOUT` small; one idle stream, one with fresh `last_activity`; run the sweep task briefly: idle one gets `tcp_close reason=idle_timeout` on both sides and is removed; fresh one stays.
   6. `test_stale_sweep_rechecks_before_closing` (bug 3) — force the interleaving: make the sweep's scan see the stream as stale, then refresh `last_activity` before the removal (e.g. wrap `_state_lock` or patch `time.monotonic`/`safe_ws_send` so the refresh happens between scan and pop); the stream must survive and no `tcp_close` is sent for it.
@@ -451,7 +467,7 @@ Read first: `agent.py` ≈ 640–1000 and the existing `tests/test_agent.py::Tes
 - Consumes: `FaultProxy` (Task 1); fixed product behaviour (Tasks 2–3).
 - Produces: steps `fault_links_up`, `agent_cut_ends_streams`, `agent_cut_recovers`, `proxy_cut_ends_streams`, `proxy_cut_recovers`, `agent_blackhole_detected`, `relay_unreachable_fails_fast`, `relay_reachable_recovers`, `agent_down_fails_fast`, `agent_restarted`.
 
-- [ ] **Step 1: `clients.wait_closed` (TDD).** Test in `e2e/tests/test_clients.py`: a loopback socket pair where the server side closes after 0.2 s → `wait_closed(sock, 2)` is True in < 1 s; server stays open → False after ~0.3 s with `timeout=0.3`; server resets → True. Implement:
+- [ ] **Step 1: `clients.wait_closed` (TDD)** (add `import time` to `clients.py`). Test in `e2e/tests/test_clients.py`: a loopback socket pair where the server side closes after 0.2 s → `wait_closed(sock, 2)` is True in < 1 s; server stays open → False after ~0.3 s with `timeout=0.3`; server resets → True. Implement:
 
 ```python
 def wait_closed(sock: socket.socket, timeout: float) -> bool:
@@ -504,31 +520,49 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
             raise RuntimeError("echo round trip failed before the fault")
         return s
 
-    def _connect_refused(self, ip: str, targets: Targets, timeout: float) -> tuple[str, str]:
-        """'refused' (SOCKS 0x04), 'other' (another reply or error), 'ok' (connected) or 'hang'."""
+    def _attempt(self, ip: str, targets: Targets, limit: float) -> tuple[str, str, float]:
+        """One SOCKS CONNECT, capped at `limit` seconds wall-clock (socket timeouts are per operation).
+
+        Returns (kind, detail, finished_at): kind is 'refused' (reply 0x04), 'reply' (another SOCKS
+        error reply), 'error' (transport error, no reply), 'ok' (connected) or 'hang'.
+        """
         start = time.monotonic()
-        try:
-            s = clients.socks5_connect(self.socks, ip, targets.echo_port, timeout=timeout)
-        except clients.ProxyError as e:
-            took = time.monotonic() - start
-            return ("refused" if e.code == 0x04 else "other"), f"SOCKS reply {e.code:#04x} after {took:.1f}s"
-        except socket.timeout:
-            return "hang", f"no SOCKS reply within {timeout:.0f}s"
-        except OSError as e:
-            return "other", f"{type(e).__name__}: {e}"
-        s.close()
-        return "ok", "connected"
+        out: dict = {}
+
+        def run():
+            try:
+                s = clients.socks5_connect(self.socks, ip, targets.echo_port, timeout=limit)
+            except clients.ProxyError as e:
+                out["r"] = ("refused" if e.code == 0x04 else "reply"), f"SOCKS reply {e.code:#04x}"
+            except OSError as e:
+                out["r"] = "error", f"{type(e).__name__}: {e}"
+            else:
+                s.close()
+                out["r"] = "ok", "connected"
+            out["at"] = time.monotonic()
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(limit)
+        if "r" not in out:
+            return "hang", f"no SOCKS reply within {limit:.0f}s", time.monotonic()
+        kind, detail = out["r"]
+        return kind, f"{detail} after {out['at'] - start:.1f}s", out["at"]
 
     def _fails_fast(self, ip, targets, deadline: float, per_attempt: float = 10.0) -> tuple[bool, str]:
         last = "no attempt"
-        while time.monotonic() < deadline:
-            kind, last = self._connect_refused(ip, targets, per_attempt)
+        while (left := deadline - time.monotonic()) > 0:
+            kind, last, at = self._attempt(ip, targets, min(per_attempt, left))
             if kind == "refused":
-                return True, last
-            if kind in ("hang", "other"):
+                return at <= deadline, last
+            if kind != "ok":
                 return False, last
-            time.sleep(1)  # still connected through a link that has not noticed yet
+            time.sleep(min(1, max(0, deadline - time.monotonic())))  # still connected through a link that has not noticed yet
         return False, f"never refused before the deadline (last: {last})"
+
+    def _evidence(self, relay, *comps) -> str:
+        tails = "; ".join(f"{c.name} log: ...{c.logs.tail(400)!r}" for c in comps)
+        return f"relay {relay.status()}; {tails}"
 
     def _inject(self, link: FaultProxy, how: str) -> tuple[float, int]:
         before = link.active()
@@ -541,9 +575,12 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
         def recovered(t0, budget, comp=None, marker=None, mark=None):
             ok, detail = self._wait_traffic(ip, targets, relay, t0 + budget)
             if ok and comp is not None:
-                m = comp.logs.wait_for(marker, max(1.0, t0 + budget - time.monotonic()), since=mark)
+                # the log line must be there by the same deadline (timeout 0 still checks once)
+                m = comp.logs.wait_for(marker, max(0.0, t0 + budget - time.monotonic()), since=mark)
                 ok, detail = m is not None, (f"{detail}; {m.group(0)}" if m else f"{detail}; no new '{marker}' log line")
-            return ok, f"{detail} ({time.monotonic() - t0:.0f}s after the fault)"
+            ok = ok and time.monotonic() <= t0 + budget
+            took = f"{detail} ({time.monotonic() - t0:.0f}s after the fault)"
+            return ok, took if ok else f"{took}; {self._evidence(relay, agent, proxy)}"
 
         # 1-2: agent link cut
         self._await_agent_session()
@@ -553,7 +590,7 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
         ended = clients.wait_closed(echo, 15)
         echo.close()
         self.step("agent_cut_ends_streams", ended, f"{n} link(s) cut; open stream ended: {ended} "
-                  f"after {time.monotonic() - t0:.1f}s")
+                  f"after {time.monotonic() - t0:.1f}s" + ("" if ended else f"; {self._evidence(relay, agent, proxy)}"))
         self.check("agent_cut_recovers", lambda: recovered(t0, 45, agent, CONNECTED, mark))
         self._agent_up = time.monotonic()
 
@@ -564,7 +601,7 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
         ended = clients.wait_closed(echo, 5)
         echo.close()
         self.step("proxy_cut_ends_streams", ended, f"{n} link(s) cut; open stream ended: {ended} "
-                  f"after {time.monotonic() - t0:.1f}s")
+                  f"after {time.monotonic() - t0:.1f}s" + ("" if ended else f"; {self._evidence(relay, agent, proxy)}"))
         self.check("proxy_cut_recovers", lambda: recovered(t0, 45, proxy, RELAY_SESSION, mark))
 
         # 5: agent link blackholed (half-open)
@@ -572,15 +609,18 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
         echo = self._open_echo(ip, targets)
         t0, n = self._inject(agent_link, "blackhole")
         probe: dict = {}
-        worker = threading.Thread(target=lambda: probe.update(r=self._connect_refused(ip, targets, 28)))
+        worker = threading.Thread(target=lambda: probe.update(r=self._attempt(ip, targets, 28)), daemon=True)
         worker.start()
-        ended = clients.wait_closed(echo, 45)
+        ended = clients.wait_closed(echo, max(0.0, t0 + 45 - time.monotonic()))
         echo.close()
         worker.join(max(0.0, t0 + 30 - time.monotonic()))
-        kind, how = probe.get("r", ("hang", "no SOCKS reply within 30s"))
+        kind, how, at = probe.get("r", ("hang", "no SOCKS reply within 30s", time.monotonic()))
+        # the promise: a SOCKS error reply (not a hang, not a bare reset) within 30 s of the fault
+        replied = kind in ("refused", "reply") and at <= t0 + 30
         ok, traffic = recovered(t0, 75)
-        self.step("agent_blackhole_detected", ended and kind in ("refused", "other") and ok,
-                  f"stream ended: {ended}; CONNECT during blackhole: {how}; {traffic}")
+        self.step("agent_blackhole_detected", ended and replied and ok,
+                  f"stream ended: {ended}; CONNECT during blackhole: {how}; {traffic}"
+                  + ("" if ended and replied else f"; {self._evidence(relay, agent, proxy)}"))
         self._agent_up = time.monotonic()
 
         # 6: relay unreachable for both clients
@@ -621,7 +661,7 @@ and merge `FAULT_TUNING` into `Relay._relay_env` (so the docker `-e` list gets i
         self._agent_up = time.monotonic()
 ```
 
-  Notes: `CONNECTED` and `RELAY_SESSION` already exist in `stack.py`; import `threading`, `socket` and `FaultProxy` in `journey.py` as needed. Blackhole: the CONNECT may get `0x04` or another error reply depending on which side notices first — the promise is "no hang", so both `refused` and `other` pass, `ok` (connected through the dead agent) and `hang` fail. If the real run shows a deadline is not met, first check whether it is a product defect (report it); do not silently widen deadlines — any change to a deadline must be justified in the report with measured numbers.
+  Notes: `CONNECTED` and `RELAY_SESSION` already exist in `stack.py`; import `threading` and `FaultProxy` in `journey.py` as needed. Blackhole: the CONNECT may get `0x04` or another SOCKS error reply depending on which side notices first — the promise is "a SOCKS error reply within 30 s", so `refused` and `reply` pass; `ok` (connected through the dead agent), `error` (bare reset, no reply) and `hang` fail. `_fails_fast` failures should also carry `self._evidence(...)` in their detail (wrap the check lambdas accordingly). If the real run shows a deadline is not met, first check whether it is a product defect (report it); do not silently widen deadlines — any change to a deadline must be justified in the report with measured numbers.
 
 - [ ] **Step 5: README** — append the new steps after `*_reconnected` in the `## Steps` sequence of `e2e/README.md`, and one sentence: "Both clients reach the relay through in-process fault proxies, so the fault steps can cut, blackhole or refuse each link; heartbeats are shortened to 10 s for the run."
 - [ ] **Step 6: Driver tests** — `cd e2e && uv run pytest -q` all pass.
