@@ -134,7 +134,7 @@ def load_proxy_credentials() -> Optional[tuple[str, str]]:
         return None
 
     username = data.get("username")
-    if not username:
+    if not username or not isinstance(username, str):
         return None
 
     if "password_b64" in data and sys.platform == "win32":
@@ -142,11 +142,11 @@ def load_proxy_credentials() -> Optional[tuple[str, str]]:
             ciphertext = base64.b64decode(data["password_b64"])
             password = _dpapi_decrypt(ciphertext)
             return (username, password)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, TypeError) as e:
             logger.warning(f"Failed to decrypt proxy password: {e}")
             return None
 
-    if "password_plain" in data:
+    if isinstance(data.get("password_plain"), str):
         return (username, data["password_plain"])
 
     return None

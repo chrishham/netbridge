@@ -25,7 +25,7 @@ def test_round_trip_and_plaintext_storage():
     credstore.clear_proxy_credentials()                      # idempotent
 
 
-@pytest.mark.parametrize("content", ["{not json", "[]", '"x"', "null", "42", '{"username": "a"}', '{"password_plain": "p"}', '{"username": "", "password_plain": "p"}'])
+@pytest.mark.parametrize("content", ["{not json", "[]", '"x"', "null", "42", '{"username": "a"}', '{"password_plain": "p"}', '{"username": "", "password_plain": "p"}', '{"username": 1, "password_plain": "p"}', '{"username": "a", "password_plain": 5}'])
 def test_corrupt_or_partial_files_return_none(content):
     p = credstore.get_creds_path()
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -41,3 +41,24 @@ def test_windows_fork_uses_dpapi(monkeypatch):
     data = json.loads(credstore.get_creds_path().read_text())
     assert "password" not in data and "password_b64" in data
     assert credstore.load_proxy_credentials() == ("bob", "pw")
+
+
+@pytest.mark.parametrize("b64", [5, "!!notbase64!!"])
+def test_windows_bad_password_b64_returns_none(monkeypatch, b64):
+    monkeypatch.setattr(credstore.sys, "platform", "win32")
+    monkeypatch.setattr(credstore, "_dpapi_decrypt", lambda b: b.decode(), raising=False)
+    credstore.get_creds_path().parent.mkdir(parents=True, exist_ok=True)
+    credstore.get_creds_path().write_text(json.dumps({"username": "bob", "password_b64": b64}))
+    assert credstore.load_proxy_credentials() is None
+
+
+def test_windows_decrypt_failure_returns_none(monkeypatch):
+    monkeypatch.setattr(credstore.sys, "platform", "win32")
+
+    def boom(_):
+        raise OSError("DPAPI failed")
+
+    monkeypatch.setattr(credstore, "_dpapi_decrypt", boom, raising=False)
+    credstore.get_creds_path().parent.mkdir(parents=True, exist_ok=True)
+    credstore.get_creds_path().write_text(json.dumps({"username": "bob", "password_b64": "QUJD"}))
+    assert credstore.load_proxy_credentials() is None
