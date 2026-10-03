@@ -595,7 +595,7 @@ class TestHandleTcpData:
         try:
             raw = '{"type":"tcp_data","stream_id":"s1","data":"aGVsbG8="}'
             with patch("relay.__main__._global_bandwidth_limiter", None):
-                await _handle_tcp_data({"stream_id": "s1"}, "tkey", raw)
+                await _handle_tcp_data({"stream_id": "s1", "data": "aGVsbG8="}, "tkey", raw)
             agent_ws.send_str.assert_called_once_with(raw)
         finally:
             mod.bridge_agents.pop("user@x.com", None)
@@ -621,7 +621,7 @@ class TestHandleTcpData:
 
         try:
             with patch("relay.__main__._global_bandwidth_limiter", None):
-                await _handle_tcp_data({"stream_id": "s1"}, "wrong_key", "{}")
+                await _handle_tcp_data({"stream_id": "s1", "data": "AA=="}, "wrong_key", "{}")
             agent_ws.send_str.assert_not_called()
         finally:
             mod.bridge_agents.pop("user@x.com", None)
@@ -633,7 +633,7 @@ class TestHandleTcpData:
         from relay.__main__ import _handle_tcp_data
         # Should not raise
         with patch("relay.__main__._global_bandwidth_limiter", None):
-            await _handle_tcp_data({"stream_id": "nonexistent"}, "key", "{}")
+            await _handle_tcp_data({"stream_id": "nonexistent", "data": "AA=="}, "key", "{}")
 
 
 # ---------------------------------------------------------------------------

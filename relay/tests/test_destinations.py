@@ -4,7 +4,7 @@ import ipaddress
 
 import pytest
 
-from relay.__main__ import _check_destination_allowed
+from relay.__main__ import _check_destination_allowed, validate_tcp_connect_params
 
 
 class TestCheckDestinationAllowed:
@@ -185,3 +185,8 @@ def _reload_destination_lists():
         mod._HAS_ALLOWLIST = bool(mod._ALLOWED_CIDRS or mod._ALLOWED_PATTERNS)
 
     return _reload
+
+
+@pytest.mark.parametrize("port", [True, False])
+def test_port_bool_rejected(port):
+    assert validate_tcp_connect_params("h", port) == (False, "Port must be an integer")
