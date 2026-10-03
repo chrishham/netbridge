@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -45,7 +44,7 @@ async def test_receive_loop_survives_bad_syntax_then_processes_valid():
     tm = _tm()
     h, fut = _register(tm)
     good = json.dumps({"type": "tcp_connect_result", "stream_id": "s1", "success": True})
-    tm.ws = _msgs(["{not json", "[1]", "null", good])
+    tm.ws = _msgs(["{not json", "[1]", "null", "[" * 100000, good])
     await tm._receive_loop()
     assert fut.done() and fut.result()["success"] is True
 
@@ -62,15 +61,18 @@ async def test_bad_stream_id_is_dropped(sid):
 @pytest.mark.asyncio
 async def test_bad_tcp_data_closes_the_stream_and_notifies_the_relay(data):
     tm = _tm()
-    _register(tm)
+    h, _ = _register(tm, "s1")
     await tm._handle_message({"type": "tcp_data", "stream_id": "s1", "data": data})
+    assert h.closed
+    assert h.semaphore_released
     assert "s1" not in tm.streams                                                # removed
     sent = [json.loads(c.args[0]) for c in tm.ws.send_str.await_args_list]
     assert {"type": "tcp_close", "stream_id": "s1", "reason": "client_closed"} in sent
 
 
 @pytest.mark.parametrize("result", [
-    {"success": False}, {"success": False, "error": None}, {"success": False, "error": 5}])
+    {"success": False}, {"success": False, "error": None}, {"success": False, "error": 5},
+    {"success": False, "error": ""}])
 @pytest.mark.asyncio
 async def test_failed_result_without_str_error_is_normalised_to_pinned_failure(result):
     tm = _tm()
@@ -78,7 +80,8 @@ async def test_failed_result_without_str_error_is_normalised_to_pinned_failure(r
     for _ in range(100):
         if tm.streams:
             break
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0)
+    assert tm.streams, "connect() never registered a stream"
     (sid,) = tm.streams
     await tm._handle_message({"type": "tcp_connect_result", "stream_id": sid, **result})
     with pytest.raises(TunnelConnectError, match="Unknown error"):
@@ -92,8 +95,12 @@ async def test_non_bool_success_fails_the_connect():
     for _ in range(100):
         if tm.streams:
             break
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0)
+    assert tm.streams, "connect() never registered a stream"
     (sid,) = tm.streams
+    handler = tm.streams[sid]
     await tm._handle_message({"type": "tcp_connect_result", "stream_id": sid, "success": "yes"})
+    assert isinstance(handler.connect_future.exception(), ConnectionError)
     with pytest.raises(ConnectionError, match="Invalid connect result"):
         await task
+    assert sid not in tm.streams

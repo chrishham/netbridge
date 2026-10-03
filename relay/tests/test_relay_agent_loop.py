@@ -104,3 +104,11 @@ async def test_bandwidth_limiter_only_acquired_for_tcp_data(client, monkeypatch)
     await agent.send(type="tcp_data", stream_id="s1", data="AA==")
     await tunnel.expect("tcp_data", stream_id="s1")
     limiter.acquire.assert_awaited_once()
+
+
+async def test_deeply_nested_json_warns_and_loop_continues(client, caplog):
+    agent, _ = await connect_agent(client)
+    await agent.ws.send_str("[" * 100000 + "]" * 100000)
+    await agent.send(type="heartbeat")
+    await agent.expect("heartbeat_ack")
+    assert "Invalid JSON from agent" in caplog.text

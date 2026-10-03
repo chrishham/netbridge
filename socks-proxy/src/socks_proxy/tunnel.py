@@ -746,18 +746,12 @@ class TunnelManager:
             self._release_semaphore_for_stream(handler)
             raise
 
-        if not isinstance(result.get("success"), bool):
-            async with self._lock:
-                self.streams.pop(stream_id, None)
-            self._release_semaphore_for_stream(handler)
-            raise ConnectionError("Invalid connect result")
-
         if not result.get("success"):
             async with self._lock:
                 self.streams.pop(stream_id, None)
             self._release_semaphore_for_stream(handler)
             error = result.get("error")
-            if not isinstance(error, str):
+            if not isinstance(error, str) or not error:
                 error = "Unknown error"
             evidence = classify_connect_error(error)
             if evidence is not None:
@@ -881,7 +875,7 @@ class TunnelManager:
                 if msg.type == WSMsgType.TEXT:
                     try:
                         data = _json_loads(msg.data)
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         logger.warning("Invalid JSON from relay")
                         continue
                     if not isinstance(data, dict):
