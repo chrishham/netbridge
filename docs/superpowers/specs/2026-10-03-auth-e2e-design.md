@@ -195,8 +195,11 @@ same connection. Then, as a control, a
   as failures, not `INFO`), not only on CRITICAL findings. Without
   `--strict` the existing CRITICAL-only exit behaviour is kept for manual
   runs against real relays.
-- Fix its broken `[project.scripts]` entry (points at an async `main`) with a
-  sync wrapper.
+- Its `[project.scripts]` entry is broken (async `main`, and the project is
+  virtual so it is never installed): remove it or package the project
+  properly; the journey runs the file directly.
+- `test_large_payload_dos` must observe a rejection (close or explicit error
+  within its timeout); silence is a failure.
 - Journey step after `auth_user_isolation`: run
   `uv run --project security-tests python security-tests/pentest_suite.py
   ws://127.0.0.1:<relay> --token <stub.mint(upn="pentest@netbridge.test")>
