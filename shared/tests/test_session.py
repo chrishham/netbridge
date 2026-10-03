@@ -84,19 +84,6 @@ class TestTokenHolder:
         holder = TokenHolder("abc")
         assert holder.get() == "abc"
 
-    def test_refresh_success(self):
-        """Successful refresh updates the token and resets failure_count."""
-        callback = MagicMock(return_value="new_tok")
-        holder = TokenHolder("old", refresh_callback=callback)
-        holder.failure_count = 2
-
-        result = holder.refresh()
-
-        assert result is True
-        assert holder.get() == "new_tok"
-        assert holder.failure_count == 0
-        callback.assert_called_once()
-
     def test_refresh_callback_returns_none(self):
         """Callback returning None does not update token."""
         callback = MagicMock(return_value=None)
@@ -108,14 +95,14 @@ class TestTokenHolder:
         assert holder.get() == "old"
 
     def test_refresh_callback_raises(self):
-        """RuntimeError from callback increments failure_count."""
+        """RuntimeError from callback fails the refresh without counting a relay rejection."""
         callback = MagicMock(side_effect=RuntimeError("auth error"))
         holder = TokenHolder("old", refresh_callback=callback)
 
         result = holder.refresh()
 
         assert result is False
-        assert holder.failure_count == 1
+        assert holder.failure_count == 0
         assert holder.get() == "old"
 
     def test_refresh_no_callback(self):
@@ -123,8 +110,8 @@ class TestTokenHolder:
         holder = TokenHolder("tok")
         assert holder.refresh() is False
 
-    def test_failure_count_accumulates(self):
-        """Multiple failures increment the counter."""
+    def test_refresh_errors_do_not_count_as_relay_rejections(self):
+        """Background refresh errors must not bring the agent closer to giving up."""
         callback = MagicMock(side_effect=RuntimeError("fail"))
         holder = TokenHolder("tok", refresh_callback=callback)
 
@@ -132,4 +119,22 @@ class TestTokenHolder:
         holder.refresh()
         holder.refresh()
 
-        assert holder.failure_count == 3
+        assert holder.failure_count == 0
+
+    def test_refresh_preserves_failure_count_for_relay_rejections(self):
+        """Bug fix: refresh() must not reset failure_count.
+
+        The failure_count tracks relay rejections (401s), not az CLI failures.
+        If refresh() resets it on success, an agent whose tokens the relay
+        keeps rejecting will retry forever because the counter never reaches
+        MAX_AUTH_FAILURES.
+        """
+        callback = MagicMock(return_value="fresh_token")
+        holder = TokenHolder("old", refresh_callback=callback)
+        holder.failure_count = 2  # Two 401s from relay
+
+        result = holder.refresh()  # Az CLI succeeds, gives us a new token
+
+        assert result is True
+        assert holder.get() == "fresh_token"
+        assert holder.failure_count == 2  # Still 2 — relay decides when to reset

@@ -3,7 +3,9 @@ name = "netbridge-e2e"
 version = "0.1.0"
 description = "End-to-end gate: relay + agent + proxy, from source or as installed Windows exes"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "cryptography>=46",
+]
 
 [tool.uv]
 package = true
@@ -14,6 +16,7 @@ shared-auth = { path = "../shared" }
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "pytest-asyncio>=0.25.3",
     "pytest-cov>=7.1.0",
     "shared-auth",
 ]
@@ -26,7 +29,7 @@ branch = true
 source = ["src/netbridge_e2e"]
 
 [tool.coverage.report]
-fail_under = 72
+fail_under = 77
 precision = 2
 show_missing = true
 skip_covered = true

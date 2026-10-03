@@ -941,8 +941,10 @@ async def run_agent(
                 if stop_event.is_set():
                     break
 
-                if intentional_stop:
+                if intentional_stop or duration > 0:
+                    # Successfully registered with relay — reset auth failure count
                     token_holder.failure_count = 0
+                if intentional_stop:
                     current_delay = RECONNECT_DELAY
                 elif duration >= HEALTHY_CONNECTION_THRESHOLD:
                     # Connection was alive long enough — not a connect failure

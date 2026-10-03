@@ -64,6 +64,9 @@ class TokenHolder:
     def __init__(self, token: str | None, refresh_callback: TokenRefreshCallback | None = None):
         self.token = token
         self.refresh_callback = refresh_callback
+        # Consecutive auth failures as counted by the caller (relay rejections);
+        # refresh() never touches it, so a background refresh can neither
+        # reset nor inflate it.
         self.failure_count = 0
 
     def get(self) -> str | None:
@@ -78,8 +81,7 @@ class TokenHolder:
             new_token = self.refresh_callback()
             if new_token:
                 self.token = new_token
-                self.failure_count = 0
                 return True
         except RuntimeError:
-            self.failure_count += 1
+            pass
         return False

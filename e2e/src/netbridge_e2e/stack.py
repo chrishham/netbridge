@@ -13,17 +13,24 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .netinfo import port_in_use
 from .procs import LogWatch, Proc, kill_exe_path
 
+if TYPE_CHECKING:
+    from .authstub import AuthStub
+
 IS_WINDOWS = sys.platform == "win32"
 
 REPO = Path(__file__).resolve().parents[3]
+# e2e-only sitecustomize that points the relay's key fetch at the local key stub
+RELAYSITE_DIR = Path(__file__).resolve().parent / "relaysite"
 TEST_TENANT = "11111111-1111-1111-1111-111111111111"
 CONNECTED = r"Status changed: \S+ -> connected"
 PROXY_READY = r"Bridge agent reachable - tunnel is working end to end"
 RELAY_SESSION = r"Connected to relay \(session: \w+\)"
+REDIRECTED = r"E2E: relay key URL redirected to "
 # fault steps: detect a half-open link in ~15 s, and never throttle fault-driven reconnects from 127.0.0.1
 FAULT_TUNING = {"RELAY_HEARTBEAT_INTERVAL": "10", "RELAY_RATE_CONNECTIONS_PER_MIN": "600",
                 "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "600"}
@@ -47,16 +54,28 @@ def _poll(predicate, timeout: float, alive=None, interval: float = 0.5):
 
 
 class Relay:
-    def __init__(self, logs_dir: Path, port: int, blocked_port: int, env: dict, image: str | None = None, cov=None):
+    def __init__(self, logs_dir: Path, port: int, blocked_port: int, env: dict, image: str | None = None, cov=None,
+                 auth: "AuthStub | None" = None):
         self.port = port
         self.image = image
+        self.auth = auth
         self._cov = None if image else cov
         if image and cov:
             cov.warn("relay runs from a docker image: not instrumented")
         self._logs_dir = logs_dir
-        self._relay_env = dict(NETBRIDGE_ALLOW_NO_AUTH="true", NETBRIDGE_ALLOWED_TENANTS=TEST_TENANT,
-                               RELAY_BLOCKED_PORTS=str(blocked_port), **FAULT_TUNING)
-        self._env = dict(env, **self._relay_env)
+        if auth:
+            auth_env = dict(NETBRIDGE_ALLOWED_TENANTS=auth.tenant, NETBRIDGE_E2E_JWKS_URL=auth.jwks_url)
+        else:
+            auth_env = dict(NETBRIDGE_ALLOW_NO_AUTH="true", NETBRIDGE_ALLOWED_TENANTS=TEST_TENANT)
+        self._relay_env = dict(auth_env, RELAY_BLOCKED_PORTS=str(blocked_port), **FAULT_TUNING)
+        self._env = {k: v for k, v in env.items() if k != "NETBRIDGE_ALLOW_NO_AUTH"} if auth else dict(env)
+        self._env.update(self._relay_env)
+        if auth:
+            self._env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(RELAYSITE_DIR), env.get("PYTHONPATH")]))
+            # the key stub is on loopback: an inherited HTTP_PROXY must not swallow the relay's key fetch
+            # Windows env names are case-insensitive: setting both would duplicate the variable
+            for var in ("NO_PROXY",) if os.name == "nt" else ("NO_PROXY", "no_proxy"):
+                self._env[var] = ",".join(filter(None, ["127.0.0.1,localhost", env.get(var)]))
         self._container = f"netbridge-e2e-relay-{port}"
         self._runs = 0
         self.proc: Proc | None = None
@@ -70,11 +89,13 @@ class Relay:
         if port_in_use(self.port):
             raise RuntimeError(f"relay port {self.port} is already in use (stale process from an earlier run?)")
         self._runs += 1
-        relay_args = ["-m", "relay", "--no-auth", "--host", "127.0.0.1", "--port", str(self.port)]
+        relay_args = ["-m", "relay", *([] if self.auth else ["--no-auth"]), "--host", "127.0.0.1", "--port", str(self.port)]
         if self.image:
             self._remove_container()
-            # host network: --no-auth only binds loopback, which must be the runner's loopback
+            # host network: the relay binds loopback, which must be the runner's loopback (and the key stub's)
             env_args = [a for k, v in self._relay_env.items() for a in ("-e", f"{k}={v}")]
+            if self.auth:
+                env_args += ["-v", f"{RELAYSITE_DIR}:/e2e-site:ro", "-e", "PYTHONPATH=/e2e-site"]
             argv = ["docker", "run", "--rm", "--name", self._container, "--network", "host", *env_args,
                     self.image, ".venv/bin/python", *relay_args]
         else:
@@ -94,8 +115,12 @@ class Relay:
             self.proc.stop()
 
     def status(self) -> dict | None:
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/status")
+        if self.auth:
+            # authenticated callers also get the agent/client counts that wait_paired needs
+            req.add_header("Authorization", f"Bearer {self.auth.mint(upn='status@netbridge.test')}")
         try:
-            with _NO_PROXY.open(f"http://127.0.0.1:{self.port}/status", timeout=3) as r:
+            with _NO_PROXY.open(req, timeout=3) as r:
                 return json.loads(r.read())
         except (OSError, ValueError):
             return None

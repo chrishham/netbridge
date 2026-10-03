@@ -3,7 +3,12 @@
 Every socket carries a timeout: a proxy that hangs fails the step instead
 of hanging the gate.
 """
+import base64
+import hashlib
+import json
+import os
 import socket
+import struct
 import threading
 import time
 import urllib.parse
@@ -19,9 +24,23 @@ class ProxyError(Exception):
         self.code = code
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
+class ClientError(Exception):
+    """WebSocket connection failed (HTTP status, body)."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(f"{message} (code {code})")
+        self.code = code
+
+
+def recv_exact(sock: socket.socket, n: int, deadline: float | None = None) -> bytes:
+    """n bytes; with a monotonic `deadline`, every recv gets only the time left."""
     buf = bytearray()
     while len(buf) < n:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("receive deadline passed")
+            sock.settimeout(left)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise ConnectionError(f"connection closed after {len(buf)}/{n} bytes")
@@ -51,11 +70,11 @@ def socks5_connect(proxy: Address, dest_host: str, dest_port: int, timeout: floa
         raise
 
 
-def _read_head(sock: socket.socket) -> tuple[int, dict[str, str]]:
+def _read_head(sock: socket.socket, deadline: float | None = None) -> tuple[int, dict[str, str]]:
     # byte by byte: never consume tunnel bytes that follow the header
     head = bytearray()
     while not head.endswith(b"\r\n\r\n"):
-        head += recv_exact(sock, 1)
+        head += recv_exact(sock, 1, deadline)
         if len(head) > 65536:
             raise ProxyError(-1, "response header too large")
     lines = head.decode("iso-8859-1").split("\r\n")
@@ -128,3 +147,179 @@ def wait_closed(sock: socket.socket, timeout: float) -> bool:
         except OSError:
             return True
     return False
+
+
+def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: float = 10) -> tuple[int, str]:
+    """WebSocket upgrade with `Authorization: Bearer <token>` (none if token is None). Returns (status, body up to 4 KiB); closes the connection."""
+    deadline = time.monotonic() + timeout
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        # Generate WebSocket key
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+
+        # Build request
+        headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host}:{port}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {ws_key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        if token:
+            headers.append(f"Authorization: Bearer {token}")
+        headers.append("")
+        headers.append("")
+
+        sock.sendall("\r\n".join(headers).encode())
+
+        # Read response
+        status, headers_dict = _read_head(sock, deadline)
+
+        # Read body if present (up to 4 KiB)
+        body = ""
+        if "content-length" in headers_dict:
+            body_len = min(int(headers_dict["content-length"]), 4096)
+            if body_len > 0:
+                body = recv_exact(sock, body_len, deadline).decode("utf-8", errors="replace")
+
+        return status, body
+    finally:
+        sock.close()
+
+
+class WsClient:
+    """Minimal WebSocket client (RFC 6455)."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+
+    @classmethod
+    def connect(cls, host: str, port: int, path: str, token: str | None, timeout: float = 10) -> "WsClient":
+        """Handshake with `Authorization: Bearer <token>` (none if token is None). Raises ClientError on non-101."""
+        deadline = time.monotonic() + timeout
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            # Generate WebSocket key
+            ws_key = base64.b64encode(os.urandom(16)).decode()
+
+            # Build request
+            headers = [
+                f"GET {path} HTTP/1.1",
+                f"Host: {host}:{port}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {ws_key}",
+                "Sec-WebSocket-Version: 13",
+            ]
+            if token:
+                headers.append(f"Authorization: Bearer {token}")
+            headers.append("")
+            headers.append("")
+
+            sock.sendall("\r\n".join(headers).encode())
+
+            # Read response
+            status, headers_dict = _read_head(sock, deadline)
+
+            if status != 101:
+                # Read error body
+                body = ""
+                if "content-length" in headers_dict:
+                    body_len = min(int(headers_dict["content-length"]), 4096)
+                    if body_len > 0:
+                        body = recv_exact(sock, body_len, deadline).decode("utf-8", errors="replace")
+                sock.close()
+                raise ClientError(status, body)
+
+            # Verify Sec-WebSocket-Accept
+            expected_accept = base64.b64encode(
+                hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+            ).decode()
+            actual_accept = headers_dict.get("sec-websocket-accept", "")
+            if actual_accept != expected_accept:
+                sock.close()
+                raise ClientError(-1, f"Invalid Sec-WebSocket-Accept: {actual_accept}")
+
+            sock.settimeout(timeout)  # the handshake deadline must not shrink later sends
+            return cls(sock)
+        except BaseException:
+            sock.close()
+            raise
+
+    def send_json(self, obj: dict) -> None:
+        """Send JSON as a masked text frame."""
+        payload = json.dumps(obj).encode("utf-8")
+        self._send_frame(1, payload, masked=True)
+
+    def recv_json(self, timeout: float) -> dict:
+        """Receive JSON, skipping pings (auto-ponged). Raises on close frame or after `timeout` overall."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"no message within {timeout:g}s")
+            opcode, payload = self._recv_frame(deadline)
+            if opcode == 1:  # text
+                return json.loads(payload.decode("utf-8"))
+            elif opcode == 8:  # close
+                raise ConnectionError("WebSocket closed by server")
+            elif opcode == 9:  # ping
+                self._send_frame(10, payload, masked=True)  # send pong
+                continue
+            elif opcode == 10:  # pong
+                continue
+            else:
+                raise ConnectionError(f"Unexpected opcode {opcode}")
+
+    def close(self) -> None:
+        """Send close frame and close socket."""
+        try:
+            self._send_frame(8, b"", masked=True)
+        except OSError:
+            pass
+        self.sock.close()
+
+    def _send_frame(self, opcode: int, payload: bytes, masked: bool = False) -> None:
+        """Send a WebSocket frame."""
+        header = bytearray([0x80 | opcode])  # FIN=1
+        payload_len = len(payload)
+
+        if payload_len <= 125:
+            header.append(payload_len)
+        elif payload_len <= 65535:
+            header.append(126)
+            header += struct.pack("!H", payload_len)
+        else:
+            header.append(127)
+            header += struct.pack("!Q", payload_len)
+
+        if masked:
+            header[1] |= 0x80
+            mask_key = os.urandom(4)
+            header += mask_key
+            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+        self.sock.sendall(header + payload)
+
+    def _read(self, n: int, deadline: float | None) -> bytes:
+        return recv_exact(self.sock, n, deadline)
+
+    def _recv_frame(self, deadline: float | None = None) -> tuple[int, bytes]:
+        """Receive a WebSocket frame. Returns (opcode, payload)."""
+        header = self._read(2, deadline)
+        opcode = header[0] & 0x0F
+        masked = (header[1] & 0x80) != 0
+        payload_len = header[1] & 0x7F
+
+        if payload_len == 126:
+            payload_len = struct.unpack("!H", self._read(2, deadline))[0]
+        elif payload_len == 127:
+            payload_len = struct.unpack("!Q", self._read(8, deadline))[0]
+
+        mask_key = self._read(4, deadline) if masked else None
+        payload = self._read(payload_len, deadline) if payload_len > 0 else b""
+
+        if masked and mask_key:
+            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+        return opcode, payload
