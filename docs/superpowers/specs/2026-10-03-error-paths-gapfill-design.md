@@ -387,7 +387,19 @@ source of truth is the unit test), to keep steps few.
 cancelled (awaited with the short timeout), so resolution/connect stops and no
 stream is registered; the pending-connect task's own cleanup path tolerates
 being cancelled (it already pops itself in `finally`, `agent.py:561`).
-Test: fake `getaddrinfo` blocked on an `asyncio.Event` for stream A;
+The pending task's body (`agent.py:504-559`) is also made cancellation-safe at
+the awkward point: after `open_tcp_connection()` has returned a reader/writer
+but before the `StreamInfo` is registered under the lock, a `CancelledError`
+must not leak the socket. The task tracks what it acquired (`writer`,
+`forward_task`) and a `try/except asyncio.CancelledError` (re-raising) closes
+the writer and cancels a started forward task unless registration completed;
+`finally` keeps popping `pending_connections`.
+Test A (cancel at exactly that point): the test holds `state.get_lock()` so the
+task, having connected (fake `open_tcp_connection` returning a fake writer),
+blocks at registration; `tcp_close` cancels it; release the lock; assert the
+fake writer's `close()` was called, the forward task (if created) is cancelled,
+and `active_streams`/`pending_connections` are empty.
+Test B: fake `getaddrinfo` blocked on an `asyncio.Event` for stream A;
 `tcp_close A`; release the event; assert no `open_connection` call, no
 `active_streams` entry, no `pending_connections` entry, and that another stream
 B opened meanwhile is unaffected.
@@ -413,8 +425,12 @@ the shutdown event itself so the normal shutdown sequence still runs.
 
 Tests (`test_app.py`): start `_async_main` with a fake `run_agent` that blocks
 on its stop event; after the agent has started (event replaced) each of
-`request_exit`, `request_restart` (non-Windows: the platform check and Popen
-patched, so only the signalling is under test) and `request_install`
+`request_exit`, `request_restart` (on Linux the method returns early unless `sys.platform` is
+patched to `win32`, and it then reads `subprocess.DETACHED_PROCESS` /
+`CREATE_NO_WINDOW`, which do not exist there: the test patches `sys.platform`,
+`get_exe_path` and `subprocess.Popen`, and sets both constants with
+`monkeypatch.setattr(subprocess, name, value, raising=False)`; no product
+helper is added for this) and `request_install`
 (`Installer.install_fresh` and `os._exit` patched) ends `_async_main` within a
 short timeout, stops the fake agent and the intercept server; an exit
 requested before `_async_main` creates the event (called from another thread
@@ -764,5 +780,6 @@ lines (it forces the guards and `AppKey` lines to be tested).
 | 27 | `validate_tcp_connect_params` uses `type(port) is int` | `isinstance` | `bool` is an `int` subclass |
 | 28 | Fix F6e: normalise IPv4-mapped IPv6 before every policy check, literals and resolved; 6to4/Teredo as follow-up | IPv4 ranges only | Real SSRF/metadata bypass of the always-blocked ranges; mapped form is the only embedding that reaches the IPv4 host on common stacks |
 | 29 | Fix F6f: `tcp_close` cancels a pending connect | ignore | Prevents orphaned streams, especially once DNS moves into the pending task |
+| 31 | Test `request_restart` with `monkeypatch.setattr(..., raising=False)` for the Windows subprocess constants | extract `_detached_creationflags()` | No product code change just for a test; the patch is local and explicit |
 | 30 | Legacy reuses the agent's field validators and `validate_destination`; single-resolution not ported | leave legacy unguarded | Keeps "every receiver" honest at low cost; legacy rewrite is out of scope |
 | 24 | Windows-only internals (DPAPI, `SendInput`, legacy) listed as uncovered | claim journey coverage | Nothing in CI exercises them; follow-up Windows unit job |
