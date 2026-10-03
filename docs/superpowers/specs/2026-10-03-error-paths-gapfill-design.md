@@ -219,7 +219,7 @@ The matrix is parametrised over failure kind x front end, one step each:
 | refused | `ip:refused_port` | `refused_socks5` 0x04 | `refused_http_connect` 502 | `refused_http_forward` 502 | 10 s |
 | DNS failure | `netbridge-e2e-nxdomain.invalid:80` (ATYP=0x03 on SOCKS5) | `dns_failure_socks5` 0x04 | `dns_failure_http_connect` 502 | `dns_failure_http_forward` 502 | 20 s |
 | agent denial | `169.254.169.254:80` (literal, no network I/O, always blocked) | `agent_denies_socks5` 0x04 | `agent_denies_http_connect` 502 | `agent_denies_http_forward` 502 | 10 s |
-| relay port block | relay-blocked port | existing `relay_filter` | `blocked_port_http_connect` 502 | `blocked_port_http_forward` 502 | 10 s |
+| relay port block | relay-blocked port | `relay_filter` (updated, below) | `blocked_port_http_connect` 502 | `blocked_port_http_forward` 502 | 10 s |
 
 Evidence rules: **before every action** the step takes `agent.logs.mark()` and
 `relay.logs.mark()`, and every log assertion uses `wait_for(..., 5,
@@ -245,8 +245,10 @@ magic hostname without an app) is **not** a journey step: `netbridge-e2e-missing
 is not a magic hostname (`intercept.py:22-28`), so it would go to plain DNS. It
 is covered by an agent unit test (section 5).
 
-`relay_filter` is kept as is (it already pins the SOCKS5 relay block); the
-HTTP variants are the new `blocked_port_*` steps.
+`relay_filter` (`journey.py:305`) is **updated**: it takes fresh `LogWatch`
+marks on the relay and agent logs before the action, asserts `Blocked port`
+with `wait_for(since=mark)`, and requires SOCKS reply **0x04 exactly** (not
+any `ProxyError`). The new `blocked_port_http_*` steps cover the HTTP front ends.
 
 ### 2. Plugin steps (new `Journey._plugins`, after `az_called`)
 
@@ -321,6 +323,36 @@ only; the test is not required for legacy). `remote_exec` `/exec` and
 required"}` and no traceback, with unit tests for both routes (`[1]`, `"x"`,
 `null`, `42`).
 
+### 3-bis. Field-type validation at every receiver
+
+Beyond "top-level is an object" and `stream_id` being a bounded `str`, each
+receiver validates the fields it uses. A bad message is warned and dropped
+(the stream is closed when that is the natural reaction, e.g. undecodable data
+for a live stream); the receive loop never dies.
+
+- **Relay** (both loops): `tcp_data.data` must be `str`, else dropped and not
+  forwarded (`__main__.py:623, 817`); `tcp_connect_result.success` must be
+  `bool` and `error` `str | None`, else the result is dropped with a warning
+  (the tunnel client then times out on its own side; an agent that sends garbage
+  results is misbehaving).
+- **Agent** (`handle_tcp_data`, `agent.py:570`): `data` must be `str`
+  (`len(None)` crashes before any size guard today); otherwise warn, close the
+  stream, return. Invalid base64 is handled the same way.
+- **Proxy** (`tunnel.py:891`): `tcp_data.data` must be a `str` and decode as
+  base64 (`validate=True`), else warn and close that stream
+  (`handler.close()`, release the semaphore); an uncaught `b64decode` error
+  no longer ends the receive loop. `tcp_connect_result` is checked the same
+  way as in the relay (`success` bool, `error` str or None); an invalid result
+  fails that connect with `ConnectionError("Invalid connect result")`.
+
+Tests, bidirectional: relay `test_relay_malformed.py` (tcp_data with
+`None`/int/list data both directions, results with non-bool `success`,
+non-str `error`: dropped, connection stays up, next valid message works);
+`netbridge-agent/tests/test_agent_malformed.py` (`tcp_data` with
+`None`/int/non-base64 data); `socks-proxy/tests/test_tunnel_malformed.py`
+(bad base64, non-str data, bad result fields: receive loop survives, stream
+closed, later valid traffic still delivered).
+
 ### 3a. Relay: release failed streams (F6a)
 
 In the agent loop, after forwarding a `tcp_connect_result` whose `success` is
@@ -338,10 +370,18 @@ result for another user's stream does not remove it. Journey:
 
 ### 3b. Agent: resolve once, bounded, connect to validated IPs (F6b)
 
-`validate_destination` is split so one resolution serves both purposes:
+`validate_destination` is split so one resolution serves both purposes. Today
+validation runs inline in `handle_tcp_connect` (`agent.py:478`) and the
+message loop awaits it (`agent.py:767`), so one slow lookup stalls heartbeats
+and every other stream. D moves **resolution, validation and connect all inside
+the tracked pending connection task** (`state.pending_connections`, created at
+the end of `handle_tcp_connect`); the receive loop never awaits DNS. Intercepted
+(magic) hosts still skip validation.
+
+Resolution details:
 
 - `resolve_destination(host, port, timeout=10.0)` runs `loop.getaddrinfo`
-  under `asyncio.wait_for`; on timeout raises an error whose text is `DNS
+  under `asyncio.wait_for` with `type=socket.SOCK_STREAM`; addresses are deduplicated preserving resolver order; on timeout raises an error whose text is `DNS
   resolution timed out for <host>`; a resolver error keeps its own text. IP
   literals skip DNS.
 - Validation applies all existing rules (link-local always, loopback unless
@@ -366,7 +406,7 @@ one blocked among several answers); timeout (a never-completing resolver yields
 `DNS resolution timed out` within the patched small timeout and the failure
 reaches the relay as `success:false`); multi-address fallback (first address
 refuses, second accepted, order preserved; all fail -> last error); hostname
-preserved in log/`StreamInfo`; magic hostname and intercepted plugin path make
+preserved in log/`StreamInfo`; **non-blocking** (a fake `getaddrinfo` blocked on an `asyncio.Event` for stream A: heartbeat, `tcp_data` and `tcp_close` for stream B are processed meanwhile; releasing the event lets A complete; the pending task is cancelled cleanly on shutdown); duplicates collapsed in order; magic hostname and intercepted plugin path make
 no resolver call.
 
 ### 4. `web.AppKey` migration (F5)
@@ -554,7 +594,7 @@ lines (it forces the guards and `AppKey` lines to be tested).
 | 9 | Fixture plugins copied by the driver with a per-run nonce | ship a plugin in the repo's agent package | No product change; a stale dir cannot give a false pass |
 | 10 | Plugin steps run in both source and exe journeys | source only | Pure file drop + proxy traffic; exe mode is where frozen imports could break, so it is the more valuable run |
 | 11 | Plugin hot-reload, install CLI not in e2e | include | Needs git/exec/remote-exec toggle; unit-tested already |
-| 12 | Test `app.py` headless logic, exclude tray/dialogs/`__main__`/`legacy`/Win32 branches | exclude `app.py` entirely, or omit files from coverage | `app.py` has no Tk and most logic is plain asyncio/state; excluding untestable files from the denominator would hide the gap, so they stay in and are covered by the Windows journey |
+| 12 | Test `app.py` headless logic, exclude tray/dialogs/`__main__`/`legacy`/Win32 branches | exclude `app.py` entirely, or omit files from coverage | `app.py` has no Tk and most logic is plain asyncio/state; excluding untestable files from the denominator would hide the gap, so they stay in; they are not covered by the Windows journey or CI (see section 5) |
 | 13 | `auth.py` gets only an identity test | mock-heavy tests | It is a pure re-export; behaviour belongs to `shared_auth` tests |
 | 14 | `AppKey` migration includes the agent's `remote_exec` keys, and the warning becomes an error | relay only | Same warning, same fix, prevents regressions |
 | 15 | Floors set from measured values at the end of D (see 23) | fixed targets now | Avoids a red CI from estimate error; ratchet never lowers |
