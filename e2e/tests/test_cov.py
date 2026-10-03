@@ -25,13 +25,14 @@ def c(tmp_path, fake_repo, monkeypatch):
     return e
 
 
-def test_prepare_removes_only_data_files(c):
+def test_prepare_removes_only_driver_owned_files(c):
     c.dir.mkdir(parents=True)
-    for name in (".coverage", ".coverage.host.1.x", ".coveragerc-old", "summary.md", "keep.txt"):
+    for name in (".coverage", ".coverage.host.1.x", ".coveragerc-old", "coverage.json", "coverage.xml",
+                 "summary.md", "keep.txt"):
         (c.dir / name).write_text("stale")
     c.prepare()
     left = sorted(p.name for p in c.dir.iterdir())
-    assert left == [".coveragerc-old", "coveragerc", "keep.txt", "summary.md"]
+    assert left == [".coveragerc-old", "coveragerc", "keep.txt"]
 
 
 def test_rcfile_content(c, fake_repo):
@@ -80,6 +81,16 @@ def test_python_resolves_the_component_venv(tmp_path, monkeypatch):
     assert len(calls) == 1  # cached per project
     assert calls[0][:4] == ["uv", "run", "--project", str(cov.REPO / "relay")]
     assert "coverage.Coverage(config_file=" in calls[0][-2] and calls[0][-1] == str(e.rcfile)
+
+
+def test_python_probe_rejects_a_core_that_cannot_start(tmp_path, monkeypatch):
+    e = cov.E2ECoverage(tmp_path / "cov")
+    e.prepare()
+    monkeypatch.setenv("COVERAGE_CORE", "invalid")  # Coverage() accepts it; only start() fails
+    monkeypatch.setattr(cov, "_uv", lambda project, *args: [sys.executable, *args[1:]])
+    assert e.wrap("relay", ["-m", "relay"]) is None
+    assert any("not instrumented" in w for w in e.warnings)
+    assert not list(e.dir.glob(".coverage*"))  # the probe writes no data
 
 
 def test_python_probe_rejects_a_broken_rcfile(tmp_path, monkeypatch):

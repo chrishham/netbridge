@@ -29,7 +29,9 @@ class E2ECoverage:
 
     def prepare(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        for f in [self.dir / ".coverage", *self.dir.glob(".coverage.*")]:  # a reused dir must not count an earlier run
+        # a reused dir must not count an earlier run's data or show its reports as current
+        owned = (".coverage", "coverage.json", "coverage.xml", "summary.md")
+        for f in [*self.dir.glob(".coverage.*"), *(self.dir / n for n in owned)]:
             f.unlink(missing_ok=True)
         # shared_auth is a non-editable copy in each venv's site-packages
         paths = "".join(f"{pkg} =\n    {self.repo / rel}\n    */site-packages/{pkg}\n" for pkg, rel in PACKAGES.items())
@@ -41,10 +43,11 @@ class E2ECoverage:
 
     def _python(self, project: str) -> str:
         if project not in self._pythons:
-            # one call resolves the venv interpreter AND proves coverage imports there and
-            # parses the rcfile, so a broken setup falls back instead of killing the child
-            probe = ("import sys, coverage; coverage.Coverage(config_file=sys.argv[1]); "
-                     "print(sys.executable)")
+            # one call resolves the venv interpreter AND proves coverage imports there, parses
+            # the rcfile and can start tracing (data_file=None: nothing written), so a broken
+            # setup falls back instead of killing the child
+            probe = ("import sys, coverage; c = coverage.Coverage(config_file=sys.argv[1], data_file=None); "
+                     "c.start(); c.stop(); print(sys.executable)")
             out = subprocess.run(_uv(project, "python", "-c", probe, str(self.rcfile)),
                                  capture_output=True, text=True, check=True, timeout=600)
             self._pythons[project] = out.stdout.strip().splitlines()[-1]
@@ -83,7 +86,7 @@ class E2ECoverage:
     def _combine_into(self, result: dict) -> None:
         if not list(self.dir.glob(".coverage.*")):
             raise RuntimeError("no data files (did any component start under coverage?)")
-        for args in (("combine", "--keep"), ("json", "-o", str(self.dir / "coverage.json")),
+        for args in (("combine",), ("json", "-o", str(self.dir / "coverage.json")),
                      ("xml", "-o", str(self.dir / "coverage.xml"))):
             r = self._coverage(*args)
             if r.returncode != 0:

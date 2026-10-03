@@ -225,10 +225,13 @@ New driver option `--coverage DIR` (source mode only):
   the three copies as distinct files.
 
 - Before writing the rcfile and launching anything, the driver deletes only
-  coverage data files in DIR (`DIR/.coverage` and `DIR/.coverage.*`; the
-  rcfile is named `coveragerc`, without a dot, so it can never match), because work directories may be reused across runs
-  and stale parallel data files would inflate totals or mask a component
-  that produced no data.
+  the files it owns in DIR: coverage data files (`DIR/.coverage` and
+  `DIR/.coverage.*`; the rcfile is named `coveragerc`, without a dot, so it
+  can never match) and its previous outputs (`coverage.json`, `coverage.xml`,
+  `summary.md`). Work directories may be reused across runs: stale parallel
+  data files would inflate totals or mask a component that produced no data,
+  and stale reports would look current after a run that produced none. Other
+  files in DIR are never touched.
 - `Relay` (non-image), `SourceAgent` and `SourceProxy` launch their module
   through `<component venv python> -m coverage run --rcfile=DIR/coveragerc
   -m <module> ...` instead of `uv run ... python -m <module>` / the console
