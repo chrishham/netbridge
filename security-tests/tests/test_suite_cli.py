@@ -22,9 +22,9 @@ class FakeRelay:
     mode "no_agent": tcp_connect -> success false for a reason other than validation
     """
 
-    def __init__(self, *, mode="reject", status=200, status_json=True, leak=False, max_msg_size=MiB, limit=20):
+    def __init__(self, *, mode="reject", status=200, status_json=True, leak=False, max_msg_size=MiB, limit=20, die=False):
         self.mode, self.status, self.status_json, self.leak = mode, status, status_json, leak
-        self.max_msg_size, self.limit = max_msg_size, limit
+        self.max_msg_size, self.limit, self.die = max_msg_size, limit, die
         self.connections = 0
         self.received: list[str] = []
         self.app = web.Application()
@@ -57,6 +57,8 @@ class FakeRelay:
                 continue
             self.received.append(msg.data)
             if self.mode == "drop":
+                if self.die:  # the message "crashed" the relay: /status fails from now on
+                    self.status = 500
                 await ws.close()
                 break
             if self.mode == "silent":
@@ -196,7 +198,21 @@ async def test_large_payload_passes_when_the_relay_closes(relay):
     fake = await relay(max_msg_size=MiB)
     result = await ps.PenTestSuite(fake.url, GOOD).test_large_payload_dos()
     assert result.passed, result.details
-    assert "closed" in result.details
+    assert "1009" in result.details
+
+
+async def test_large_payload_passes_on_a_drop_when_the_relay_survives(relay):
+    fake = await relay(mode="drop", max_msg_size=0)
+    result = await ps.PenTestSuite(fake.url, GOOD).test_large_payload_dos()
+    assert result.passed, result.details
+    assert "relay still answers" in result.details
+
+
+async def test_large_payload_fails_when_the_relay_dies(relay):
+    fake = await relay(mode="drop", max_msg_size=0, die=True)
+    result = await ps.PenTestSuite(fake.url, GOOD).test_large_payload_dos()
+    assert result.passed is False and result.severity == "HIGH"
+    assert "relay down afterwards" in result.details
 
 
 async def test_large_payload_fails_on_silence(relay):
