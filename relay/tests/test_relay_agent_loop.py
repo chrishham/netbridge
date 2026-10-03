@@ -111,7 +111,9 @@ async def test_deeply_nested_json_warns_and_loop_continues(client, caplog):
     await agent.ws.send_str("[" * 100000 + "]" * 100000)
     await agent.send(type="heartbeat")
     await agent.expect("heartbeat_ack")
-    assert "Invalid JSON from agent" in caplog.text
+    # builds whose json decoder hits the recursion limit report invalid JSON;
+    # others decode the nested list and drop it as a non-object
+    assert "Invalid JSON from agent" in caplog.text or "Ignoring non-object JSON" in caplog.text
 
 
 async def test_failed_result_does_not_drop_a_stream_that_reused_the_id(client, monkeypatch):
