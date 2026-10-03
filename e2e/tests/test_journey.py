@@ -106,7 +106,13 @@ def test_install_failure_becomes_named_step(tmp_path):
     assert "RuntimeError: existing installation" in j.results[-1]["detail"]
 
 
-def test_coverage_flag_parses_in_source_mode(tmp_path):
+@pytest.fixture
+def coverage_platform(monkeypatch):
+    # --coverage is refused on Windows; these tests cover the platform-neutral logic
+    monkeypatch.setattr(journey, "IS_WINDOWS", False)
+
+
+def test_coverage_flag_parses_in_source_mode(tmp_path, coverage_platform):
     args = journey.parse_args(["--mode", "source", "--coverage", str(tmp_path / "cov")])
     assert args.coverage == str(tmp_path / "cov")
 
@@ -125,7 +131,7 @@ def test_coverage_flag_rejected_on_windows(monkeypatch, capsys):
     assert "--coverage is not supported on Windows" in capsys.readouterr().err
 
 
-def test_summary_includes_coverage(tmp_path, monkeypatch):
+def test_summary_includes_coverage(tmp_path, monkeypatch, coverage_platform):
     args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
     j = journey.Journey(args)
     monkeypatch.setattr(j, "_journey", lambda: None)
@@ -135,7 +141,7 @@ def test_summary_includes_coverage(tmp_path, monkeypatch):
     assert summary["coverage"]["total"] == 12.5
 
 
-def test_coverage_prepare_failure_runs_uninstrumented(tmp_path, monkeypatch):
+def test_coverage_prepare_failure_runs_uninstrumented(tmp_path, monkeypatch, coverage_platform):
     args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
     j = journey.Journey(args)
 
@@ -156,7 +162,7 @@ def test_coverage_prepare_failure_runs_uninstrumented(tmp_path, monkeypatch):
     assert "coverage disabled" in summary["coverage"]["warnings"][0]
 
 
-def test_coverage_failure_never_changes_exit_code(tmp_path, monkeypatch):
+def test_coverage_failure_never_changes_exit_code(tmp_path, monkeypatch, coverage_platform):
     args = journey.parse_args(["--mode", "source", "--work", str(tmp_path), "--coverage", str(tmp_path / "cov")])
     j = journey.Journey(args)
     monkeypatch.setattr(j, "_journey", lambda: None)
