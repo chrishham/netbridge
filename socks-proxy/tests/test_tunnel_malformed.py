@@ -104,3 +104,16 @@ async def test_non_bool_success_fails_the_connect():
     with pytest.raises(ConnectionError, match="Invalid connect result"):
         await task
     assert sid not in tm.streams
+    sent = [json.loads(c.args[0]) for c in tm.ws.send_str.call_args_list]
+    assert {"type": "tcp_close", "stream_id": sid, "reason": "client_closed"} in sent
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_tells_the_relay_to_close():
+    tm = _tm()
+    with pytest.raises(asyncio.TimeoutError):
+        await tm.connect("10.0.0.1", 80, timeout=0.01)
+    sent = [json.loads(c.args[0]) for c in tm.ws.send_str.call_args_list]
+    assert sent[0]["type"] == "tcp_connect"
+    assert sent[-1] == {"type": "tcp_close", "stream_id": sent[0]["stream_id"], "reason": "client_closed"}
+    assert tm.streams == {}

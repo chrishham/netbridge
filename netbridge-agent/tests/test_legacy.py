@@ -315,3 +315,76 @@ async def test_legacy_tcp_data_valid_payload_is_written(mock_writer, mock_reader
     monkeypatch.setitem(legacy.active_streams, "s1", info)
     await legacy.handle_tcp_data({"type": "tcp_data", "stream_id": "s1", "data": "AA=="})
     mock_writer.write.assert_called_once_with(b"\x00")
+
+
+@pytest.fixture
+def legacy_dial(monkeypatch):
+    """Legacy connect path with an allowed destination and a dial that blocks until released."""
+    from netbridge_agent import legacy
+    release = asyncio.Event()
+    dials = []
+
+    async def slow_dial(host, port, timeout, proxy_auth=None):
+        dials.append((host, port))
+        await release.wait()
+        raise OSError("refused")
+
+    monkeypatch.setattr(legacy, "validate_destination", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(legacy, "open_tcp_connection", slow_dial)
+    monkeypatch.setattr(legacy, "pending_connections", {})
+    monkeypatch.setattr(legacy, "active_streams", {})
+    yield legacy, release, dials
+    release.set()
+
+
+def _connect(sid="s1"):
+    return {"type": "tcp_connect", "stream_id": sid, "host": "example.com", "port": 80}
+
+
+async def test_legacy_duplicate_pending_id_is_ignored(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    first = legacy.pending_connections["s1"]
+    await legacy.handle_tcp_connect(ws, _connect())
+    await asyncio.sleep(0)
+    assert legacy.pending_connections["s1"] is first
+    assert len(dials) == 1
+    ws.send_str.assert_not_called()                 # no reply that would tear down s1
+    release.set()
+    await first
+    assert "s1" not in legacy.pending_connections
+
+
+async def test_legacy_duplicate_at_capacity_gets_no_rejection(legacy_dial, monkeypatch):
+    legacy, release, dials = legacy_dial
+    monkeypatch.setattr(legacy, "MAX_CONCURRENT_CONNECTIONS", 1)
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    await legacy.handle_tcp_connect(ws, _connect())
+    ws.send_str.assert_not_called()
+
+
+async def test_legacy_close_cancels_a_pending_dial(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    task = legacy.pending_connections["s1"]
+    await asyncio.sleep(0)
+    await legacy.handle_tcp_close({"type": "tcp_close", "stream_id": "s1"})
+    assert task.cancelled()
+    assert legacy.pending_connections == {}
+    assert legacy.active_streams == {}
+
+
+async def test_legacy_finished_dial_keeps_an_entry_that_reused_the_id(legacy_dial):
+    legacy, release, dials = legacy_dial
+    ws = MagicMock(closed=False, send_str=AsyncMock())
+    await legacy.handle_tcp_connect(ws, _connect())
+    task = legacy.pending_connections["s1"]
+    await asyncio.sleep(0)
+    replacement = asyncio.get_running_loop().create_future()
+    legacy.pending_connections["s1"] = replacement
+    release.set()
+    await task
+    assert legacy.pending_connections["s1"] is replacement

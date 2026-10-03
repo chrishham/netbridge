@@ -125,7 +125,7 @@ def load_proxy_credentials() -> Optional[tuple[str, str]]:
     try:
         with open(path) as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
+    except (ValueError, OSError) as e:  # ValueError covers bad JSON and non-UTF-8 bytes
         logger.warning(f"Failed to read proxy creds: {e}")
         return None
 

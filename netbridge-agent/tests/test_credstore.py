@@ -33,6 +33,13 @@ def test_corrupt_or_partial_files_return_none(content):
     assert credstore.load_proxy_credentials() is None
 
 
+def test_non_utf8_file_returns_none():
+    p = credstore.get_creds_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b'{"username": "\xff\xfe"}')
+    assert credstore.load_proxy_credentials() is None
+
+
 def test_windows_fork_uses_dpapi(monkeypatch):
     monkeypatch.setattr(credstore.sys, "platform", "win32")
     monkeypatch.setattr(credstore, "_dpapi_encrypt", lambda s: b"ENC" + s.encode(), raising=False)

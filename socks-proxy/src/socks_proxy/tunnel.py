@@ -741,9 +741,9 @@ class TunnelManager:
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
         except (asyncio.TimeoutError, ConnectionError):
-            async with self._lock:
-                self.streams.pop(stream_id, None)
-            self._release_semaphore_for_stream(handler)
+            # also tells the relay: it may still hold the stream (timeout,
+            # malformed result) and would otherwise keep it until idle cleanup
+            await self.close_stream(stream_id)
             raise
 
         if not result.get("success"):

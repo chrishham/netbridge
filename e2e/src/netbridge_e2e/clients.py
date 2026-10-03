@@ -87,14 +87,21 @@ def _read_head(sock: socket.socket, deadline: float | None = None) -> tuple[int,
     return status, headers
 
 
-def _read_response(sock: socket.socket) -> tuple[int, bytes]:
-    status, headers = _read_head(sock)
+def _read_response(sock: socket.socket, timeout: float) -> tuple[int, bytes]:
+    # one deadline for the whole response: a trickling peer cannot stall the gate
+    deadline = time.monotonic() + timeout
+    status, headers = _read_head(sock, deadline)
     if "content-length" in headers:
-        return status, recv_exact(sock, int(headers["content-length"]))
+        return status, recv_exact(sock, int(headers["content-length"]), deadline)
     body = bytearray()
-    while chunk := sock.recv(65536):
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("receive deadline passed")
+        sock.settimeout(left)
+        if not (chunk := sock.recv(65536)):
+            return status, bytes(body)
         body += chunk
-    return status, bytes(body)
 
 
 def http_connect(proxy: Address, dest_host: str, dest_port: int, timeout: float = 15.0) -> socket.socket:
@@ -111,10 +118,10 @@ def http_connect(proxy: Address, dest_host: str, dest_port: int, timeout: float 
         raise
 
 
-def http_get(sock: socket.socket, host_header: str, path: str = "/") -> tuple[int, bytes]:
+def http_get(sock: socket.socket, host_header: str, path: str = "/", timeout: float = 15.0) -> tuple[int, bytes]:
     """GET over an already-established tunnel."""
     sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n".encode())
-    return _read_response(sock)
+    return _read_response(sock, timeout)
 
 
 def http_forward_get(proxy: Address, url: str, timeout: float = 15.0) -> tuple[int, bytes]:
@@ -122,7 +129,7 @@ def http_forward_get(proxy: Address, url: str, timeout: float = 15.0) -> tuple[i
     host_header = urllib.parse.urlsplit(url).netloc
     with socket.create_connection(proxy, timeout=timeout) as sock:
         sock.sendall(f"GET {url} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n".encode())
-        return _read_response(sock)
+        return _read_response(sock, timeout)
 
 
 def echo_roundtrip(sock: socket.socket, data: bytes) -> bytes:

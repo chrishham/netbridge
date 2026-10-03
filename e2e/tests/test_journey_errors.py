@@ -141,6 +141,9 @@ def test_error_case_agent_denial_fails_when_the_relay_blocked_it_instead(j, monk
     assert not ok and "relay logged" in detail
 
 
+FRONTS = ("socks5", "http_connect", "http_forward")
+
+
 class _ErrRelay(FakeComp):
     def status(self):
         return {"active_streams": 0}
@@ -161,7 +164,7 @@ def _errors_world(j, monkeypatch, replies):
         return replies(front), 0.1
 
     monkeypatch.setattr(j, "_fail_case", fail_case)
-    monkeypatch.setattr(j, "_socks_get", lambda *a, **k: (200, PAGE))
+    monkeypatch.setattr(j, "_get_all_fronts", lambda *a, **k: dict.fromkeys(FRONTS, (200, PAGE)))
     j.fail_case_orig = fail_case
     return relay, agent
 
@@ -297,8 +300,9 @@ def test_errors_baseline_fails_when_streams_are_stuck(j, monkeypatch, clock):
     assert _steps_failing(j, relay, agent) == "errors_baseline_clean"
 
 
+@pytest.mark.parametrize("front", FRONTS)
 @pytest.mark.parametrize("reply,streams", [((503, b"x"), 0), ((200, PAGE), 2)])
-def test_tunnel_health_step_fails(j, monkeypatch, clock, reply, streams):
+def test_tunnel_health_step_fails(j, monkeypatch, clock, reply, streams, front):
     relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
     state = {"n": 0}
 
@@ -306,7 +310,12 @@ def test_tunnel_health_step_fails(j, monkeypatch, clock, reply, streams):
         return {"active_streams": 0 if state["n"] == 0 else streams}
 
     relay.status = status
-    monkeypatch.setattr(j, "_socks_get", lambda *a, **k: (state.update(n=1), reply)[1])
+
+    def fronts(*a, **k):
+        state.update(n=1)
+        return {**dict.fromkeys(FRONTS, (200, PAGE)), front: reply}
+
+    monkeypatch.setattr(j, "_get_all_fronts", fronts)
     assert _steps_failing(j, relay, agent) == "errors_leave_tunnel_healthy"
 
 
@@ -404,3 +413,19 @@ def test_fail_case_late_answer_counts_as_hang(j, monkeypatch):
     monkeypatch.setattr(journey.clients, "socks5_connect", slow)
     got, secs = j._fail_case("socks5", HOST, 80, 5)
     assert got == "hang" and secs == 10
+
+
+def test_get_all_fronts_hits_each_front_end_at_the_target(j, monkeypatch):
+    seen = []
+    sock = FakeSock()
+    monkeypatch.setattr(clients, "socks5_connect",
+                        lambda p, h, port, **k: (seen.append(("socks5", h, port)), contextlib.closing(sock))[1])
+    monkeypatch.setattr(clients, "http_connect",
+                        lambda p, h, port, **k: (seen.append(("http_connect", h, port)), contextlib.closing(sock))[1])
+    monkeypatch.setattr(clients, "http_get", lambda s, host, path="/": (200, host.encode()))
+    monkeypatch.setattr(clients, "http_forward_get", lambda p, url, **k: (seen.append(("http_forward", url)), (200, b"f"))[1])
+    res = j._get_all_fronts("10.0.0.1", TARGETS)
+    target = f"10.0.0.1:{TARGETS.http_port}"
+    assert res == {"socks5": (200, target.encode()), "http_connect": (200, target.encode()), "http_forward": (200, b"f")}
+    assert seen == [("socks5", "10.0.0.1", TARGETS.http_port), ("http_connect", "10.0.0.1", TARGETS.http_port),
+                    ("http_forward", f"http://{target}/")]

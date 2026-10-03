@@ -256,6 +256,14 @@ class Journey:
         with clients.socks5_connect(self.socks, host, targets.http_port, timeout=timeout) as s:
             return clients.http_get(s, f"{host}:{targets.http_port}", path)
 
+    def _get_all_fronts(self, host: str, targets: Targets) -> dict[str, tuple[int, bytes]]:
+        target = f"{host}:{targets.http_port}"
+        results = {"socks5": self._socks_get(host, targets)}
+        with clients.http_connect(self.http, host, targets.http_port, timeout=15) as s:
+            results["http_connect"] = clients.http_get(s, target)
+        results["http_forward"] = clients.http_forward_get(self.http, f"http://{target}/")
+        return results
+
     def _traffic(self, ip: str, targets: Targets, relay: Relay) -> None:
         def socks5_http():
             status, body = self._socks_get(ip, targets)
@@ -417,11 +425,13 @@ class Journey:
                     relay, agent, front, host, port, expect, budget, alog, rlog, not_rlog, not_alog))
 
         def healthy():
-            status, body = self._socks_get(ip, targets)
-            if (status, body) != (200, PAGE):
-                return False, f"tunnel unhealthy after the error group: HTTP {status}, {len(body)} bytes"
+            # every front end: the error cases above expected 502 from the HTTP ones
+            bad = {k: (st, len(b)) for k, (st, b) in self._get_all_fronts(ip, targets).items()
+                   if (st, b) != (200, PAGE)}
+            if bad:
+                return False, f"tunnel unhealthy after the error group: {bad}"
             ok, detail = self._wait_streams_zero(relay, within=5)
-            return ok, f"HTTP 200 after the errors; {detail}"
+            return ok, f"HTTP 200 on all three front ends after the errors; {detail}"
 
         self.check("errors_leave_tunnel_healthy", healthy)
 

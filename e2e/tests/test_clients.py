@@ -537,3 +537,29 @@ def test_http_proxy_forward_status_option():
         assert status == 502
     finally:
         proxy.close()
+
+
+@pytest.mark.parametrize("head", [b"HTTP/1.1 200 OK\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n"])
+def test_http_get_deadline_bounds_a_trickled_body(head):
+    """A peer that keeps sending a byte now and then must not hold the response read open."""
+    a, b = socket.socketpair()
+    stop = threading.Event()
+
+    def trickle():
+        b.recv(65536)
+        b.sendall(head)
+        while not stop.wait(0.05):
+            b.sendall(b"x")
+
+    t = threading.Thread(target=trickle, daemon=True)
+    t.start()
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            clients.http_get(a, "h", timeout=0.4)
+        assert time.monotonic() - start < 2
+    finally:
+        stop.set()
+        t.join(2)
+        a.close()
+        b.close()

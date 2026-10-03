@@ -281,7 +281,9 @@ async def _do_tcp_connect(ws, stream_id: str, host: str, port: int) -> None:
 
     finally:
         async with lock:
-            pending_connections.pop(stream_id, None)
+            # only drop our own entry, not a later connect that reused the id
+            if pending_connections.get(stream_id) is asyncio.current_task():
+                del pending_connections[stream_id]
 
 
 async def handle_tcp_connect(ws, request: dict) -> None:
@@ -306,8 +308,15 @@ async def handle_tcp_connect(ws, request: dict) -> None:
     lock = _get_streams_lock()
 
     async with lock:
+        # before any reply: a rejection for a reused id would make the relay
+        # tear down the stream that already owns it
+        duplicate = stream_id in pending_connections or stream_id in active_streams
         pending_count = len(pending_connections)
         active_count = len(active_streams)
+
+    if duplicate:
+        print(f"[{ts()}] [TCP] Ignoring tcp_connect for in-use stream_id: {stream_id}")
+        return
 
     if pending_count >= MAX_CONCURRENT_CONNECTIONS:
         print(f"[{ts()}] [TCP] Rejected (too many pending): {stream_id} -> {host}:{port}")
@@ -343,8 +352,12 @@ async def handle_tcp_connect(ws, request: dict) -> None:
 
     print(f"[{ts()}] [TCP] Connect request: {stream_id} -> {host}:{port}")
 
-    task = asyncio.create_task(_do_tcp_connect(ws, stream_id, host, port))
     async with lock:
+        # re-checked: validate_destination awaited since the first check
+        if stream_id in pending_connections or stream_id in active_streams:
+            print(f"[{ts()}] [TCP] Ignoring tcp_connect for in-use stream_id: {stream_id}")
+            return
+        task = asyncio.create_task(_do_tcp_connect(ws, stream_id, host, port))
         pending_connections[stream_id] = task
 
 
@@ -429,6 +442,13 @@ async def handle_tcp_close(request: dict) -> None:
         print(f"[{ts()}] [!] tcp_close with invalid stream_id, dropping")
         return
     print(f"[{ts()}] [TCP] Close request: {stream_id} ({reason})")
+    lock = _get_streams_lock()
+    async with lock:
+        pending = pending_connections.pop(stream_id, None)
+    if pending and not pending.done():
+        # a close during DNS/connect: stop the dial so it cannot register later
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
     await close_stream(stream_id)
 
 
