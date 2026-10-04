@@ -71,7 +71,7 @@ client --wss--> FaultProxy (TCP) --> edge (TLS, HTTP) --ws--> relay
 
 - The fault links stay on the client side of the edge. A cut or a blackhole then behaves like a network fault between the user and the proxy, which is the realistic place for one. Fault steps work unchanged, because the FaultProxy forwards TLS bytes as readily as plain ones.
 - Clients get `NETBRIDGE_CA_BUNDLE=work/edge/ca.pem`. Both the agent and the proxy build their SSL context in `shared_auth.connection.create_tunnel_ssl_context`. That function adds this CA to the default store and keeps verification on. No `NETBRIDGE_VERIFY_SSL=false` is used anywhere.
-- The client relay URL becomes `wss://localhost:<link port><prefix>/ws` for the agent and `/tunnel` for the proxy. The URL always includes the explicit path, as the edge's prefix option requires.
+- The client relay URL becomes `wss://127.0.0.1:<link port><prefix>/ws` for the agent and `/tunnel` for the proxy. The URL always includes the explicit path, as the edge's prefix option requires.
 - The relay gets `RELAY_TRUSTED_PROXIES=127.0.0.1/32` and `RELAY_CLIENT_IP_HEADER=X-Forwarded-For`.
 - The driver's own probes, the auth matrix and the pentest suite keep talking to the relay directly. They test the relay, not the path.
 
@@ -119,7 +119,7 @@ These runs behave exactly as today: plain `ws://`, no edge, and `RELAY_TRUSTED_P
 - **CA trust in the frozen exes.** Both exes go through `create_tunnel_ssl_context`, so `NETBRIDGE_CA_BUNDLE` applies. The plan's first task proves this on the Windows runner before anything else depends on it.
 - **The edge's own bugs look like product bugs.** The edge gets unit tests (head parsing, the XFF append in both forms, prefix strip and 404, the idle close, oversized heads) before the journey uses it. A failing step names the hop in its detail ("via edge").
 - **Timing on slow runners.** The idle steps add about 60 s. Heartbeat 10 s against idle 25 s leaves more than two missed beats of margin.
-- **Hostname verification.** Clients connect to `localhost`, and the certificate carries both a `localhost` DNS SAN and a `127.0.0.1` IP SAN. A Windows runner that resolves `localhost` to `::1` first is handled by the edge listening on both families, or by the plan using `127.0.0.1` in the URL.
+- **Hostname verification.** Clients connect to `127.0.0.1`, so a Windows runner that resolves `localhost` to `::1` first cannot misroute them. The certificate carries an IP SAN for `127.0.0.1` and a DNS SAN for `localhost`.
 
 ## Related (not part of this work)
 
