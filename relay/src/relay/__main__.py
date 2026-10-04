@@ -1068,6 +1068,7 @@ async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
     # Get rate limiters for this user
     message_limiter = _get_message_limiter(user_email)
     stream_limiter = _get_stream_limiter(user_email)
+    throttled = False  # inside a message-rate episode: warned once already
 
     try:
         async for msg in ws:
@@ -1080,10 +1081,13 @@ async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
                     )
                     continue
 
-                # Rate limit messages (non-blocking check, skip if exceeded)
-                if not message_limiter.has_capacity():
-                    logger.warning(f"Message rate limit exceeded for {tunnel_key}")
-                    continue
+                # Over the rate, wait rather than drop: a dropped tcp_data would corrupt its stream.
+                # Not reading pushes the delay back to the client through TCP.
+                if message_limiter.has_capacity():
+                    throttled = False
+                elif not throttled:
+                    throttled = True
+                    logger.warning(f"Message rate limit exceeded for {tunnel_key}, delaying its messages")
                 await message_limiter.acquire()
 
                 data = _parse_message(msg.data, f"tunnel client {tunnel_key}")

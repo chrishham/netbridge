@@ -268,3 +268,29 @@ async def test_stale_sweep_rechecks_before_closing(fast_sweep, monkeypatch):
     assert "s1" in mod.tcp_streams
     tunnel_ws.send_str.assert_not_called()
     agent_ws.send_str.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_message_rate_limit_delays_instead_of_dropping(client, monkeypatch, caplog):
+    """Over the per-user message rate, tcp_data is held back, never lost or reordered."""
+    monkeypatch.setattr(mod, "RATE_LIMIT_MESSAGES_PER_SEC", 20)
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "s1")
+
+    chunks = [f"chunk-{i}" for i in range(60)]  # three seconds' worth at 20/s
+    start = time.monotonic()
+    for c in chunks:
+        await tunnel.send(type="tcp_data", stream_id="s1", data=c)
+    got = []
+    async def _all():
+        while len(got) < len(chunks):
+            got.append((await agent.inbox.get())["data"])
+    await asyncio.wait_for(_all(), 10)
+
+    assert got == chunks
+    assert time.monotonic() - start >= 1.5  # the limit still holds: delayed, not waved through
+    throttled = [r for r in caplog.records if "Message rate limit exceeded" in r.getMessage()]
+    assert len(throttled) == 1  # one warning per throttling episode, not one per message
+    await tunnel.close()
+    await agent.close()

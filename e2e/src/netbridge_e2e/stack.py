@@ -35,7 +35,10 @@ REDIRECTED = r"E2E: relay key URL redirected to "
 # never throttled. The per-IP limit only counts failed auth, so it stays near the production default.
 # 49 = measured failed auths before the flood step (34) + 15; re-measure if the pentest suite or auth matrix adds failing requests.
 FAULT_TUNING = {"RELAY_HEARTBEAT_INTERVAL": "10", "RELAY_RATE_CONNECTIONS_PER_MIN": "600",
-                "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "49"}
+                "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "49",
+                # low enough that the journey's data bursts cross it: over the rate the relay must
+                # delay a tunnel's messages, never drop them (a dropped tcp_connect stalls a later step)
+                "RELAY_RATE_MESSAGES_PER_SEC": "50"}
 CLIENT_TUNING = {"NETBRIDGE_CLIENT_HEARTBEAT_INTERVAL": "10"}
 FIXTURES = Path(__file__).resolve().parent / "plugin_fixtures"
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
