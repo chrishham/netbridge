@@ -149,6 +149,15 @@ class _ErrRelay(FakeComp):
         return {"active_streams": 0}
 
 
+def _correct(front, host, port):
+    """The reply each error case must get: (SOCKS5 reply, HTTP status) per the connect error-code mapping."""
+    if port == TARGETS.blocked_port or host == journey.LINK_LOCAL:
+        return 0x02 if front == "socks5" else 403
+    if host == journey.NXDOMAIN:
+        return 0x04 if front == "socks5" else 502
+    return 0x05 if front == "socks5" else 502
+
+
 def _errors_world(j, monkeypatch, replies):
     relay, agent = _ErrRelay("relay"), FakeComp("agent")
 
@@ -156,12 +165,12 @@ def _errors_world(j, monkeypatch, replies):
         if port == TARGETS.blocked_port:
             relay.logs.lines.append(f"Blocked port {port} requested by t")
         elif host == "169.254.169.254":
-            agent.logs.lines.append(f"Destination denied: s -> {host}:{port}: link-local")
+            agent.logs.lines.append(f"Destination denied: s -> {host}:{port}: link-local [not_allowed]")
         elif host == journey.NXDOMAIN:
-            agent.logs.lines.append(f"Failed: s -> {host}:{port}: DnsError: [Errno -2] Name or service not known")
+            agent.logs.lines.append(f"Failed: s -> {host}:{port}: DnsError: [Errno -2] Name or service not known [dns_failed]")
         else:
-            agent.logs.lines.append(f"Failed: s -> {host}:{port}: ConnectionRefusedError: [Errno 111] Connect call failed")
-        return replies(front), 0.1
+            agent.logs.lines.append(f"Failed: s -> {host}:{port}: ConnectionRefusedError: [Errno 111] Connect call failed [refused]")
+        return replies(front, host, port), 0.1
 
     monkeypatch.setattr(j, "_fail_case", fail_case)
     monkeypatch.setattr(j, "_get_all_fronts", lambda *a, **k: dict.fromkeys(FRONTS, (200, PAGE)))
@@ -170,7 +179,7 @@ def _errors_world(j, monkeypatch, replies):
 
 
 def test_errors_group_runs_all_steps_in_order(j, monkeypatch, clock):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    relay, agent = _errors_world(j, monkeypatch, _correct)
     j._errors("10.0.0.1", TARGETS, relay, agent)
     assert [r["step"] for r in j.results] == [
         "errors_baseline_clean", "refused_socks5", "refused_http_connect", "refused_http_forward",
@@ -182,15 +191,15 @@ def test_errors_group_runs_all_steps_in_order(j, monkeypatch, clock):
 
 
 def test_errors_group_fails_fast_on_a_regressed_reply(j, monkeypatch, clock):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 6 if front == "socks5" else 502)
+    relay, agent = _errors_world(j, monkeypatch, lambda front, host, port: 6 if front == "socks5" else _correct(front, host, port))
     with pytest.raises(journey.StepFailed):
         j._errors("10.0.0.1", TARGETS, relay, agent)
     assert j.results[-1]["step"] == "refused_socks5" and "6" in j.results[-1]["detail"]
 
 
-def test_relay_filter_requires_exactly_0x04_and_the_relay_log(j, monkeypatch):
+def test_relay_filter_requires_exactly_0x02_and_the_relay_log(j, monkeypatch):
     relay, agent = FakeComp("relay"), FakeComp("agent")
-    for code, log, want in ((0x04, True, True), (0x01, True, False), (0x04, False, False)):
+    for code, log, want in ((0x02, True, True), (0x01, True, False), (0x04, True, False), (0x02, False, False)):
         j.results.clear()
 
         def connect(*a, code=code, log=log, **k):
@@ -214,7 +223,7 @@ def _steps_failing(j, relay, agent):
 
 
 def test_dns_step_not_satisfied_by_a_refused_line_for_another_host(j, monkeypatch, clock):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    relay, agent = _errors_world(j, monkeypatch, _correct)
     base = j.fail_case_orig
 
     def fc(front, host, port, budget):
@@ -228,13 +237,13 @@ def test_dns_step_not_satisfied_by_a_refused_line_for_another_host(j, monkeypatc
 
 
 def test_dns_step_fails_when_the_name_was_refused(j, monkeypatch, clock):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    relay, agent = _errors_world(j, monkeypatch, _correct)
     base = j.fail_case_orig
 
     def fc(front, host, port, budget):
         out = base(front, host, port, budget)
         if host == journey.NXDOMAIN:
-            agent.logs.lines[-1] = f"Failed: s -> {host}:{port}: ConnectionRefusedError: [Errno 111] Connect call failed"
+            agent.logs.lines[-1] = f"Failed: s -> {host}:{port}: ConnectionRefusedError: [Errno 111] Connect call failed [refused]"
         return out
 
     monkeypatch.setattr(j, "_fail_case", fc)
@@ -242,7 +251,7 @@ def test_dns_step_fails_when_the_name_was_refused(j, monkeypatch, clock):
 
 
 def test_agent_denial_fails_on_the_relays_own_denial(j, monkeypatch, clock):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    relay, agent = _errors_world(j, monkeypatch, _correct)
     base = j.fail_case_orig
 
     def fc(front, host, port, budget):
@@ -256,7 +265,7 @@ def test_agent_denial_fails_on_the_relays_own_denial(j, monkeypatch, clock):
 
 
 def test_blocked_port_fails_when_the_agent_connected_anyway(j, monkeypatch, clock):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    relay, agent = _errors_world(j, monkeypatch, _correct)
     base = j.fail_case_orig
 
     def fc(front, host, port, budget):
@@ -288,14 +297,14 @@ def test_relay_filter_ignores_a_longer_port_number(j, monkeypatch):
     def connect(*a, **k):
         relay.logs.lines.append("Blocked port 9 requested by t")
         agent.logs.lines.append("Connected: s -> 10.0.0.1:90")
-        raise clients.ProxyError(4, "refused")
+        raise clients.ProxyError(2, "refused")
 
     monkeypatch.setattr(clients, "socks5_connect", connect)
     j._filter("10.0.0.1", TARGETS, relay, agent)
 
 
 def test_errors_baseline_fails_when_streams_are_stuck(j, monkeypatch, clock):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 4)
+    relay, agent = _errors_world(j, monkeypatch, _correct)
     relay.status = lambda: {"active_streams": 3}
     assert _steps_failing(j, relay, agent) == "errors_baseline_clean"
 
@@ -303,7 +312,7 @@ def test_errors_baseline_fails_when_streams_are_stuck(j, monkeypatch, clock):
 @pytest.mark.parametrize("front", FRONTS)
 @pytest.mark.parametrize("reply,streams", [((503, b"x"), 0), ((200, PAGE), 2)])
 def test_tunnel_health_step_fails(j, monkeypatch, clock, reply, streams, front):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    relay, agent = _errors_world(j, monkeypatch, _correct)
     state = {"n": 0}
 
     def status():
@@ -388,7 +397,7 @@ def test_plugins_listed_fails_when_the_broken_plugin_is_listed(j, monkeypatch):
 
 
 def test_late_agent_connect_to_the_blocked_port_fails_the_sweep(j, monkeypatch, clock):
-    relay, agent = _errors_world(j, monkeypatch, lambda front: 4 if front == "socks5" else 502)
+    relay, agent = _errors_world(j, monkeypatch, _correct)
     calls = []
     base = j._wait_streams_zero
 

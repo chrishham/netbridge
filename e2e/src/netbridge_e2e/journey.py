@@ -328,8 +328,8 @@ class Journey:
                 secs = time.monotonic() - start
                 logged = relay.logs.wait_for(rf"Blocked port {targets.blocked_port}\b", 5, since=rmark)
                 reached_agent = agent.logs.wait_for(rf"Connected: .* -> .*:{targets.blocked_port}\b", 1, since=amark)
-                ok = e.code == 0x04 and logged is not None and reached_agent is None
-                return ok, (f"SOCKS5 reply {e.code:#04x} (want 0x04) after {secs:.1f}s, relay logged the block: "
+                ok = e.code == 0x02 and logged is not None and reached_agent is None
+                return ok, (f"SOCKS5 reply {e.code:#04x} (want 0x02) after {secs:.1f}s, relay logged the block: "
                             f"{logged is not None}, agent connected anyway: {reached_agent is not None}")
             sock.close()
             return False, f"connection to blocked port {targets.blocked_port} was allowed"
@@ -408,24 +408,27 @@ class Journey:
         socks_http = ("socks5", "http_connect", "http_forward")
         groups = [
             ("refused", ip, targets.refused_port, 10,
-             rf"Failed: \S+ -> {re.escape(ip)}:{targets.refused_port}: ConnectionRefusedError:", None, None, None,
+             rf"Failed: \S+ -> {re.escape(ip)}:{targets.refused_port}: ConnectionRefusedError: .*\[refused\]", None, None, None,
              socks_http),
             ("dns_failure", NXDOMAIN, 80, 20,
-             rf"Failed: \S+ -> {re.escape(NXDOMAIN)}:80: DnsError:", None, None, None, socks_http),
+             rf"Failed: \S+ -> {re.escape(NXDOMAIN)}:80: DnsError: .*\[dns_failed\]", None, None, None, socks_http),
             ("agent_denies", LINK_LOCAL, 80, 10,
-             rf"Destination denied: \S+ -> {re.escape(LINK_LOCAL)}:80\b", None, r"Blocked port|Destination denied for", None,
+             rf"Destination denied: \S+ -> {re.escape(LINK_LOCAL)}:80\b.*\[not_allowed\]", None, r"Blocked port|Destination denied for", None,
              socks_http),
             ("blocked_port", ip, targets.blocked_port, 10, None, rf"Blocked port {targets.blocked_port}\b", None,
              rf"Connected: .* -> .*:{targets.blocked_port}\b", ("http_connect", "http_forward")),
         ]
+        # (SOCKS5 reply, HTTP status) per case, from the connect error-code mapping
+        wanted = {"refused": (0x05, 502), "dns_failure": (0x04, 502),
+                  "agent_denies": (0x02, 403), "blocked_port": (0x02, 403)}
         for name, host, port, budget, alog, rlog, not_rlog, not_alog, fronts in groups:
             for front in fronts:
-                expect = 4 if front == "socks5" else 502
+                expect = wanted[name][0 if front == "socks5" else 1]
                 self.check(f"{name}_{front}", self._error_case(
                     relay, agent, front, host, port, expect, budget, alog, rlog, not_rlog, not_alog))
 
         def healthy():
-            # every front end: the error cases above expected 502 from the HTTP ones
+            # every front end: the error cases above expected 502/403 from the HTTP ones
             bad = {k: (st, len(b)) for k, (st, b) in self._get_all_fronts(ip, targets).items()
                    if (st, b) != (200, PAGE)}
             if bad:
@@ -521,7 +524,8 @@ class Journey:
         finally:
             echo.close()
         isolated = (other.get("type") == "tcp_connect_result" and other.get("success") is False
-                    and NO_AGENT in str(other.get("error")))
+                    and NO_AGENT in str(other.get("error"))
+                    and other.get("error_code") == "no_agent")
         control = mine.get("type") == "tcp_connect_result" and mine.get("success") is True
         return isolated and control and echo_after, (f"{OTHER_USER}: {json.dumps(other)}; journey user: {json.dumps(mine)}; "
                                                      f"echo stream round-tripped before and after: {echo_after}")
