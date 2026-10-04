@@ -138,8 +138,9 @@ bound fetches toward Microsoft regardless of request rate:
    - At most one background refresh is pending per tenant, and none is
      started during a failure backoff.
    - A 200 response that is not a JSON object with a `keys` list counts as a
-     failed fetch and never replaces the cached keys. Entries that are not
-     objects with string `kid`, `n` and `e` are dropped; a response with no
+     failed fetch and never replaces the cached keys. Entries from which
+     signature verification could not build an RS256 public key (built with
+     the same helper verification uses) are dropped; a response with no
      usable entry left is a failed fetch too.
    - Every fetch failure without usable keys raises
      `Signing keys unavailable`, the first one included.

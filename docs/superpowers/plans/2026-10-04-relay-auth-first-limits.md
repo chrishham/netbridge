@@ -324,7 +324,9 @@ async def test_expired_usable_cache_does_not_wait_for_slow_fetch(key):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", [[], {"keys": "x"}, {}, "keys", {"keys": []}, {"keys": [None]},
-                                  {"keys": [{"kid": "k1"}]}, {"keys": [{"kid": "k1", "n": 1, "e": "AQAB"}]}])
+                                  {"keys": [{"kid": "k1"}]}, {"keys": [{"kid": "k1", "n": 1, "e": "AQAB"}]},
+                                  {"keys": [{"kid": "k1", "n": "", "e": ""}]},
+                                  {"keys": [{"kid": "k1", "n": "!!", "e": "AQAB"}]}])
 async def test_malformed_jwks_response_keeps_previous_keys(key, body):
     private, jwk = key
     ms = FakeMicrosoft([jwk])
@@ -409,11 +411,21 @@ async def _fetch_jwks(tenant_id: str) -> dict:
     if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
         raise ValueError("Malformed JWKS response")  # a fetch failure: must not replace working keys
     # Keep only entries validation can use; a response with none of them is a failure too
-    keys = [k for k in jwks["keys"]
-            if isinstance(k, dict) and all(isinstance(k.get(f), str) for f in ("kid", "n", "e"))]
+    keys = [k for k in jwks["keys"] if _usable_jwk(k)]
     if not keys:
         raise ValueError("JWKS response has no usable keys")
     return {**jwks, "keys": keys}
+
+
+def _usable_jwk(jwk) -> bool:
+    """Whether _verify_signature could build a key from this entry."""
+    if not isinstance(jwk, dict) or not isinstance(jwk.get("kid"), str):
+        return False
+    try:
+        _jwk_public_key(jwk)
+    except Exception:
+        return False
+    return True
 
 
 async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
@@ -469,6 +481,31 @@ async def _refresh_jwks(tenant_id: str, force: bool = False) -> dict:
         _jwks_cache[tenant_id] = (time.time(), jwks)
         return jwks
 ```
+
+Move the key construction out of `_verify_signature` into a module-level helper both paths share, so the fetch filter accepts exactly the keys verification can use. In `_verify_signature`, replace the block from `# Get algorithm` through `public_key = rsa.RSAPublicNumbers(e, n).public_key(default_backend())` with `public_key = _jwk_public_key(jwk)`, and add above it:
+
+```python
+def _jwk_public_key(jwk: dict):
+    """The RSA public key for a JWK; raises TokenValidationError or ValueError if unusable."""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    alg = jwk.get("alg", "RS256")
+    if alg != "RS256":
+        raise TokenValidationError(f"Unsupported algorithm: {alg}")
+
+    def b64_to_int(b64: str) -> int:
+        pad = 4 - len(b64) % 4
+        if pad != 4:
+            b64 += "=" * pad
+        return int.from_bytes(base64.urlsafe_b64decode(b64), byteorder="big")
+
+    n = b64_to_int(jwk["n"])  # modulus
+    e = b64_to_int(jwk["e"])  # exponent
+    return rsa.RSAPublicNumbers(e, n).public_key(default_backend())
+```
+
+Add `import base64` to the module imports if `_verify_signature`'s local import is the only one. Keep the unsupported-algorithm message unchanged: `test_key_with_wrong_alg_rejected` matches it. Since the fetch now drops non-RS256 entries, that test (which patches `_get_jwks` directly) is unaffected; check any test that serves a non-RS256 key through the real fetch and expects `Unsupported algorithm` (`grep -n "Unsupported algorithm" shared/tests/*.py`), and if one exists, expect `Signing key not found` instead.
 
 Add `import asyncio` to the imports. Keep `global` statements out: the dicts are mutated, not rebound.
 
