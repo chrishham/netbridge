@@ -323,7 +323,8 @@ async def test_expired_usable_cache_does_not_wait_for_slow_fetch(key):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("body", [[], {"keys": "x"}, {}, "keys"])
+@pytest.mark.parametrize("body", [[], {"keys": "x"}, {}, "keys", {"keys": []}, {"keys": [None]},
+                                  {"keys": [{"kid": "k1"}]}, {"keys": [{"kid": "k1", "n": 1, "e": "AQAB"}]}])
 async def test_malformed_jwks_response_keeps_previous_keys(key, body):
     private, jwk = key
     ms = FakeMicrosoft([jwk])
@@ -334,6 +335,18 @@ async def test_malformed_jwks_response_keeps_previous_keys(key, body):
             await validate_arm_token(_token(private, "ghost"))  # forced refresh gets the bad body
         assert VALID_TENANT in mod._jwks_failed_at
         assert await validate_arm_token(_token(private))  # old keys still cached
+
+
+@pytest.mark.asyncio
+async def test_unusable_entries_are_dropped_and_usable_ones_kept(key):
+    private, jwk = key
+    new_private, new_public = _generate_rsa_keypair()
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))
+        ms.body = {"keys": [None, {"kid": "broken"}, _key_to_jwk(new_public, "k2"), jwk]}
+        assert await validate_arm_token(_token(new_private, "k2"))  # forced refresh accepts the usable keys
+        assert [k["kid"] for k in mod._jwks_cache[VALID_TENANT][1]["keys"]] == ["k2", "k1"]
 
 
 @pytest.mark.asyncio
@@ -395,7 +408,12 @@ async def _fetch_jwks(tenant_id: str) -> dict:
         jwks = resp.json()
     if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
         raise ValueError("Malformed JWKS response")  # a fetch failure: must not replace working keys
-    return jwks
+    # Keep only entries validation can use; a response with none of them is a failure too
+    keys = [k for k in jwks["keys"]
+            if isinstance(k, dict) and all(isinstance(k.get(f), str) for f in ("kid", "n", "e"))]
+    if not keys:
+        raise ValueError("JWKS response has no usable keys")
+    return {**jwks, "keys": keys}
 
 
 async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
@@ -791,6 +809,21 @@ async def test_per_user_limit_still_applies_when_ip_bucket_empty(client, monkeyp
             assert "Too many connection attempts" in await resp.text()
         finally:
             await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_rapid_valid_connections_hit_per_user_limit_with_defaults(client):
+    """Mirrors pentest rapid_connection_dos: 35 valid /tunnel upgrades from one IP, default limits."""
+    good = {"Authorization": "Bearer good"}
+    with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
+        for i in range(35):
+            resp = await client.get("/tunnel", headers=good)  # plain GET: auth and limits run before the upgrade
+            if resp.status == 429:
+                assert "Too many connection attempts" in await resp.text()
+                assert i <= mod.RATE_LIMIT_CONNECTIONS_PER_MIN
+                break
+        else:
+            pytest.fail("no 429 within 35 valid connections")
 
 
 @pytest.mark.asyncio

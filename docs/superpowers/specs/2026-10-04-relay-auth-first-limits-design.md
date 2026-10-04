@@ -138,7 +138,9 @@ bound fetches toward Microsoft regardless of request rate:
    - At most one background refresh is pending per tenant, and none is
      started during a failure backoff.
    - A 200 response that is not a JSON object with a `keys` list counts as a
-     failed fetch and never replaces the cached keys.
+     failed fetch and never replaces the cached keys. Entries that are not
+     objects with string `kid`, `n` and `e` are dropped; a response with no
+     usable entry left is a failed fetch too.
    - Every fetch failure without usable keys raises
      `Signing keys unavailable`, the first one included.
    - Stale keys are served for at most `JWKS_MAX_STALE = 86400` seconds
@@ -305,8 +307,10 @@ E2E (`e2e/src/netbridge_e2e/journey.py`, after `pentest_suite` and before
   not guesswork.
 - The pentest's `rapid_connection_dos` (skipped in the journey) uses a valid
   token and expects 429 within 35 connections. The per-user limit (10/min)
-  still provides that. Update its comment, which mentions the per-IP limit,
-  and verify it with security-tests against a local relay.
+  still provides that. Update its comment, which mentions the per-IP limit.
+  A relay test mirrors it with the default limits: 35 valid `/tunnel`
+  requests from one IP must hit the per-user 429. The pentest itself stays
+  skipped in the journey, as today.
 
 ## Deployment independence
 
@@ -355,8 +359,13 @@ prerequisite.
 ## Rollout notes for the user (not part of this change)
 
 - Restrict 80/443 on the VPS to Cloudflare ranges, or enable Authenticated
-  Origin Pulls. After that, `RELAY_TRUSTED_PROXIES=10.42.0.0/16` with
-  `RELAY_CLIENT_IP_HEADER=CF-Connecting-IP` gives real client IPs in logs and
-  in the failure throttle.
+  Origin Pulls.
+- Then trust the proxy, not the pod network. The Traefik pod IP changes on
+  restart, so the practical form is the pod range plus a rule that makes it
+  proxy-only for the relay: a NetworkPolicy (k3s enforces them) that admits
+  ingress to the relay pods only from the Traefik pods in `kube-system`.
+  With that policy in place, `RELAY_TRUSTED_PROXIES=10.42.0.0/16` and
+  `RELAY_CLIENT_IP_HEADER=CF-Connecting-IP` give real client IPs in logs and
+  in the failure throttle. Without the policy, any pod could forge the header.
 - Close 6443 to the internet, or restrict it to a known IP or the Headscale
   network.
