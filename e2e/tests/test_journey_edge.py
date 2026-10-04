@@ -48,11 +48,11 @@ class Stub:
 
 # --- arguments -----------------------------------------------------------
 
-def test_edge_profile_defaults_to_traefik_in_source_mode(tmp_path):
+def test_edge_profile_defaults_to_traefik_in_source_mode():
     assert journey.parse_args(["--mode", "source", "--edge"]).edge_profile == "traefik"
 
 
-def test_edge_profile_override(tmp_path):
+def test_edge_profile_override():
     assert journey.parse_args(["--mode", "source", "--edge", "--edge-profile", "arr"]).edge_profile == "arr"
 
 

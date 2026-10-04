@@ -273,7 +273,8 @@ class EdgeProxy:
             self._track(socks, 1, upstream)
             upstream.sendall(out + rest)
             self._pump(client, upstream)
-        except (OSError, ValueError):  # OSError includes SSLError; ValueError: a socket close() shut mid-select
+        except (OSError, ValueError, AttributeError):  # OSError includes SSLError; ValueError: a socket
+            # close() shut mid-select; AttributeError: close() cleared an SSLSocket mid-call
             pass
         finally:
             with self._lock:
