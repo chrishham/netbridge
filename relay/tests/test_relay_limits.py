@@ -144,6 +144,7 @@ async def test_throttle_warning_is_logged_once_per_window(client, monkeypatch, c
         clock[0] += mod.IP_THROTTLE_REPORT_INTERVAL + 1
         await client.get("/ws", headers=bad)
     assert "(4 more since last report)" in caplog.text
+    assert caplog.text.count("auth rejected") == 1  # the one 401 only; throttled 429s add no such line
 
 
 @pytest.mark.asyncio

@@ -366,9 +366,19 @@ def _parse_ip(value: str):
     elif value.count(":") == 1:
         value = value.split(":", 1)[0]
     try:
-        return ipaddress.ip_address(value)
+        ip = ipaddress.ip_address(value)
     except ValueError:
         return None
+    return getattr(ip, "ipv4_mapped", None) or ip  # ::ffff:1.2.3.4 is 1.2.3.4
+
+
+def _warn_client_ip_config(header_env: str, proxies) -> None:
+    """Warn about client-IP settings that are ignored or trust everything."""
+    if header_env.strip() and not proxies:
+        logger.warning("RELAY_CLIENT_IP_HEADER is set but RELAY_TRUSTED_PROXIES is empty: the header is ignored")
+    if any(net.prefixlen == 0 for net in proxies):
+        logger.warning("RELAY_TRUSTED_PROXIES contains a /0 range: every address is trusted, "
+                       "so any client can spoof its IP")
 
 
 def _is_trusted(ip) -> bool:
@@ -1224,6 +1234,7 @@ def main():
     except ValueError as e:
         logger.error(f"Configuration error: RELAY_TRUSTED_PROXIES: {e}")
         sys.exit(1)
+    _warn_client_ip_config(os.environ.get("RELAY_CLIENT_IP_HEADER", ""), _TRUSTED_PROXIES)
     if _TRUSTED_PROXIES:
         logger.info(f"Client IP: {CLIENT_IP_HEADER} from {len(_TRUSTED_PROXIES)} trusted proxy range(s)")
 

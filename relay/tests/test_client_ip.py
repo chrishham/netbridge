@@ -115,3 +115,32 @@ def test_parse_trusted_proxies():
 def test_parse_trusted_proxies_rejects_invalid(raw):
     with pytest.raises(ValueError):
         mod._parse_trusted_proxies(raw)
+
+
+def test_ipv4_mapped_peer_is_matched_against_ipv4_proxies(trusted):
+    trusted("10.0.0.0/8")
+    assert mod._client_ip(_req("::ffff:10.0.0.5", {"X-Forwarded-For": "1.1.1.1"})) == "1.1.1.1"
+
+
+def test_ipv4_mapped_header_entry_is_normalised(trusted):
+    trusted("10.0.0.0/8")
+    assert mod._client_ip(_req("10.0.0.5", {"X-Forwarded-For": "::ffff:1.1.1.1"})) == "1.1.1.1"
+
+
+def test_warns_when_header_set_without_trusted_proxies(caplog):
+    mod._warn_client_ip_config("X-Real-IP", ())
+    assert "ignored" in caplog.text
+
+
+def test_warns_on_trust_everything_range(caplog):
+    mod._warn_client_ip_config("", mod._parse_trusted_proxies("0.0.0.0/0"))
+    assert "/0" in caplog.text
+    caplog.clear()
+    mod._warn_client_ip_config("", mod._parse_trusted_proxies("::/0"))
+    assert "/0" in caplog.text
+
+
+def test_no_warning_for_sane_config(caplog):
+    mod._warn_client_ip_config("X-Real-IP", mod._parse_trusted_proxies("10.0.0.0/8"))
+    mod._warn_client_ip_config("", ())
+    assert caplog.text == ""

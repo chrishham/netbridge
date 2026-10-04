@@ -264,3 +264,39 @@ async def test_keys_older_than_max_stale_are_not_served(key):
             await validate_arm_token(_token(private))  # fetch fails, keys too old to serve
         with pytest.raises(TokenValidationError, match="Signing keys unavailable"):
             await validate_arm_token(_token(private))  # within backoff
+
+
+@pytest.mark.asyncio
+async def test_forced_refresh_during_backoff_keeps_cooldown_unspent(key, monkeypatch):
+    private, jwk = key
+    clock = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))  # warm cache
+        _expire(mod.JWKS_CACHE_TTL + 1)
+        ms.fail = True
+        await validate_arm_token(_token(private))  # background refresh fails: backoff starts
+        await _drain_refreshes()
+        assert VALID_TENANT in mod._jwks_failed_at
+        calls = ms.calls
+        with pytest.raises(TokenValidationError, match="Signing key not found: ghost-1"):
+            await validate_arm_token(_token(private, "ghost-1"))
+        assert ms.calls == calls
+        assert VALID_TENANT not in mod._jwks_forced_refresh
+        clock[0] += mod.JWKS_FETCH_BACKOFF + 1
+        ms.fail = False
+        with pytest.raises(TokenValidationError, match="Signing key not found: ghost-2"):
+            await validate_arm_token(_token(private, "ghost-2"))
+        assert ms.calls == calls + 1  # backoff over: the unknown kid forces a fetch
+
+
+@pytest.mark.asyncio
+async def test_kidless_token_makes_no_http_request(key):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    token = _sign_jwt(private, {"alg": "RS256", "typ": "JWT"}, _make_valid_claims())
+    with _patched(ms):
+        with pytest.raises(TokenValidationError, match="No key ID in token header"):
+            await validate_arm_token(token)
+    assert ms.calls == 0

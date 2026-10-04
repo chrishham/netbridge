@@ -285,13 +285,14 @@ async def validate_arm_token(token: str) -> str:
                 if token_age_hours > max_age_hours:
                     raise TokenValidationError("Token too old")
 
+        kid = header.get("kid")
+        if not kid:
+            raise TokenValidationError("No key ID in token header")
+
         # Get JWKS for signature verification
         jwks = await _get_jwks(tid)
 
         # Find the signing key
-        kid = header.get("kid")
-        if not kid:
-            raise TokenValidationError("No key ID in token header")
 
         signing_key = None
         for key in jwks.get("keys", []):
@@ -303,7 +304,10 @@ async def validate_arm_token(token: str) -> str:
             # Maybe a key rollover: force a refresh, at most once per tenant per cooldown
             now = time.monotonic()
             last = _jwks_forced_refresh.get(tid)
-            if last is None or now - last >= JWKS_FORCED_REFRESH_COOLDOWN:
+            failed_at = _jwks_failed_at.get(tid)
+            in_backoff = failed_at is not None and now - failed_at < JWKS_FETCH_BACKOFF
+            # inside the failure backoff a refresh would fetch nothing: keep the cooldown unspent
+            if not in_backoff and (last is None or now - last >= JWKS_FORCED_REFRESH_COOLDOWN):
                 _jwks_forced_refresh[tid] = now  # before the await: concurrent requests skip
                 jwks = await _get_jwks(tid, force=True)
                 for key in jwks.get("keys", []):
