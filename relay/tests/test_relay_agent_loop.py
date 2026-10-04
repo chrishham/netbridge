@@ -21,6 +21,29 @@ async def test_failed_connect_result_releases_the_stream(client):
     await wait_until(lambda: "s1" not in mod.tcp_streams)
 
 
+async def test_agent_error_code_is_forwarded_byte_identical(client):
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "s1")
+    raw = '{"type":"tcp_connect_result", "stream_id":"s1","success":false,"error":"x","error_code":"refused"}'
+    await agent.ws.send_str(raw)
+    await wait_until(lambda: "s1" not in mod.tcp_streams)
+    res = await tunnel.expect("tcp_connect_result", stream_id="s1", success=False)
+    assert res["error_code"] == "refused"
+    assert tunnel.raw[-1] == raw                     # relay does not re-serialise agent frames
+
+
+async def test_unknown_well_formed_error_code_is_forwarded_untouched(client):
+    agent, _ = await connect_agent(client)
+    tunnel = await connect_tunnel(client)
+    await open_stream(tunnel, agent, "s1")
+    raw = '{"type":"tcp_connect_result","stream_id":"s1","success":false,"error":"x","error_code":"from_the_future"}'
+    await agent.ws.send_str(raw)
+    res = await tunnel.expect("tcp_connect_result", stream_id="s1", success=False)
+    assert res["error_code"] == "from_the_future"
+    assert tunnel.raw[-1] == raw
+
+
 async def test_successful_connect_result_keeps_the_stream(client):
     agent, _ = await connect_agent(client)
     tunnel = await connect_tunnel(client)

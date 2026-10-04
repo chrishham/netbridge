@@ -370,6 +370,7 @@ class TestHandleTcpConnect:
         ws.send_str.assert_called_once()
         sent = json.loads(ws.send_str.call_args[0][0])
         assert sent["success"] is False
+        assert sent["error_code"] == "invalid_request"
 
     @pytest.mark.asyncio
     async def test_rate_limit(self):
@@ -387,6 +388,25 @@ class TestHandleTcpConnect:
         sent = json.loads(ws.send_str.call_args[0][0])
         assert sent["success"] is False
         assert "rate limit" in sent["error"].lower()
+        assert sent["error_code"] == "capacity"
+
+    @pytest.mark.asyncio
+    async def test_destination_denied_has_not_allowed_code(self):
+        from relay.__main__ import _handle_tcp_connect
+        ws = AsyncMock()
+        ws.closed = False
+        limiter = MagicMock()
+        limiter.has_capacity.return_value = True
+        limiter.acquire = AsyncMock()
+
+        data = {"stream_id": "s1", "host": "10.0.0.1", "port": 80}
+        with patch("relay.__main__._check_destination_allowed",
+                   AsyncMock(return_value=(False, "denied"))):
+            await _handle_tcp_connect(ws, data, "key", "user@x.com", limiter, "{}")
+
+        sent = json.loads(ws.send_str.call_args[0][0])
+        assert sent["success"] is False
+        assert sent["error_code"] == "not_allowed"
 
     @pytest.mark.asyncio
     async def test_blocked_port(self):
@@ -410,6 +430,7 @@ class TestHandleTcpConnect:
             sent = json.loads(ws.send_str.call_args[0][0])
             assert sent["success"] is False
             assert "not allowed" in sent["error"].lower()
+            assert sent["error_code"] == "not_allowed"
         finally:
             mod.BLOCKED_PORTS = original_ports
 
@@ -460,6 +481,7 @@ class TestHandleTcpConnect:
             sent = json.loads(ws.send_str.call_args[0][0])
             assert sent["success"] is False
             assert "no bridge agent" in sent["error"].lower()
+            assert sent["error_code"] == "no_agent"
         finally:
             mod.bridge_agents.update(original_agents)
 
@@ -490,6 +512,7 @@ class TestHandleTcpConnect:
             sent = json.loads(ws.send_str.call_args[0][0])
             assert sent["success"] is False
             assert "limit" in sent["error"].lower()
+            assert sent["error_code"] == "capacity"
         finally:
             mod.tcp_streams.clear()
             mod.tcp_streams.update(original_streams)
@@ -531,6 +554,7 @@ class TestHandleTcpConnect:
             sent = json.loads(ws.send_str.call_args[0][0])
             assert sent["success"] is False
             assert "collision" in sent["error"].lower()
+            assert sent["error_code"] == "invalid_request"
         finally:
             mod.bridge_agents.pop("user@x.com", None)
             mod.tcp_streams.pop("s1", None)

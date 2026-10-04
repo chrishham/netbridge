@@ -48,6 +48,7 @@ async def test_tunnel_bad_stream_id_never_becomes_a_key(client, sid, caplog):
     await tunnel.send(type="tcp_connect", stream_id=sid, host="10.0.0.1", port=80)
     res = await tunnel.expect("tcp_connect_result", success=False)
     assert res["stream_id"] is None and res["error"] == "Invalid stream_id"
+    assert res["error_code"] == "invalid_request"
     for t in ("tcp_data", "tcp_close"):
         await tunnel.send(type=t, stream_id=sid, data="AA==")
     await tunnel.send(type="tcp_connect", stream_id="ok", host="10.0.0.1", port=80)
@@ -75,6 +76,11 @@ async def test_agent_tcp_data_with_non_str_data_is_not_forwarded(client, data):
     {"success": False, "error": None},
     {"success": False, "error": 5},
     {"success": True, "error": "boom"},              # error only allowed when absent/null on success
+    {"success": False, "error": "x", "error_code": 5},            # non-str code
+    {"success": False, "error": "x", "error_code": "REFUSED"},    # uppercase
+    {"success": False, "error": "x", "error_code": "a" * 33},     # too long
+    {"success": False, "error": "x", "error_code": ""},           # empty
+    {"success": True, "error_code": "refused"},                   # code on success
 ])
 async def test_invalid_connect_results_are_dropped(client, fields):
     agent, _ = await connect_agent(client)

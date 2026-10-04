@@ -32,6 +32,7 @@ from typing import Any, TypedDict
 
 from aiohttp import web, WSMsgType
 from aiolimiter import AsyncLimiter
+from shared_auth import connect_errors
 
 from . import __version__
 from .auth import validate_token, extract_bearer_token, TokenValidationError
@@ -128,6 +129,9 @@ def _valid_connect_result(msg: dict) -> bool:
     if not isinstance(success, bool):
         return False
     error = msg.get("error")
+    if "error_code" in msg:
+        if success or not connect_errors.valid_error_code(msg["error_code"]):
+            return False
     return isinstance(error, str) if not success else error is None
 
 
@@ -742,6 +746,7 @@ async def _handle_tcp_connect(
                 "stream_id": None,
                 "success": False,
                 "error": "Invalid stream_id",
+                "error_code": connect_errors.INVALID_REQUEST,
             }),
         )
         return
@@ -759,6 +764,7 @@ async def _handle_tcp_connect(
                 "stream_id": stream_id,
                 "success": False,
                 "error": error_msg,
+                "error_code": connect_errors.INVALID_REQUEST,
             }),
         )
         return
@@ -773,6 +779,7 @@ async def _handle_tcp_connect(
                 "stream_id": stream_id,
                 "success": False,
                 "error": "Rate limit exceeded for stream creation",
+                "error_code": connect_errors.CAPACITY,
             }),
         )
         return
@@ -788,6 +795,7 @@ async def _handle_tcp_connect(
                 "stream_id": stream_id,
                 "success": False,
                 "error": f"Port {port} is not allowed",
+                "error_code": connect_errors.NOT_ALLOWED,
             }),
         )
         return
@@ -803,6 +811,7 @@ async def _handle_tcp_connect(
                 "stream_id": stream_id,
                 "success": False,
                 "error": f"Destination {host} is not allowed",
+                "error_code": connect_errors.NOT_ALLOWED,
             }),
         )
         return
@@ -818,6 +827,7 @@ async def _handle_tcp_connect(
                     "stream_id": stream_id,
                     "success": False,
                     "error": "Maximum stream limit reached",
+                    "error_code": connect_errors.CAPACITY,
                 }),
             )
             return
@@ -829,6 +839,7 @@ async def _handle_tcp_connect(
                 "stream_id": stream_id,
                 "success": False,
                 "error": "No bridge agent available",
+                "error_code": connect_errors.NO_AGENT,
             }))
             return
 
@@ -844,6 +855,7 @@ async def _handle_tcp_connect(
                     "stream_id": stream_id,
                     "success": False,
                     "error": "Stream ID collision",
+                    "error_code": connect_errors.INVALID_REQUEST,
                 }),
             )
             return

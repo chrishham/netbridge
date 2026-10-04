@@ -54,11 +54,13 @@ class Peer:
         self.ws = ws
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.seen: list[dict] = []
+        self.raw: list[str] = []
         self._reader = asyncio.create_task(self._read())
 
     async def _read(self):
         async for msg in self.ws:
             data = json.loads(msg.data)
+            self.raw.append(msg.data)
             self.seen.append(data)
             await self.inbox.put(data)
 
