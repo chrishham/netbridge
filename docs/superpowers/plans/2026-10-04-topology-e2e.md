@@ -4,7 +4,7 @@
 
 **Goal:** Run the whole e2e journey with an in-process TLS reverse proxy (the "edge") between the clients and the relay. The edge's proxy behaviours are parameters. The run also proves the trusted-proxy client IP from #27 through a real hop.
 
-**Architecture:** A new driver module, `edgeproxy.py`, terminates TLS with a per-run CA, rewrites the HTTP/1.1 request head (X-Forwarded-For, prefix strip, X-Forwarded-Proto), then pumps bytes to the relay and closes idle links. It follows the thread style of `faultproxy.py`. With `--edge`, the chain is `client --wss--> FaultProxy --> edge --ws--> relay`, the clients get `NETBRIDGE_CA_BUNDLE`, and the relay trusts `127.0.0.1/32` for X-Forwarded-For. Four new journey steps assert on the edge.
+**Architecture:** A new driver module, `edgeproxy.py`, terminates TLS with a per-run CA, rewrites the HTTP/1.1 request head (X-Forwarded-For, prefix strip, X-Forwarded-Proto), then pumps bytes to the relay and closes idle links. It follows the thread style of `faultproxy.py`. With `--edge`, the chain is `client --wss--> FaultProxy --> edge --ws--> relay`, the clients get `NETBRIDGE_CA_BUNDLE`, and the relay trusts `127.0.0.1/32` for X-Forwarded-For. Six new journey steps assert on the edge.
 
 **Tech Stack:** Python 3.14, stdlib `socket`/`ssl`/`select`/`threading`, `cryptography` (already an e2e dependency), pytest, GitHub Actions.
 
@@ -26,10 +26,11 @@
 
 ## Review Focus
 
-1. **Relay down behind the edge** (relay restart step): the edge accepts TLS and then cannot reach the relay. It must answer `502` and close, and the clients must treat that as a transient failure and reconnect. Pinned by `test_upstream_down_answers_502`; the journey's `reconnect` step runs through the edge.
-2. **Decrypted bytes buffered inside the SSL object**: `select` does not see them. A large transfer must not stall. Pinned by `test_large_payload_round_trips` (1 MiB each way).
+1. **Relay down behind the edge** (relay restart step): the edge accepts TLS and then cannot reach the relay. It must answer `502` and close, and the clients must treat that as a transient failure and reconnect. Pinned by `test_upstream_down_answers_502`, and in the journey by `edge_relay_down_502` (the relay stays down until both clients have met a 502) followed by `reconnect`.
+2. **Decrypted bytes buffered inside the SSL object**: `select` does not see them. A large transfer in both directions at once must not stall or deadlock. Pinned by `test_large_payload_round_trips` (32 MiB each way against an echo that blocks on its own writes).
 3. **A request head trickled across many segments**: it must still parse. Pinned by `test_trickled_head_is_parsed`.
 4. **Bytes sent in the same segment as the head** (a client pipelining its first frame): they must be forwarded, not dropped. Pinned by `test_bytes_after_head_are_forwarded`.
+6. **A spoofed X-Forwarded-For from a direct client**: the relay must key on the edge's peer, never on what the client wrote. Pinned by `test_listening_on_all_interfaces_appends_the_real_peer` and the journey's `edge_appends_peer`.
 5. **Client-supplied forwarding headers**: repeated `X-Forwarded-For` fields merge in order into one field, and a client's `X-Forwarded-Proto` is replaced, not duplicated. Pinned by `test_repeated_xff_fields_merge_in_order` and `test_xff_appended_bare_ip_and_proto_replaced`.
 
 ---
@@ -44,7 +45,7 @@
 | `e2e/tests/test_clients.py` | modify | tests for the three client additions |
 | `e2e/src/netbridge_e2e/stack.py` | modify | `Relay(..., extra_env=)` |
 | `e2e/tests/test_stack.py` | modify | `extra_env` reaches the process env and the docker `-e` list |
-| `e2e/src/netbridge_e2e/journey.py` | modify | `--edge`/`--edge-profile`, wiring, four steps |
+| `e2e/src/netbridge_e2e/journey.py` | modify | `--edge`/`--edge-profile`, wiring, six steps |
 | `e2e/tests/test_journey_edge.py` | create | edge steps against fakes; arg parsing |
 | `e2e/README.md` | modify | mode table, flags, steps |
 | `.github/workflows/ci.yml` | modify | new `e2e-edge` job |
@@ -73,6 +74,7 @@
 
 ```python
 import os
+import select
 import socket
 import ssl
 import threading
@@ -92,7 +94,6 @@ class Upstream:
     def __init__(self, answer=b"HTTP/1.1 101 Switching Protocols\r\n\r\n"):
         self.answer = answer
         self.heads: list[bytes] = []
-        self.extra: list[bytes] = []  # bytes that arrived with the head
         self.srv = socket.create_server(("127.0.0.1", 0))
         self.address = self.srv.getsockname()
         self._stop = threading.Event()
@@ -118,7 +119,6 @@ class Upstream:
                     buf += chunk
                 head, _, rest = buf.partition(b"\r\n\r\n")
                 self.heads.append(head + b"\r\n\r\n")
-                self.extra.append(rest)
                 c.sendall(self.answer + rest)
                 while data := c.recv(65536):
                     c.sendall(data)
@@ -167,6 +167,16 @@ def read_until(sock, marker: bytes) -> bytes:
 
 def get(path="/ws", extra="") -> bytes:
     return f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}\r\n".encode()
+
+
+def ended_by_edge(s, timeout=4.0) -> bool:
+    """The edge closed the link. Its close sends no TLS close_notify, so a verifying client may see
+    SSLEOFError instead of b""; a timeout (TimeoutError) still fails the test."""
+    s.settimeout(timeout)
+    try:
+        return s.recv(1) == b""
+    except (ConnectionError, ssl.SSLError):
+        return True
 
 
 def wait_until(pred, timeout=3.0):
@@ -220,7 +230,12 @@ def test_bare_prefix_becomes_root():
     assert rewrite_head(get("/netbridge"), PEER, ARR).startswith(b"GET / HTTP/1.1\r\n")
 
 
-@pytest.mark.parametrize("path", ["/ws", "/netbridgex/ws", "/"])
+def test_query_survives_the_prefix_strip():
+    assert rewrite_head(get("/netbridge?x=1"), PEER, ARR).startswith(b"GET /?x=1 HTTP/1.1\r\n")
+    assert rewrite_head(get("/netbridge/ws?x=/a"), PEER, ARR).startswith(b"GET /ws?x=/a HTTP/1.1\r\n")
+
+
+@pytest.mark.parametrize("path", ["/ws", "/netbridgex/ws", "/", "/netbridgex?x=1"])
 def test_outside_the_prefix_is_a_lookup_error(path):
     with pytest.raises(LookupError):
         rewrite_head(get(path), PEER, ARR)
@@ -271,23 +286,36 @@ def test_trickled_head_is_parsed(edge, upstream):
 def test_bytes_after_head_are_forwarded(edge, upstream):
     with tls(edge) as s:
         s.sendall(get() + b"first-frame")
+        # the echo can only return it if the edge forwarded it
         assert read_until(s, b"first-frame").endswith(b"first-frame")
-    assert upstream.extra[0] == b"first-frame"
 
 
 def test_large_payload_round_trips(edge):
-    data = os.urandom(1024 * 1024)
+    """32 MiB each way at once, against an echo that blocks on its own writes: well past the loopback
+    socket buffers, so a pump that blocked on one direction's write would deadlock here."""
+    data = os.urandom(32 * 1024 * 1024)
     with tls(edge) as s:
         s.sendall(get())
         read_until(s, b"\r\n\r\n")
-        sender = threading.Thread(target=s.sendall, args=(data,), daemon=True)
-        sender.start()
-        got = b""
+        # one thread, non-blocking: an SSL socket is not safe to read and write from two threads
+        s.setblocking(False)
+        sent, got = 0, bytearray()
         while len(got) < len(data):
-            chunk = s.recv(65536)
-            assert chunk, f"closed after {len(got)} bytes"
-            got += chunk
-        sender.join(5)
+            want_write = [s] if sent < len(data) else []
+            readable, writable, _ = select.select([s], want_write, [], 5)
+            assert readable or writable or s.pending(), f"stalled: sent {sent}, got {len(got)}"
+            if writable:
+                try:
+                    sent += s.send(data[sent:sent + 65536])
+                except (ssl.SSLWantWriteError, ssl.SSLWantReadError):
+                    pass
+            if readable or s.pending():
+                try:
+                    chunk = s.recv(65536)
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    continue
+                assert chunk, f"closed after {len(got)} bytes"
+                got += chunk
     assert got == data
 
 
@@ -336,6 +364,7 @@ def test_upstream_down_answers_502(tmp_path):
         with tls(e) as c:
             c.sendall(get())
             assert read_until(c, b"\r\n\r\n").startswith(b"HTTP/1.1 502")
+        assert e.bad_gateways == {"/ws": 1}
     finally:
         e.close()
 
@@ -358,8 +387,7 @@ def test_idle_link_is_closed_and_counted(tmp_path, upstream):
             s.sendall(get())
             read_until(s, b"\r\n\r\n")
             start = time.monotonic()
-            s.settimeout(4)
-            assert s.recv(1) == b""
+            assert ended_by_edge(s)
             assert 0.8 <= time.monotonic() - start < 3.5
         assert wait_until(lambda: e.idle_closes == 1)
     finally:
@@ -385,8 +413,7 @@ def test_silent_client_before_its_head_is_idle_too(tmp_path, upstream):
     e = make_edge(tmp_path, upstream.address, idle=1.0)
     try:
         with tls(e) as s:
-            s.settimeout(4)
-            assert s.recv(1) == b""
+            assert ended_by_edge(s)
         assert wait_until(lambda: e.idle_closes == 1)
         assert upstream.heads == []
     finally:
@@ -399,14 +426,35 @@ def test_close_ends_open_links(edge):
     read_until(s, b"\r\n\r\n")
     assert wait_until(lambda: edge.active() == 1)
     edge.close()
-    s.settimeout(3)
     try:
-        assert s.recv(1) == b""
-    except (ConnectionError, ssl.SSLError):
-        pass
+        assert ended_by_edge(s, 3)
     finally:
         s.close()
     assert edge.active() == 0
+
+
+def test_close_does_not_wait_for_a_silent_client(tmp_path, upstream):
+    e = make_edge(tmp_path, upstream.address, idle=30.0)
+    s = tls(e)  # handshake done, no head: the edge sits in a blocking recv
+    try:
+        assert wait_until(lambda: e.active() == 1)
+        start = time.monotonic()
+        e.close()
+        assert time.monotonic() - start < 1.5
+        assert ended_by_edge(s, 3)
+    finally:
+        s.close()
+
+
+def test_listening_on_all_interfaces_appends_the_real_peer(tmp_path, upstream):
+    e = EdgeProxy(upstream.address, tmp_path / "edge", TRAEFIK, 5.0, host="0.0.0.0").start()
+    try:
+        with tls(e) as s:
+            s.sendall(get(extra="X-Forwarded-For: 203.0.113.9\r\n"))
+            read_until(s, b"\r\n\r\n")
+        assert b"X-Forwarded-For: 203.0.113.9, 127.0.0.1\r\n" in upstream.heads[0]
+    finally:
+        e.close()
 
 
 def test_profiles_match_the_spec():
@@ -431,6 +479,7 @@ App Service), strips an optional path prefix, sets X-Forwarded-Proto, then
 pumps bytes to the relay over plain TCP. A link with no byte in either
 direction for idle_timeout seconds is closed, as Cloudflare and App Service do.
 """
+import collections
 import datetime
 import ipaddress
 import select
@@ -450,6 +499,7 @@ TICK = 0.2
 MAX_HEAD = 16 * 1024
 HANDSHAKE_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 5.0
+MAX_BUFFERED = 1024 * 1024  # per direction, toward a side that is not reading
 # the edge reaches the relay from loopback: trust exactly that hop
 RELAY_ENV = {"RELAY_TRUSTED_PROXIES": "127.0.0.1/32", "RELAY_CLIENT_IP_HEADER": "X-Forwarded-For"}
 
@@ -517,9 +567,10 @@ def rewrite_head(head: bytes, peer: tuple[str, int], profile: EdgeProfile) -> by
         raise ValueError(f"bad request line {lines[0]!r}")
     method, target, version = parts
     if profile.prefix:
-        if target != profile.prefix and not target.startswith(profile.prefix + "/"):
+        path, mark, query = target.partition("?")
+        if path != profile.prefix and not path.startswith(profile.prefix + "/"):
             raise LookupError(target)
-        target = target[len(profile.prefix):] or "/"
+        target = (path[len(profile.prefix):] or "/") + mark + query
     fields, forwarded = [], []
     for line in lines[1:]:
         name, sep, value = line.partition(":")
@@ -563,6 +614,11 @@ def _respond(sock: socket.socket, status: int, reason: str) -> None:
 
 
 def _close(s: socket.socket) -> None:
+    """Shut down first: a bare close() from another thread does not wake a recv blocked on it."""
+    try:
+        s.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
     try:
         s.close()
     except OSError:
@@ -570,17 +626,19 @@ def _close(s: socket.socket) -> None:
 
 
 class EdgeProxy:
-    def __init__(self, upstream: tuple[str, int], tls_dir: Path, profile: EdgeProfile, idle_timeout: float):
+    def __init__(self, upstream: tuple[str, int], tls_dir: Path, profile: EdgeProfile, idle_timeout: float,
+                 host: str = "127.0.0.1"):
         self.upstream = upstream
         self.profile = profile
         self.idle_timeout = idle_timeout
         self.ca_path, cert, key = make_tls_material(tls_dir)
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.load_cert_chain(cert, key)
-        self._srv = socket.create_server(("127.0.0.1", 0))
+        self._srv = socket.create_server((host, 0))
         self.port = self._srv.getsockname()[1]
         self.accepted = 0
         self.idle_closes = 0
+        self.bad_gateways: collections.Counter[str] = collections.Counter()  # 502s, by path as the relay would see it
         self._lock = threading.Lock()
         self._links: dict[int, list[socket.socket]] = {}  # per connection: client socket (+ upstream)
         self._threads: list[threading.Thread] = []
@@ -599,7 +657,7 @@ class EdgeProxy:
             return len(self._links)
 
     def close(self) -> None:
-        with self._lock:
+        with self._lock:  # after this, no thread starts and no link registers
             self._closed = True
             links = [s for socks in self._links.values() for s in socks]
             threads = list(self._threads)
@@ -610,43 +668,53 @@ class EdgeProxy:
             if t is not threading.current_thread():
                 t.join(2)
 
-    def _spawn(self, target, *args) -> None:
-        with self._lock:
+    def _spawn(self, target, *args) -> bool:
+        t = threading.Thread(target=target, args=args, name=f"edge-{target.__name__}", daemon=True)
+        with self._lock:  # atomic with close(): every recorded thread is started, none starts after it
             if self._closed:
-                return
-            self._threads = [t for t in self._threads if t.is_alive()]
-            t = threading.Thread(target=target, args=args, name=f"edge-{target.__name__}", daemon=True)
+                return False
+            self._threads = [x for x in self._threads if x.is_alive()]
             self._threads.append(t)
-        t.start()
+            t.start()
+        return True
 
     def _accept_loop(self) -> None:
-        while True:
+        while not self._closed:
             try:
+                # a listener closed by another thread does not reliably wake accept(): poll instead
+                if not select.select([self._srv], [], [], TICK)[0]:
+                    continue
                 raw, peer = self._srv.accept()
-            except OSError:
-                return  # closed
+            except (OSError, ValueError):  # ValueError: listener closed by close() mid-select
+                return
             with self._lock:
-                if self._closed:
-                    _close(raw)
-                    return
                 self.accepted += 1
-            self._spawn(self._serve, raw, peer)
+            if not self._spawn(self._serve, raw, peer):
+                _close(raw)  # closed meanwhile: nobody else owns this socket
+                return
 
     def _count_idle(self) -> None:
         with self._lock:
             self.idle_closes += 1
 
-    def _serve(self, raw: socket.socket, peer: tuple[str, int]) -> None:
-        socks = [raw]
+    def _track(self, socks: list[socket.socket], index: int, s: socket.socket) -> None:
+        """Record a link's socket so close() can end it; raises if close() already ran."""
         with self._lock:
             if self._closed:
-                _close(raw)
-                return
+                raise OSError("edge closed")
+            if index < len(socks):
+                socks[index] = s
+            else:
+                socks.append(s)
             self._links[id(socks)] = socks
+
+    def _serve(self, raw: socket.socket, peer: tuple[str, int]) -> None:
+        socks: list[socket.socket] = []
         try:
+            self._track(socks, 0, raw)
             raw.settimeout(HANDSHAKE_TIMEOUT)
             client = self._ctx.wrap_socket(raw, server_side=True)
-            socks[0] = client
+            self._track(socks, 0, client)  # raw is detached now: close() must reach the TLS socket
             client.settimeout(self.idle_timeout)  # a client silent before its head is idle too
             try:
                 head, rest = _read_head(client)
@@ -669,10 +737,11 @@ class EdgeProxy:
             try:
                 upstream = socket.create_connection(self.upstream, timeout=CONNECT_TIMEOUT)
             except OSError:
+                with self._lock:
+                    self.bad_gateways[out.split(b" ", 2)[1].decode("latin-1")] += 1
                 _respond(client, 502, "Bad Gateway")
                 return
-            socks.append(upstream)
-            upstream.settimeout(self.idle_timeout)
+            self._track(socks, 1, upstream)
             upstream.sendall(out + rest)
             self._pump(client, upstream)
         except OSError:  # includes ssl.SSLError and socket.timeout mid-record
@@ -682,24 +751,53 @@ class EdgeProxy:
                 self._links.pop(id(socks), None)
             for s in socks:
                 _close(s)
+            if not socks:
+                _close(raw)
 
     def _pump(self, client: ssl.SSLSocket, upstream: socket.socket) -> None:
+        """Both directions in one thread that never blocks on a write: a side that stops reading
+        stalls only the direction toward it (up to MAX_BUFFERED bytes), never the other one."""
         other = {client: upstream, upstream: client}
+        pending = {client: bytearray(), upstream: bytearray()}  # bytes waiting to be written to that socket
+        ended: set[socket.socket] = set()
+        for s in other:
+            s.setblocking(False)
         last = time.monotonic()
         while not self._closed:
-            # decrypted bytes already inside the SSL object are invisible to select
-            ready = [client] if client.pending() else select.select([client, upstream], [], [], TICK)[0]
-            if not ready:
-                if time.monotonic() - last >= self.idle_timeout:
-                    self._count_idle()
-                    return
-                continue
-            for s in ready:
-                data = s.recv(65536)
-                if not data:
-                    return
-                other[s].sendall(data)
-            last = time.monotonic()
+            # one side hung up: finish delivering what it sent, then end both (FIN is not forwarded)
+            if ended and not any(pending[other[s]] for s in ended):
+                return
+            readers = [s for s in other if s not in ended and len(pending[other[s]]) < MAX_BUFFERED]
+            writers = [s for s in other if pending[s]]
+            if client in readers and client.pending():
+                # decrypted bytes already inside the SSL object are invisible to select
+                readable, writable = [client], []
+            else:
+                readable, writable, _ = select.select(readers, writers, [], TICK)
+            moved = False
+            for s in writable:
+                try:
+                    n = s.send(pending[s][:65536])
+                except (ssl.SSLWantWriteError, ssl.SSLWantReadError, BlockingIOError):
+                    continue
+                del pending[s][:n]
+                moved = moved or n > 0
+            for s in readable:
+                try:
+                    data = s.recv(65536)
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                    continue  # a partial TLS record: nothing to deliver yet
+                if data:
+                    pending[other[s]] += data
+                    moved = True
+                else:
+                    ended.add(s)
+            now = time.monotonic()
+            if moved:
+                last = now
+            elif now - last >= self.idle_timeout:
+                self._count_idle()
+                return
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -728,8 +826,8 @@ git commit -m "Add a TLS edge proxy to the e2e driver"
 **Interfaces:**
 - Consumes: `EdgeProxy`, `PROFILES` from Task 1 (tests only).
 - Produces:
-  - `clients.tls_connect(host: str, port: int, ssl_context: ssl.SSLContext, timeout: float = 10.0) -> ssl.SSLSocket`
-  - `clients.ws_upgrade(host, port, path, token, timeout=10, *, ssl_context: ssl.SSLContext | None = None, extra_headers: dict[str, str] | None = None) -> tuple[int, str]`. Existing positional callers are unchanged.
+  - `clients.tls_connect(host: str, port: int, ssl_context: ssl.SSLContext, timeout: float = 10.0, server_hostname: str | None = None) -> ssl.SSLSocket` (`server_hostname` defaults to `host`; set it to reach the edge by another address while verifying the cert for `127.0.0.1`)
+  - `clients.ws_upgrade(host, port, path, token, timeout=10, *, ssl_context: ssl.SSLContext | None = None, server_hostname: str | None = None, extra_headers: dict[str, str] | None = None) -> tuple[int, str]`. Existing positional callers are unchanged.
   - `clients.http_get(sock, host_header, path="/", timeout=15.0, keep_alive: bool = False) -> tuple[int, bytes]`
   - `stack.Relay(..., extra_env: dict[str, str] | None = None)`, which is merged into the relay's own env and therefore also into the docker `-e` list.
 
@@ -779,6 +877,13 @@ def test_tls_connect_refuses_an_untrusted_edge(ws_edge):
         clients.tls_connect("127.0.0.1", edge.port, ssl.create_default_context())
 
 
+def test_tls_connect_verifies_the_given_server_hostname(ws_edge):
+    edge, _ = ws_edge
+    with pytest.raises(ssl.SSLCertVerificationError):  # not a SAN of the edge's cert
+        clients.tls_connect("127.0.0.1", edge.port, edge.client_context(), server_hostname="example.test")
+    clients.tls_connect("127.0.0.1", edge.port, edge.client_context(), server_hostname="localhost").close()
+
+
 def test_http_get_keep_alive_leaves_the_connection_open(ws_edge):
     edge, seen = ws_edge
     with clients.tls_connect("127.0.0.1", edge.port, edge.client_context()) as s:
@@ -819,11 +924,12 @@ Expected: FAIL. You should see `TypeError: ws_upgrade() got an unexpected keywor
 In `clients.py`, add `import ssl` to the imports. Add this after `recv_exact`:
 
 ```python
-def tls_connect(host: str, port: int, ssl_context: ssl.SSLContext, timeout: float = 10.0) -> ssl.SSLSocket:
-    """TCP + TLS handshake, verifying the peer for `host` with `ssl_context`."""
+def tls_connect(host: str, port: int, ssl_context: ssl.SSLContext, timeout: float = 10.0,
+                server_hostname: str | None = None) -> ssl.SSLSocket:
+    """TCP + TLS handshake, verifying the peer for server_hostname (default: host) with ssl_context."""
     raw = socket.create_connection((host, port), timeout=timeout)
     try:
-        return ssl_context.wrap_socket(raw, server_hostname=host)
+        return ssl_context.wrap_socket(raw, server_hostname=server_hostname or host)
     except BaseException:
         raw.close()
         raise
@@ -844,13 +950,13 @@ In `ws_upgrade`, change the signature and the first lines, and add the extra hea
 
 ```python
 def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: float = 10, *,
-               ssl_context: ssl.SSLContext | None = None,
+               ssl_context: ssl.SSLContext | None = None, server_hostname: str | None = None,
                extra_headers: dict[str, str] | None = None) -> tuple[int, str]:
     """WebSocket upgrade with `Authorization: Bearer <token>` (none if token is None), over TLS if
     ssl_context is given. Returns (status, body up to 4 KiB); closes the connection."""
     deadline = time.monotonic() + timeout
     if ssl_context is not None:
-        sock = tls_connect(host, port, ssl_context, timeout)
+        sock = tls_connect(host, port, ssl_context, timeout, server_hostname)
     else:
         sock = socket.create_connection((host, port), timeout=timeout)
     try:
@@ -886,7 +992,7 @@ git commit -m "Let e2e clients speak TLS and pass extra relay env"
 
 ---
 
-### Task 3: Journey wiring and the four edge steps
+### Task 3: Journey wiring and the six edge steps
 
 **Files:**
 - Modify: `e2e/src/netbridge_e2e/journey.py`: imports, constants, `_journey` (~lines 172-232), new methods next to `_auth_flood`, `parse_args` (~848-875)
@@ -899,7 +1005,7 @@ git commit -m "Let e2e clients speak TLS and pass extra relay env"
   - From Task 2: `clients.tls_connect`, `clients.ws_upgrade(..., ssl_context=, extra_headers=)`, `clients.http_get(..., keep_alive=)`, `Relay(..., extra_env=)`.
 - Produces:
   - CLI flags `--edge` and `--edge-profile {arr,traefik}`. After parsing, `args.edge_profile` is always set when `--edge` is given.
-  - Steps `edge_up`, `edge_client_ip`, `edge_idle_survives`, `edge_idle_closes_dead_link`.
+  - Steps `edge_up`, `edge_appends_peer`, `edge_client_ip`, `edge_idle_survives`, `edge_idle_closes_dead_link`, `edge_relay_down_502`.
 
 Where the steps run:
 - `edge_up` and `edge_client_ip` run right after `auth_matrix`, before `fault_links_up`.
@@ -913,6 +1019,7 @@ Where the steps run:
 ```python
 """The journey's edge steps against fakes: no relay, no edge sockets."""
 import re
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -933,7 +1040,7 @@ def j(tmp_path):
 
 def fake_edge(profile="arr", idle=0.0):
     return SimpleNamespace(port=4443, profile=PROFILES[profile], idle_timeout=idle, idle_closes=0,
-                           ca_path=Path("ca.pem"), client_context=lambda: "CTX")
+                           bad_gateways=Counter(), ca_path=Path("ca.pem"), client_context=lambda: "CTX")
 
 
 class Logs:
@@ -1042,8 +1149,11 @@ def fake_upgrades(monkeypatch, throttle_after=CAP, other=401, valid=101):
     calls = []
     count = {"bad": 0}
 
-    def ws_upgrade(host, port, path, token, timeout=10, *, ssl_context=None, extra_headers=None):
-        client = extra_headers["X-Forwarded-For"]
+    def ws_upgrade(host, port, path, token, timeout=10, *, ssl_context=None, server_hostname=None,
+                   extra_headers=None):
+        entries = [e.strip() for e in extra_headers["X-Forwarded-For"].split(",")]
+        assert entries[0] == journey.EDGE_SPOOF  # every request carries the spoofed leftmost entry
+        client = entries[-1]
         calls.append((path, token, client, ssl_context))
         if token == "valid-token":
             return valid, ""
@@ -1089,6 +1199,59 @@ def test_edge_client_ip_buckets_are_per_forwarded_client(j, monkeypatch, other, 
     fake_upgrades(monkeypatch, other=other, valid=valid)
     ok, _ = j._edge_client_ip(fake_edge(), relay_with(LOGGED), Stub())
     assert not ok
+
+
+# --- edge_appends_peer ---------------------------------------------------
+
+def test_edge_appends_peer_passes(j, monkeypatch):
+    calls = []
+
+    def ws_upgrade(host, port, path, token, timeout=10, *, ssl_context=None, server_hostname=None,
+                   extra_headers=None):
+        calls.append((host, path, server_hostname, extra_headers))
+        return 401, "Token validation failed"
+
+    monkeypatch.setattr(journey.clients, "ws_upgrade", ws_upgrade)
+    ok, detail = j._edge_appends_peer(fake_edge("arr"), relay_with("Tunnel auth rejected for 10.0.0.1: x"), "10.0.0.1")
+    assert ok, detail
+    assert calls == [("10.0.0.1", "/netbridge/tunnel", "127.0.0.1", {"X-Forwarded-For": journey.EDGE_SPOOF})]
+
+
+@pytest.mark.parametrize("log", [
+    "Tunnel auth rejected for 127.0.0.1: x",                                        # edge address, not the peer
+    f"Tunnel auth rejected for 10.0.0.1: x\nTunnel auth rejected for {journey.EDGE_SPOOF}: x",  # spoof honoured
+])
+def test_edge_appends_peer_fails(j, monkeypatch, log):
+    monkeypatch.setattr(journey.clients, "ws_upgrade", lambda *a, **k: (401, ""))
+    ok, _ = j._edge_appends_peer(fake_edge(), relay_with(log), "10.0.0.1")
+    assert not ok
+
+
+def test_edge_appends_peer_needs_a_non_loopback_host(j):
+    ok, detail = j._edge_appends_peer(fake_edge(), relay_with(""), "127.0.0.1")
+    assert not ok and "loopback" in detail
+
+
+# --- edge_relay_down_502 ------------------------------------------------
+
+def test_edge_relay_down_sees_both_clients(j, monkeypatch):
+    edge = fake_edge()
+    edge.bad_gateways.update({"/ws": 3})  # earlier 502s do not count
+
+    def sleep(_):
+        edge.bad_gateways.update({"/ws": 1, "/tunnel": 1})
+
+    monkeypatch.setattr(journey.time, "sleep", sleep)
+    ok, detail = j._edge_relay_down(edge)
+    assert ok and "agent (/ws) 1, proxy (/tunnel) 1" in detail
+
+
+def test_edge_relay_down_fails_without_the_proxy(j, monkeypatch):
+    edge = fake_edge()
+    monkeypatch.setattr(journey, "EDGE_502_WAIT", 0.2)
+    monkeypatch.setattr(journey.time, "sleep", lambda _: edge.bad_gateways.update({"/ws": 1}))
+    ok, detail = j._edge_relay_down(edge)
+    assert not ok and "proxy (/tunnel) 0" in detail
 
 
 # --- idle ----------------------------------------------------------------
@@ -1157,7 +1320,7 @@ In `journey.py`:
 ```
 With --edge, both clients reach the relay through a TLS reverse proxy (edgeproxy.py):
 client --wss--> fault proxy --> edge --ws--> relay; the relay trusts the edge's
-X-Forwarded-For, and four edge steps prove client IP and idle behaviour.
+X-Forwarded-For, and six edge steps prove client IP, relay-down and idle behaviour.
 ```
 
 2. Imports: add `from .edgeproxy import PROFILES, RELAY_ENV, EdgeProxy`.
@@ -1169,7 +1332,9 @@ EDGE_DEFAULT_PROFILE = {"source": "traefik", "exe": "arr"}
 EDGE_IDLE_TIMEOUT = 25.0  # vs 10 s heartbeats: more than two missed beats of margin
 EDGE_CLIENT = "198.51.100.7"  # TEST-NET-2: stands in for the upstream hop that wrote X-Forwarded-For
 EDGE_OTHER_CLIENT = "198.51.100.8"
+EDGE_SPOOF = "203.0.113.9"  # TEST-NET-3: a client's own, untrustworthy X-Forwarded-For entry
 EDGE_IP_USER = "edge-ip@netbridge.test"
+EDGE_502_WAIT = 30.0  # both clients retry within it: the reconnect backoff starts at 5 s (+30 % jitter)
 ```
 
 4. New methods, placed right after `_auth_flood`:
@@ -1177,13 +1342,15 @@ EDGE_IP_USER = "edge-ip@netbridge.test"
 ```python
     # --- the edge ----------------------------------------------------------
 
-    def _edge_up(self, relay: Relay, stub: AuthStub, env: dict) -> EdgeProxy:
+    def _edge_up(self, relay: Relay, stub: AuthStub, env: dict, ip: str) -> EdgeProxy:
+        # all interfaces: edge_appends_peer reaches the edge from the host's own (untrusted) address
         edge = EdgeProxy(("127.0.0.1", relay.port), self.work / "edge", PROFILES[self.args.edge_profile],
-                         EDGE_IDLE_TIMEOUT)
+                         EDGE_IDLE_TIMEOUT, host="0.0.0.0")
         self.cleanups.append(edge.close)
         edge.start()
         env["NETBRIDGE_CA_BUNDLE"] = str(edge.ca_path)  # clients verify the edge with the run's CA
         self.check("edge_up", lambda: self._edge_status(edge))
+        self.check("edge_appends_peer", lambda: self._edge_appends_peer(edge, relay, ip))
         self.check("edge_client_ip", lambda: self._edge_client_ip(edge, relay, stub))
         return edge
 
@@ -1199,14 +1366,32 @@ EDGE_IP_USER = "edge-ip@netbridge.test"
             status, _ = clients.http_get(s, f"127.0.0.1:{edge.port}", f"{edge.profile.prefix}/status")
         return status == 200, f"{url} via edge ({edge.profile.name}, verified with {edge.ca_path.name}): HTTP {status}"
 
+    def _edge_appends_peer(self, edge: EdgeProxy, relay: Relay, ip: str) -> tuple[bool, str]:
+        """A client the edge sees directly is keyed on its own address, whatever X-Forwarded-For it sends:
+        proves the edge appends its peer and the relay ignores what the client wrote."""
+        if ip.startswith("127."):
+            return False, f"host address {ip} is loopback, which the relay trusts: it cannot play a direct client"
+        mark = relay.logs.mark()
+        status, _ = clients.ws_upgrade(ip, edge.port, f"{edge.profile.prefix}/tunnel", "not-a-jwt",
+                                       ssl_context=edge.client_context(), server_hostname="127.0.0.1",
+                                       extra_headers={"X-Forwarded-For": EDGE_SPOOF})
+        logged = relay.logs.wait_for(rf"Tunnel auth rejected for {re.escape(ip)}:", 5, since=mark)
+        spoofed = EDGE_SPOOF in relay.logs.text(since=mark)
+        ok = status == 401 and logged is not None and not spoofed
+        return ok, (f"bad token from {ip} via edge, claiming X-Forwarded-For {EDGE_SPOOF}: HTTP {status} (want 401); "
+                    f"relay line naming {ip}: {'found' if logged else 'missing'}; "
+                    f"spoofed address in relay log: {'yes' if spoofed else 'no'}")
+
     def _edge_client_ip(self, edge: EdgeProxy, relay: Relay, stub: AuthStub) -> tuple[bool, str]:
-        """Failed auth through the edge is keyed on the forwarded client, not on the edge's address."""
+        """Behind a trusted hop, failed auth is keyed on the rightmost untrusted X-Forwarded-For entry:
+        here the client-supplied list stands in for an upstream proxy, after a spoofed leftmost entry."""
         ctx = edge.client_context()
         path = f"{edge.profile.prefix}/tunnel"
 
         def upgrade(client_ip: str, token: str) -> tuple[int, str]:
+            # a relay that took the leftmost entry would put every request in EDGE_SPOOF's bucket
             return clients.ws_upgrade("127.0.0.1", edge.port, path, token, ssl_context=ctx,
-                                      extra_headers={"X-Forwarded-For": client_ip})
+                                      extra_headers={"X-Forwarded-For": f"{EDGE_SPOOF}, {client_ip}"})
 
         mark = relay.logs.mark()
         first = upgrade(EDGE_CLIENT, "not-a-jwt")
@@ -1244,6 +1429,18 @@ EDGE_IP_USER = "edge-ip@netbridge.test"
         return ok, (f"quiet for {quiet:.0f}s (edge idle timeout {edge.idle_timeout:.0f}s, heartbeats 10s): "
                     f"edge idle closes {closes}->{closes_after}, relay sessions agent/proxy {before}->{after}; "
                     f"echo round trip ok")
+
+    def _edge_relay_down(self, edge: EdgeProxy) -> tuple[bool, str]:
+        """With the relay stopped, both clients retry through the edge and get its 502, then must recover
+        (the reconnect step that follows proves the recovery)."""
+        paths = ("/ws", "/tunnel")  # as the relay would see them: the edge has stripped any prefix
+        before = {p: edge.bad_gateways[p] for p in paths}
+        deadline = time.monotonic() + EDGE_502_WAIT
+        while time.monotonic() < deadline and not all(edge.bad_gateways[p] > before[p] for p in paths):
+            time.sleep(0.5)
+        seen = {p: edge.bad_gateways[p] - before[p] for p in paths}
+        return all(seen.values()), (f"502s from the edge while the relay was down: agent (/ws) {seen['/ws']}, "
+                                    f"proxy (/tunnel) {seen['/tunnel']}, within {EDGE_502_WAIT:.0f}s")
 
     def _edge_dead_link(self, edge: EdgeProxy) -> tuple[bool, str]:
         """Counter-proof: a kept-alive HTTPS connection with no traffic is closed by the edge's idle timer."""
@@ -1297,7 +1494,7 @@ Replace the `relay = Relay(...)` line with:
 Replace the block from `agent_link = FaultProxy(...)` through `agent, proxy = self._components(...)` with:
 
 ```python
-        edge = self._edge_up(relay, stub, env) if a.edge else None
+        edge = self._edge_up(relay, stub, env, ip) if a.edge else None
         upstream = ("127.0.0.1", edge.port if edge else relay.port)
         agent_link = FaultProxy(upstream, "agent")
         self.cleanups.append(agent_link.close)
@@ -1321,6 +1518,20 @@ Replace `self._traffic(ip, targets, relay)` with:
             self.check("edge_idle_closes_dead_link", lambda: self._edge_dead_link(edge))
 ```
 
+Replace `self._reconnect(relay, agent, proxy, ip, targets)` with `self._reconnect(relay, agent, proxy, ip, targets, edge)`. In `_reconnect`, change the signature and replace the fixed `time.sleep(3)` while the relay is down:
+
+```python
+    def _reconnect(self, relay: Relay, agent, proxy, ip: str, targets: Targets, edge: EdgeProxy | None = None) -> None:
+        marks = {agent.name: agent.logs.mark(), proxy.name: proxy.logs.mark()}
+        relay.stop()
+        if edge:  # hold the relay down until both clients have met the edge's 502
+            self.check("edge_relay_down_502", lambda: self._edge_relay_down(edge))
+        else:
+            time.sleep(3)
+        relay.start()
+        ...  # unchanged
+```
+
 - [ ] **Step 6: Update `e2e/README.md`**
 
 Add a row to the mode table:
@@ -1340,7 +1551,7 @@ mode). The edge's CA is generated for the run (`<work>/edge/ca.pem`) and handed 
 still talk to the relay directly.
 ```
 
-In the Steps line, insert `→ (with --edge) edge_up → edge_client_ip` after `auth_matrix (...)`, and `→ (with --edge) edge_idle_survives → edge_idle_closes_dead_link` after `concurrency (20 simultaneous streams)`.
+In the Steps line, insert `→ (with --edge) edge_up → edge_appends_peer → edge_client_ip` after `auth_matrix (...)`, `→ (with --edge) edge_idle_survives → edge_idle_closes_dead_link` after `concurrency (20 simultaneous streams)`, and `(with --edge) edge_relay_down_502 →` before `relay_restarted`.
 
 - [ ] **Step 7: Run the e2e unit suite, then the journey locally**
 
@@ -1356,7 +1567,7 @@ uv run --project e2e python -m netbridge_e2e --mode source --edge --edge-profile
 uv run --project e2e python -m netbridge_e2e --mode source --work /tmp/nb-e2e-plain 2>&1 | tail -n 15
 ```
 
-Expected: every step ✓ in all three runs. In the edge runs, the four `edge_*` steps appear and `fault_links_up` names the edge. The plain run shows no `edge_*` step.
+Expected: every step ✓ in all three runs. In the edge runs, the six `edge_*` steps appear and `fault_links_up` names the edge. The plain run shows no `edge_*` step.
 
 If an existing step fails only under `--edge`, find out which hop is at fault before touching anything. Check the edge (with a unit test that reproduces it), the driver, or the product. A product-side cause is a compatibility finding (Global Constraints): record it, stop the task, and report. Never weaken a step to make it pass. Steps that are likely to show such findings:
 - `reconnect`, because the edge answers `502` while the relay is down

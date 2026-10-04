@@ -87,8 +87,9 @@ Profiles keep both clouds' quirks covered without doubling CI time:
 ### New journey steps (edge runs only)
 
 - **`edge_up`:** the edge serves TLS with the run's CA, and an HTTPS `GET /status` through it returns 200.
+- **`edge_appends_peer`:** a client the edge sees directly is keyed on its own address. The driver connects to the edge from the host's own (non-loopback, untrusted) address, which is why the edge listens on all interfaces, and sends a spoofed `X-Forwarded-For: 203.0.113.9` with a bad token. The relay must log `auth rejected for <host address>` and never name the spoofed address. This proves that the edge appends its peer and that the relay picks the rightmost untrusted entry.
 - **`edge_client_ip`:** proves that the relay keys failed auth on the forwarded client, through the real hop.
-  - A bad-token upgrade through the edge carries a client-supplied `X-Forwarded-For: 198.51.100.7`. The edge appends `127.0.0.1` (with a port in the ARR profile). The relay must log `auth rejected for 198.51.100.7`.
+  - A bad-token upgrade from loopback through the edge carries a client-supplied `X-Forwarded-For: 203.0.113.9, 198.51.100.7`. The edge appends `127.0.0.1` (with a port in the ARR profile). The relay must log `auth rejected for 198.51.100.7`. Every request in this step carries the spoofed leftmost entry, so a relay that took the leftmost entry would fail it.
   - Flood with `198.51.100.7` until the first 429. The cap is the per-IP override plus 10, as in `auth_flood_spares_valid_users`.
   - A bad token from `198.51.100.8` must then still get 401: buckets are separate per forwarded client.
   - A valid token from `198.51.100.7` must still upgrade (101).
@@ -98,6 +99,7 @@ Profiles keep both clouds' quirks covered without doubling CI time:
   - the edge counted no idle closes;
   - neither client logged a new relay session;
   - an echo round trip through the SOCKS port succeeds.
+- **`edge_relay_down_502`:** during the existing relay restart, the relay stays down until both clients have retried through the edge and received its `502` (at most 30 s; reconnect backoff starts at 5 s). The `reconnect` step that follows proves they treat it as transient.
 - **`edge_idle_closes_dead_link`:** this is the counter-proof that the idle timer is real. A raw TLS connection through the edge with no traffic must be closed by the edge within `idle_timeout + 5` s.
 
 Every existing step runs unchanged through the edge. That includes the socks5 and HTTP paths, the errors, isolation, the flood, relay restart and reconnect, and all link faults. Because they still pass, the edge adds no breakage.
@@ -128,7 +130,7 @@ These runs behave exactly as today: plain `ws://`, no edge, and `RELAY_TRUSTED_P
 
 ## Success criteria
 
-1. `--mode source --edge` and `--mode exe --edge` pass every step, including the four new ones, locally and in CI.
+1. `--mode source --edge` and `--mode exe --edge` pass every step, including the six new ones, locally and in CI.
 2. The default plain runs are unchanged and green.
 3. The edge's unit tests cover every option. `scripts/coverage.sh` floors hold.
 4. No product code changes are needed. If one turns out to be needed, it is a real compatibility finding and gets its own fix and test.
