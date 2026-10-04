@@ -4,6 +4,8 @@ ARM Token validation for relay server.
 Validates JWT tokens issued by Azure AD without requiring an app registration.
 """
 
+import asyncio
+import base64
 import os
 import time
 from typing import Optional
@@ -101,16 +103,21 @@ ARM_AUDIENCE = "https://management.azure.com"
 _jwks_cache: dict[str, tuple[float, dict]] = {}
 JWKS_CACHE_TTL = 3600  # 1 hour
 
+# Fetches toward Microsoft are bounded however many requests arrive: one fetch
+# in flight per tenant, no refetch for a while after a failure, and an unknown
+# kid forces a refresh at most once per cooldown.
+JWKS_FETCH_BACKOFF = 10  # seconds
+JWKS_FORCED_REFRESH_COOLDOWN = 60  # seconds
+# During a Microsoft outage expired keys keep being served, but not forever:
+# a key Microsoft revoked must stop working within a day.
+JWKS_MAX_STALE = 86400  # seconds
+_jwks_locks: dict[str, asyncio.Lock] = {}
+_jwks_failed_at: dict[str, float] = {}
+_jwks_forced_refresh: dict[str, float] = {}
+_jwks_refreshes: dict[str, asyncio.Task] = {}  # at most one background refresh per tenant
 
-async def _get_jwks(tenant_id: str) -> dict:
-    """Fetch and cache Microsoft's public keys for a tenant."""
-    global _jwks_cache
 
-    now = time.time()
-    cached = _jwks_cache.get(tenant_id)
-    if cached and (now - cached[0]) < JWKS_CACHE_TTL:
-        return cached[1]
-
+async def _fetch_jwks(tenant_id: str) -> dict:
     async with httpx.AsyncClient(timeout=10.0) as client:
         url = _get_jwks_url(tenant_id)
         try:
@@ -120,7 +127,77 @@ async def _get_jwks(tenant_id: str) -> dict:
             resp = await client.get(url)
         resp.raise_for_status()
         jwks = resp.json()
-        _jwks_cache[tenant_id] = (now, jwks)
+    if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+        raise ValueError("Malformed JWKS response")  # a fetch failure: must not replace working keys
+    # Keep only entries validation can use; a response with none of them is a failure too
+    keys = [k for k in jwks["keys"] if _usable_jwk(k)]
+    if not keys:
+        raise ValueError("JWKS response has no usable keys")
+    return {**jwks, "keys": keys}
+
+
+def _usable_jwk(jwk) -> bool:
+    """Whether _verify_signature could build a key from this entry."""
+    if not isinstance(jwk, dict) or not isinstance(jwk.get("kid"), str) or not jwk["kid"]:
+        return False  # validate_arm_token rejects tokens without a kid, so such a key is unselectable
+    try:
+        _jwk_public_key(jwk)
+    except Exception:
+        return False
+    return True
+
+
+async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
+    """Microsoft's public keys for a tenant: cached, single-flight, backed off after failures.
+
+    force=True bypasses the TTL (unknown kid) and only replaces the cache on success.
+    """
+    cached = _jwks_cache.get(tenant_id)
+    if not force and cached is not None:
+        age = time.time() - cached[0]
+        if age < JWKS_CACHE_TTL:
+            return cached[1]  # fast path: a fetch in flight must not stall validations served from cache
+        if age < JWKS_MAX_STALE:
+            # Expired but usable: refresh in the background so no validation waits on Microsoft
+            failed_at = _jwks_failed_at.get(tenant_id)
+            backing_off = failed_at is not None and time.monotonic() - failed_at < JWKS_FETCH_BACKOFF
+            if tenant_id not in _jwks_refreshes and not backing_off:
+                task = asyncio.create_task(_refresh_jwks_quietly(tenant_id))
+                _jwks_refreshes[tenant_id] = task
+                task.add_done_callback(lambda _t: _jwks_refreshes.pop(tenant_id, None))
+            return cached[1]
+    return await _refresh_jwks(tenant_id, force)
+
+
+async def _refresh_jwks_quietly(tenant_id: str) -> None:
+    try:
+        await _refresh_jwks(tenant_id)
+    except Exception:
+        pass  # recorded in _jwks_failed_at; callers keep the cached keys
+
+
+async def _refresh_jwks(tenant_id: str, force: bool = False) -> dict:
+    lock = _jwks_locks.setdefault(tenant_id, asyncio.Lock())
+    async with lock:
+        cached = _jwks_cache.get(tenant_id)
+        fresh = cached is not None and (time.time() - cached[0]) < JWKS_CACHE_TTL
+        if fresh and not force:
+            return cached[1]
+        usable = cached is not None and (time.time() - cached[0]) < JWKS_MAX_STALE
+        failed_at = _jwks_failed_at.get(tenant_id)
+        if failed_at is not None and time.monotonic() - failed_at < JWKS_FETCH_BACKOFF:
+            if usable:
+                return cached[1]
+            raise TokenValidationError("Signing keys unavailable")
+        try:
+            jwks = await _fetch_jwks(tenant_id)
+        except Exception as e:
+            _jwks_failed_at[tenant_id] = time.monotonic()
+            if usable:
+                return cached[1]  # keep serving the previous keys
+            raise TokenValidationError("Signing keys unavailable") from e
+        _jwks_failed_at.pop(tenant_id, None)
+        _jwks_cache[tenant_id] = (time.time(), jwks)
         return jwks
 
 
@@ -223,14 +300,16 @@ async def validate_arm_token(token: str) -> str:
                 break
 
         if not signing_key:
-            # Key not found - might need to refresh cache
-            global _jwks_cache
-            _jwks_cache.pop(tid, None)  # Invalidate cache for this tenant
-            jwks = await _get_jwks(tid)
-            for key in jwks.get("keys", []):
-                if key.get("kid") == kid:
-                    signing_key = key
-                    break
+            # Maybe a key rollover: force a refresh, at most once per tenant per cooldown
+            now = time.monotonic()
+            last = _jwks_forced_refresh.get(tid)
+            if last is None or now - last >= JWKS_FORCED_REFRESH_COOLDOWN:
+                _jwks_forced_refresh[tid] = now  # before the await: concurrent requests skip
+                jwks = await _get_jwks(tid, force=True)
+                for key in jwks.get("keys", []):
+                    if key.get("kid") == kid:
+                        signing_key = key
+                        break
 
         if not signing_key:
             raise TokenValidationError(f"Signing key not found: {kid}")
@@ -280,17 +359,35 @@ async def validate_arm_token(token: str) -> str:
         raise TokenValidationError(f"Token validation failed: {e}")
 
 
+def _jwk_public_key(jwk: dict):
+    """The RSA public key for a JWK; raises TokenValidationError or ValueError if unusable."""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    alg = jwk.get("alg", "RS256")
+    if alg != "RS256":
+        raise TokenValidationError(f"Unsupported algorithm: {alg}")
+
+    def b64_to_int(b64: str) -> int:
+        pad = 4 - len(b64) % 4
+        if pad != 4:
+            b64 += "=" * pad
+        return int.from_bytes(base64.urlsafe_b64decode(b64), byteorder="big")
+
+    n = b64_to_int(jwk["n"])  # modulus
+    e = b64_to_int(jwk["e"])  # exponent
+    return rsa.RSAPublicNumbers(e, n).public_key(default_backend())
+
+
 async def _verify_signature(token: str, jwk: dict) -> None:
     """
     Verify JWT signature using the provided JWK.
 
     Uses the cryptography library for RSA signature verification.
     """
-    import base64
     import hashlib
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives.asymmetric import padding
     from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.backends import default_backend
 
     parts = token.split(".")
     if len(parts) != 3:
@@ -307,24 +404,7 @@ async def _verify_signature(token: str, jwk: dict) -> None:
         sig_b64 += "=" * padding_needed
     signature = base64.urlsafe_b64decode(sig_b64)
 
-    # Get algorithm
-    alg = jwk.get("alg", "RS256")
-    if alg != "RS256":
-        raise TokenValidationError(f"Unsupported algorithm: {alg}")
-
-    # Build RSA public key from JWK
-    def b64_to_int(b64: str) -> int:
-        # Add padding if needed
-        pad = 4 - len(b64) % 4
-        if pad != 4:
-            b64 += "=" * pad
-        decoded = base64.urlsafe_b64decode(b64)
-        return int.from_bytes(decoded, byteorder="big")
-
-    n = b64_to_int(jwk["n"])  # modulus
-    e = b64_to_int(jwk["e"])  # exponent
-
-    public_key = rsa.RSAPublicNumbers(e, n).public_key(default_backend())
+    public_key = _jwk_public_key(jwk)
 
     # Verify signature
     try:
