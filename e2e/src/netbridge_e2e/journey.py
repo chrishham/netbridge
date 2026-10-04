@@ -9,6 +9,10 @@ install → connect (relay pairs agent and proxy, fake az used) → auth matrix
 port filter → user isolation → pentest suite (source mode) → relay restart and
 reconnect → link faults through in-process fault proxies (cut, blackhole, relay
 unreachable, agent down) → uninstall (exe mode).
+
+With --edge, both clients reach the relay through a TLS reverse proxy (edgeproxy.py):
+client --wss--> fault proxy --> edge --ws--> relay; the relay trusts the edge's
+X-Forwarded-For, and six edge steps prove client IP, relay-down and idle behaviour.
 """
 import argparse
 import hashlib
@@ -29,6 +33,7 @@ from pathlib import Path
 from . import clients, fakeaz, netinfo
 from .authstub import AuthStub
 from .cov import E2ECoverage
+from .edgeproxy import PROFILES, RELAY_ENV, EdgeProxy
 from .faultproxy import FaultProxy
 from .jwtmint import ISSUER_V2
 from .procs import IS_WINDOWS
@@ -47,6 +52,16 @@ LINK_LOCAL = "169.254.169.254"
 # connection without a separation check, stream_id_enumeration is a hard-coded pass
 PENTEST_SKIPS = ("rapid_connection_dos", "session_hijack", "stream_id_enumeration")
 PENTEST_TIMEOUT = 180
+EDGE_DEFAULT_PROFILE = {"source": "traefik", "exe": "arr"}
+EDGE_IDLE_TIMEOUT = 25.0  # vs 10 s heartbeats: more than two missed beats of margin
+EDGE_CLIENT = "198.51.100.7"  # TEST-NET-2: stands in for the upstream hop that wrote X-Forwarded-For
+EDGE_OTHER_CLIENT = "198.51.100.8"
+EDGE_SPOOF = "203.0.113.9"  # TEST-NET-3: a client's own, untrustworthy X-Forwarded-For entry
+EDGE_IP_USER = "edge-ip@netbridge.test"
+EDGE_502_WAIT = 30.0  # both clients retry within it: the reconnect backoff starts at 5 s (+30 % jitter)
+# aiohttp's WSServerHandshakeError, as each client logs it: the agent "Handshake failed: 502 Invalid response
+# status", the proxy "WebSocket handshake failed (502): Invalid response status"
+HANDSHAKE_502 = r"[Hh]andshake failed\W{1,3}502\b"
 
 
 class StepFailed(Exception):
@@ -169,7 +184,8 @@ class Journey:
 
         self.check("targets_up", create_targets)
 
-        relay = Relay(logs, a.relay_port, targets.blocked_port, env, image=a.relay_image, cov=self.cov, auth=stub)
+        relay = Relay(logs, a.relay_port, targets.blocked_port, env, image=a.relay_image, cov=self.cov, auth=stub,
+                      extra_env=RELAY_ENV if a.edge else None)
         self.cleanups.append(relay.stop)
         relay.start()
         ready = relay.wait_ready(180)
@@ -177,15 +193,19 @@ class Journey:
         self.step("relay_up", ok, f"{relay.url}; {detail}{'' if relay.alive() else ' ' + relay.logs.tail()}")
         self.check("auth_matrix", lambda: self._auth_matrix(relay, stub))
 
-        agent_link = FaultProxy(("127.0.0.1", relay.port), "agent")
+        edge = self._edge_up(relay, stub, env, ip) if a.edge else None
+        upstream = ("127.0.0.1", edge.port if edge else relay.port)
+        agent_link = FaultProxy(upstream, "agent")
         self.cleanups.append(agent_link.close)
-        proxy_link = FaultProxy(("127.0.0.1", relay.port), "proxy")
+        proxy_link = FaultProxy(upstream, "proxy")
         self.cleanups.append(proxy_link.close)
         for link in (agent_link, proxy_link):
             link.start()
-        self.step("fault_links_up", True, f"agent via :{agent_link.port}, proxy via :{proxy_link.port}")
+        via = f" -> edge :{edge.port} ({edge.profile.name})" if edge else ""
+        self.step("fault_links_up", True, f"agent via :{agent_link.port}, proxy via :{proxy_link.port}{via}")
 
-        agent, proxy = self._components(agent_link.url, proxy_link.url, ip, targets, env)
+        agent_url, proxy_url = self._client_urls(agent_link, proxy_link, edge)
+        agent, proxy = self._components(agent_url, proxy_url, ip, targets, env)
         for comp in (agent, proxy):
             self.cleanups.append(comp.cleanup)
             self.cleanups.append(lambda c=comp: c.collect_logs(logs))  # runs before cleanup
@@ -219,12 +239,15 @@ class Journey:
         self._agent_start_mark = start_marks["agent"]   # this run only: --work may be reused
         self._plugins(agent, start_marks["agent"], nonce)
         self._traffic(ip, targets, relay)
+        if edge:
+            self.check("edge_idle_survives", lambda: self._edge_idle(edge, agent, proxy, ip, targets))
+            self.check("edge_idle_closes_dead_link", lambda: self._edge_dead_link(edge))
         self._filter(ip, targets, relay, agent)
         self._errors(ip, targets, relay, agent)
         self.check("auth_user_isolation", lambda: self._user_isolation(relay, stub, ip, targets))
         self._pentest_step(relay, stub, env, logs)
         self.check("auth_flood_spares_valid_users", lambda: self._auth_flood(relay, stub, ip, targets))
-        self._reconnect(relay, agent, proxy, ip, targets)
+        self._reconnect(relay, agent, proxy, ip, targets, edge)
         self._faults(relay, agent, proxy, ip, targets, agent_link, proxy_link)
 
         if a.mode == "exe":
@@ -550,6 +573,140 @@ class Journey:
         return ok, (f"429 after {throttled_at} bad-token upgrades; then valid /ws upgrade: HTTP {agent_status}, "
                     f"valid /tunnel connect: {json.dumps(reply)}")
 
+    # --- the edge ----------------------------------------------------------
+
+    def _edge_up(self, relay: Relay, stub: AuthStub, env: dict, ip: str) -> EdgeProxy:
+        # all interfaces: edge_appends_peer reaches the edge from the host's own (untrusted) address
+        edge = EdgeProxy(("127.0.0.1", relay.port), self.work / "edge", PROFILES[self.args.edge_profile],
+                         EDGE_IDLE_TIMEOUT, host="0.0.0.0")
+        self.cleanups.append(edge.close)
+        edge.start()
+        self._edge_client_env(env, edge)
+        self.check("edge_up", lambda: self._edge_status(edge))
+        self.check("edge_appends_peer", lambda: self._edge_appends_peer(edge, relay, ip))
+        self.check("edge_client_ip", lambda: self._edge_client_ip(edge, relay, stub))
+        return edge
+
+    @staticmethod
+    def _edge_client_env(env: dict, edge: EdgeProxy) -> None:
+        """Clients verify the edge with the run's CA, and nothing inherited may switch verification off:
+        a run with NETBRIDGE_VERIFY_SSL=false + NETBRIDGE_ALLOW_INSECURE=1 would pass without the CA."""
+        env["NETBRIDGE_CA_BUNDLE"] = str(edge.ca_path)
+        env["NETBRIDGE_VERIFY_SSL"] = "true"
+        env.pop("NETBRIDGE_ALLOW_INSECURE", None)
+
+    def _client_urls(self, agent_link: FaultProxy, proxy_link: FaultProxy, edge: EdgeProxy | None) -> tuple[str, str]:
+        if edge is None:
+            return agent_link.url, proxy_link.url
+        prefix = edge.profile.prefix  # an explicit path: the clients keep it as given
+        return f"wss://127.0.0.1:{agent_link.port}{prefix}/ws", f"wss://127.0.0.1:{proxy_link.port}{prefix}/tunnel"
+
+    def _edge_status(self, edge: EdgeProxy) -> tuple[bool, str]:
+        url = f"https://127.0.0.1:{edge.port}{edge.profile.prefix}/status"
+        with clients.tls_connect("127.0.0.1", edge.port, edge.client_context()) as s:
+            status, _ = clients.http_get(s, f"127.0.0.1:{edge.port}", f"{edge.profile.prefix}/status")
+        return status == 200, f"{url} via edge ({edge.profile.name}, verified with {edge.ca_path.name}): HTTP {status}"
+
+    def _edge_appends_peer(self, edge: EdgeProxy, relay: Relay, ip: str) -> tuple[bool, str]:
+        """A client the edge sees directly is keyed on its own address, whatever X-Forwarded-For it sends:
+        proves the edge appends its peer and the relay ignores what the client wrote."""
+        if ip.startswith("127."):
+            return False, f"host address {ip} is loopback, which the relay trusts: it cannot play a direct client"
+        mark = relay.logs.mark()
+        status, _ = clients.ws_upgrade(ip, edge.port, f"{edge.profile.prefix}/tunnel", "not-a-jwt",
+                                       ssl_context=edge.client_context(), server_hostname="127.0.0.1",
+                                       extra_headers={"X-Forwarded-For": EDGE_SPOOF})
+        logged = relay.logs.wait_for(rf"Tunnel auth rejected for {re.escape(ip)}:", 5, since=mark)
+        spoofed = EDGE_SPOOF in relay.logs.text(since=mark)
+        ok = status == 401 and logged is not None and not spoofed
+        return ok, (f"bad token from {ip} via edge, claiming X-Forwarded-For {EDGE_SPOOF}: HTTP {status} (want 401); "
+                    f"relay line naming {ip}: {'found' if logged else 'missing'}; "
+                    f"spoofed address in relay log: {'yes' if spoofed else 'no'}")
+
+    def _edge_client_ip(self, edge: EdgeProxy, relay: Relay, stub: AuthStub) -> tuple[bool, str]:
+        """Behind a trusted hop, failed auth is keyed on the rightmost untrusted X-Forwarded-For entry:
+        here the client-supplied list stands in for an upstream proxy, after a spoofed leftmost entry."""
+        ctx = edge.client_context()
+        path = f"{edge.profile.prefix}/tunnel"
+
+        def upgrade(client_ip: str, token: str) -> tuple[int, str]:
+            # a relay that took the leftmost entry would put every request in EDGE_SPOOF's bucket
+            return clients.ws_upgrade("127.0.0.1", edge.port, path, token, ssl_context=ctx,
+                                      extra_headers={"X-Forwarded-For": f"{EDGE_SPOOF}, {client_ip}"})
+
+        mark = relay.logs.mark()
+        first = upgrade(EDGE_CLIENT, "not-a-jwt")
+        logged = relay.logs.wait_for(rf"Tunnel auth rejected for {re.escape(EDGE_CLIENT)}:", 5, since=mark)
+        if first[0] != 401 or logged is None:
+            return False, (f"bad token from {EDGE_CLIENT} via edge: HTTP {first[0]}; relay line naming it "
+                           f"{'found' if logged else 'missing'}: ...{relay.logs.tail(300)!r}")
+        cap = int(FAULT_TUNING["RELAY_RATE_IP_CONNECTIONS_PER_MIN"]) + 10
+        throttled_at, last = None, first
+        for attempt in range(2, cap + 1):
+            last = upgrade(EDGE_CLIENT, "not-a-jwt")
+            if last[0] == 429:
+                throttled_at = attempt
+                break
+        if throttled_at is None:
+            return False, f"no 429 for {EDGE_CLIENT} within {cap} bad-token upgrades via edge; last {last}"
+        other = upgrade(EDGE_OTHER_CLIENT, "not-a-jwt")
+        valid = upgrade(EDGE_CLIENT, stub.mint(upn=EDGE_IP_USER))
+        ok = other[0] == 401 and valid[0] == 101
+        return ok, (f"relay logged {EDGE_CLIENT}; 429 after {throttled_at} bad tokens from it via edge; "
+                    f"bad token from {EDGE_OTHER_CLIENT}: HTTP {other[0]} (want 401); "
+                    f"valid token from {EDGE_CLIENT}: HTTP {valid[0]} (want 101)")
+
+    def _edge_idle(self, edge: EdgeProxy, agent, proxy, ip: str, targets: Targets) -> tuple[bool, str]:
+        """No user traffic for idle_timeout + 5 s: heartbeats alone must keep both tunnels open."""
+        def sessions():
+            return tuple(len(re.findall(RELAY_SESSION, c.logs.text())) for c in (agent, proxy))
+
+        quiet = edge.idle_timeout + 5
+        closes, before = edge.idle_closes, sessions()
+        time.sleep(quiet)
+        closes_after, after = edge.idle_closes, sessions()
+        self._open_echo(ip, targets).close()  # raises if the tunnel is gone
+        ok = closes_after == closes and after == before
+        return ok, (f"quiet for {quiet:.0f}s (edge idle timeout {edge.idle_timeout:.0f}s, heartbeats 10s): "
+                    f"edge idle closes {closes}->{closes_after}, relay sessions agent/proxy {before}->{after}; "
+                    f"echo round trip ok")
+
+    def _edge_relay_down(self, edge: EdgeProxy, agent, proxy, marks: dict, before: dict) -> tuple[bool, str]:
+        """With the relay stopped, both clients retry through the edge and get its 502, then must recover
+        (the reconnect step that follows proves the recovery). The edge's counter says it answered 502;
+        each client's own log line says the 502 reached it (a reset would log something else)."""
+        paths = ("/ws", "/tunnel")  # as the relay would see them: the edge has stripped any prefix
+        # `before` and `marks` were taken before relay.stop(): a retry during the stop still counts
+
+        def logged():
+            return {c.name: re.search(HANDSHAKE_502, c.logs.text(since=marks[c.name])) is not None
+                    for c in (agent, proxy)}
+
+        deadline = time.monotonic() + EDGE_502_WAIT
+        while time.monotonic() < deadline and not (all(edge.bad_gateways[p] > before.get(p, 0) for p in paths)
+                                                   and all(logged().values())):
+            time.sleep(0.5)
+        seen, heard = {p: edge.bad_gateways[p] - before.get(p, 0) for p in paths}, logged()
+        return all(seen.values()) and all(heard.values()), (
+            f"502s from the edge while the relay was down: agent (/ws) {seen['/ws']}, proxy (/tunnel) "
+            f"{seen['/tunnel']}; logged by the client: agent {heard[agent.name]}, proxy {heard[proxy.name]}; "
+            f"within {EDGE_502_WAIT:.0f}s")
+
+    def _edge_dead_link(self, edge: EdgeProxy) -> tuple[bool, str]:
+        """Counter-proof: a kept-alive HTTPS connection with no traffic is closed by the edge's idle timer."""
+        before = edge.idle_closes
+        with clients.tls_connect("127.0.0.1", edge.port, edge.client_context()) as s:
+            status, _ = clients.http_get(s, f"127.0.0.1:{edge.port}", f"{edge.profile.prefix}/status",
+                                         keep_alive=True)
+            start = time.monotonic()
+            closed = clients.wait_closed(s, edge.idle_timeout + 5)
+            took = time.monotonic() - start
+        counted = edge.idle_closes - before
+        # the relay's own keep-alive timeout is 75 s: a close this early is the edge's
+        ok = status == 200 and closed and took >= edge.idle_timeout - 1 and counted >= 1
+        return ok, (f"HTTP {status} kept alive, then {'closed' if closed else 'still open'} after {took:.1f}s "
+                    f"of silence (idle timeout {edge.idle_timeout:.0f}s); edge counted {counted} idle close(s)")
+
     def _pentest_step(self, relay: Relay, stub: AuthStub, env: dict, logs: Path) -> None:
         if self.args.mode != "source":
             self.step("pentest_suite", True, "skipped: exe mode has no checkout")
@@ -578,10 +735,14 @@ class Journey:
         why = f"timed out after {PENTEST_TIMEOUT}s" if code is None else f"exit {code}"
         return False, f"{why} (log {log}): {text[-600:]}"
 
-    def _reconnect(self, relay: Relay, agent, proxy, ip: str, targets: Targets) -> None:
+    def _reconnect(self, relay: Relay, agent, proxy, ip: str, targets: Targets, edge: EdgeProxy | None = None) -> None:
         marks = {agent.name: agent.logs.mark(), proxy.name: proxy.logs.mark()}
+        gateways = dict(edge.bad_gateways) if edge else {}  # with the marks: before the relay goes down
         relay.stop()
-        time.sleep(3)
+        if edge:  # hold the relay down until both clients have met the edge's 502
+            self.check("edge_relay_down_502", lambda: self._edge_relay_down(edge, agent, proxy, marks, gateways))
+        else:
+            time.sleep(3)
         relay.start()
         self.step("relay_restarted", relay.wait_ready(60), relay.url)
         start = time.monotonic()
@@ -862,7 +1023,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="exe mode: overwrite an existing installation (disposable machines only)")
     p.add_argument("--coverage", metavar="DIR",
                    help="source mode, Linux/macOS: run relay, agent and proxy under coverage and report per package in DIR (report-only)")
+    p.add_argument("--edge", action="store_true",
+                   help="clients reach the relay through a TLS reverse proxy (wss://, run CA, X-Forwarded-For)")
+    p.add_argument("--edge-profile", choices=sorted(PROFILES),
+                   help="edge behaviour: traefik (bare-IP X-Forwarded-For) or arr (ip:port, /netbridge prefix); "
+                        "default traefik in source mode, arr in exe mode")
     args = p.parse_args(argv)
+    if args.edge_profile and not args.edge:
+        p.error("--edge-profile needs --edge")
+    if args.edge and not args.edge_profile:
+        args.edge_profile = EDGE_DEFAULT_PROFILE[args.mode]
     if args.relay_image and args.mode != "source":
         p.error("--relay-image works in source mode only (the image is a Linux container)")
     if args.coverage and args.mode != "source":
