@@ -293,7 +293,6 @@ async def validate_arm_token(token: str) -> str:
         jwks = await _get_jwks(tid)
 
         # Find the signing key
-
         signing_key = None
         for key in jwks.get("keys", []):
             if key.get("kid") == kid:
