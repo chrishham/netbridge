@@ -368,3 +368,45 @@ def test_pentest_step_is_a_recorded_skip_in_exe_mode(j, tmp_path, monkeypatch):
     j._pentest_step(FakeRelay(), FakeStub(), {}, tmp_path)
     assert j.results[-1] == {"step": "pentest_suite", "ok": True, "detail": "skipped: exe mode has no checkout"}
     assert run.calls == []
+
+
+def flood_env(monkeypatch, j, throttle_at, ws_status=101, reply=None):
+    calls = []
+
+    def ws_upgrade(host, port, path, token):
+        calls.append((path, token))
+        if path == "/tunnel":
+            n = sum(1 for p, _ in calls if p == "/tunnel")
+            return (429, "Too many failed authentication attempts from this IP") if n == throttle_at else (401, "bad")
+        return ws_status, ""
+
+    monkeypatch.setattr(clients, "ws_upgrade", ws_upgrade)
+    ok_reply = {"type": "tcp_connect_result", "success": True}
+    monkeypatch.setattr(j, "_tunnel_connect", lambda *a: ok_reply if reply is None else reply)
+    return calls
+
+
+def test_auth_flood_passes_when_valid_user_spared(j, monkeypatch):
+    flood_env(monkeypatch, j, 3)
+    ok, detail = j._auth_flood(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert ok, detail
+    assert "429 after 3" in detail
+
+
+def test_auth_flood_fails_without_429(j, monkeypatch):
+    calls = flood_env(monkeypatch, j, None)
+    ok, detail = j._auth_flood(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert not ok and "no 429 within" in detail
+    assert len(calls) == int(journey.FAULT_TUNING["RELAY_RATE_IP_CONNECTIONS_PER_MIN"]) + 10
+
+
+def test_auth_flood_fails_when_connect_fails(j, monkeypatch):
+    flood_env(monkeypatch, j, 3, reply={"type": "tcp_connect_result", "success": False})
+    ok, _ = j._auth_flood(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert not ok
+
+
+def test_auth_flood_fails_when_valid_ws_throttled(j, monkeypatch):
+    flood_env(monkeypatch, j, 3, ws_status=429)
+    ok, detail = j._auth_flood(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert not ok and "HTTP 429" in detail

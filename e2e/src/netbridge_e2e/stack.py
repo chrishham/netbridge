@@ -31,9 +31,10 @@ CONNECTED = r"Status changed: \S+ -> connected"
 PROXY_READY = r"Bridge agent reachable - tunnel is working end to end"
 RELAY_SESSION = r"Connected to relay \(session: \w+\)"
 REDIRECTED = r"E2E: relay key URL redirected to "
-# fault steps: detect a half-open link in ~15 s, and never throttle fault-driven reconnects from 127.0.0.1
+# fault steps: detect a half-open link in ~15 s; the per-user limit is raised so fault-driven reconnects are
+# never throttled. The per-IP limit only counts failed auth, so it stays near the production default.
 FAULT_TUNING = {"RELAY_HEARTBEAT_INTERVAL": "10", "RELAY_RATE_CONNECTIONS_PER_MIN": "600",
-                "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "600"}
+                "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "49"}
 CLIENT_TUNING = {"NETBRIDGE_CLIENT_HEARTBEAT_INTERVAL": "10"}
 FIXTURES = Path(__file__).resolve().parent / "plugin_fixtures"
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
