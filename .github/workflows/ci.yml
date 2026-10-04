@@ -16,6 +16,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     env:
       NETBRIDGE_ALLOWED_TENANTS: "11111111-1111-1111-1111-111111111111"
@@ -126,6 +127,7 @@ jobs:
 
   security-scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v7
