@@ -5,16 +5,16 @@ on:
     tags: ["socks-v*"]
 
 jobs:
+  # unit tests, scans and the source-mode e2e journey gate the Homebrew bump
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: ci
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
-
-      - uses: astral-sh/setup-uv@v7
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgirepository-2.0-dev libcairo2-dev
 
       - name: Get version
         id: version
@@ -25,15 +25,6 @@ jobs:
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Run tests
-        run: |
-          if compgen -G "tests/test_*.py" > /dev/null || compgen -G "tests/*_test.py" > /dev/null; then
-            uv run --native-tls pytest
-          else
-            echo "No test files found, skipping"
-          fi
-        working-directory: socks-proxy
 
       - name: Update Homebrew formula
         env:

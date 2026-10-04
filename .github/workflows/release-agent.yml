@@ -39,6 +39,10 @@ jobs:
           uv sync --group dev
           uv run pytest
 
+  ci:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+
   e2e:
     needs: prepare
     uses: ./.github/workflows/e2e-windows.yml
@@ -46,7 +50,7 @@ jobs:
       version: ${{ needs.prepare.outputs.version }}
 
   publish:
-    needs: [prepare, e2e]
+    needs: [prepare, ci, e2e]
     runs-on: ubuntu-latest
 
     steps:
