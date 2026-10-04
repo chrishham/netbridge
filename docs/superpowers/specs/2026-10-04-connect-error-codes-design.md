@@ -113,7 +113,11 @@ HTTP responses get a matching reason phrase. 403/503/400 send
 
 ## Agent
 
-New function in `netbridge_agent/tunnel.py`:
+`DnsError` moves from `agent.py` to `tunnel.py`. `agent.py` already imports
+from `tunnel.py` (`from .tunnel import ProxyAuthRejected`), so importing back
+would be circular. `agent.py` re-exports it (`from .tunnel import DnsError,
+ProxyAuthRejected`), so `netbridge_agent.agent.DnsError`, its tests and the
+logged type name (`DnsError`) stay unchanged. New function in `tunnel.py`:
 `connect_error_code(exc: BaseException) -> str`. It checks in order:
 
 1. `ProxyAuthRejected` → `upstream_proxy`
@@ -150,10 +154,15 @@ The log line `Failed: <id> -> host:port: <Type>: <text>` gains a
 still match. Denied destinations log
 `Destination denied: ... [not_allowed]`.
 
-`legacy.py` gets the same treatment in its own except paths
-(`CancelledError` keeps no code because the stream is gone; timeout →
-`timeout`; `OSError` → `connect_error_code(e)`; other → `general`) and in its
-field, cap and denial replies. The legacy path is deprecated, but it is cheap
+`legacy.py` gets the same treatment in its own except paths:
+- the `CancelledError` reply, sent while the task is still pending, →
+  `general`
+- timeout → `timeout`
+- `OSError` and the generic `Exception` handler → `connect_error_code(e)`.
+  `ProxyConnectionError` is not an `OSError`, so it lands in the generic
+  handler and still has to get its semantic code.
+
+The same applies to its field, cap and denial replies. The legacy path is deprecated, but it is cheap
 to keep it consistent, so every producer stays honest.
 
 ## Relay
@@ -197,8 +206,10 @@ Each case also asserts that the agent log line carries the code where the
 agent produced it (`[refused]`, `[dns_failed]`, `[not_allowed]`).
 Pinning a code that only the new path can produce (`0x05`, `0x02`, `403`)
 proves the end-to-end plumbing in both source mode and installed-exe mode.
-`_probe_relay`'s raw `/tunnel` helper asserts that `error_code` is present
-on relay-originated failures. The fault journey's `refused` kind (reply
+`_user_isolation` (the only user of the raw `/tunnel` helper
+`_tunnel_connect`) additionally requires `error_code == "no_agent"` on the
+other user's failed result. This gives a relay-originated code a direct wire
+check, independent of any proxy mapping. The fault journey's `refused` kind (reply
 0x04 after the agent or relay dies) is a local-failure path and stays as it
 is.
 
@@ -207,7 +218,9 @@ is.
 TDD per component. Each test must fail without its change.
 - shared: vocabulary, pattern, both mappings including the fallback for
   None and unknown codes, and all codes covered by both maps.
-- agent: `connect_error_code` per exception class and errno/winerror;
+- agent: `connect_error_code` per exception class and errno/winerror, and on
+  the real `DnsError` raised by `resolve_destination` (monkeypatched
+  `getaddrinfo` failure and timeout);
   `handle_tcp_connect` sends the right code for each branch; legacy
   likewise.
 - relay: each relay-originated failure carries its code;

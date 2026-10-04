@@ -54,8 +54,14 @@ for field errors), `tests/test_legacy.py`.
    - an unrelated `OSError`
    - `ValueError` → `general`
 
-   `DnsError` lives in `tunnel.py` (it subclasses `OSError`). Check it before
-   the generic `OSError` branch.
+   First move `class DnsError(OSError)` from `agent.py` to `tunnel.py`, and
+   change `agent.py`'s import to `from .tunnel import DnsError,
+   ProxyAuthRejected`. A back-import from `agent.py` would be circular.
+   `tests/test_agent_dns.py` imports `DnsError` from `netbridge_agent.agent`
+   and must keep passing unchanged. Check `DnsError` before the generic
+   `OSError` branch. Add a test that feeds the exception actually raised by
+   `resolve_destination` (patch `getaddrinfo` to raise `socket.gaierror`,
+   and the timeout case) into `connect_error_code` and gets `dns_failed`.
 2. `agent.py` `handle_tcp_connect`: add `"error_code"` to every failure send,
    per the spec's Agent section. Import the constants from
    `shared_auth.connect_errors`. Append ` [<code>]` to the `Failed:` and
@@ -71,7 +77,11 @@ for field errors), `tests/test_legacy.py`.
      raising `ConnectionRefusedError`)
    - `DnsError`
    - `ProxyAuthRejected`
-3. `legacy.py`: the same treatment per the spec. Tests in
+3. `legacy.py`: the same treatment per the spec. Remember that
+   `ProxyConnectionError` reaches the generic `except Exception` handler,
+   which must therefore use `connect_error_code(e)`. The pending-cancel
+   reply gets `general`; the existing test around `test_legacy.py:423`
+   should assert it. Tests in
    `test_legacy.py` follow the file's existing style.
 4. `uv sync --group dev && uv run pytest` green with floor 54. Commit.
 
@@ -145,10 +155,9 @@ if it unit-tests the step helpers.
    Check how `_error_case` compares HTTP statuses and update it if it
    hard-codes 502. Update the comment in `healthy()`.
 2. `_filter.blocked`: expect `0x02` and update the message.
-3. `_probe_relay`/raw `/tunnel` helper (around line 500): wherever the
-   journey asserts on relay-originated failures, also assert
-   `reply.get("error_code")` equals the expected code. Leave the
-   tenant-isolation check alone unless it naturally fits.
+3. `_user_isolation` (it uses the raw `/tunnel` helper `_tunnel_connect`):
+   add `and other.get("error_code") == "no_agent"` to `isolated`. The detail
+   string already dumps the full reply.
 4. Update the driver unit tests that pin the old values.
 5. `uv run pytest` in `e2e` green with floor 79.
 6. Run the full journey in source mode locally (see `ci.yml` e2e-source for
