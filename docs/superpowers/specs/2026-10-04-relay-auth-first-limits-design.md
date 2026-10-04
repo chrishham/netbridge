@@ -135,6 +135,10 @@ bound fetches toward Microsoft regardless of request rate:
      or hanging Microsoft endpoint never delays a validation that has usable
      keys. Only a missing or too-old cache, or a forced refresh, waits on the
      fetch.
+   - At most one background refresh is pending per tenant, and none is
+     started during a failure backoff.
+   - A 200 response that is not a JSON object with a `keys` list counts as a
+     failed fetch and never replaces the cached keys.
    - Every fetch failure without usable keys raises
      `Signing keys unavailable`, the first one included.
    - Stale keys are served for at most `JWKS_MAX_STALE = 86400` seconds
@@ -200,10 +204,17 @@ settings:
 
 - Clients must not be able to reach the relay except through the trusted
   proxies.
+- `RELAY_TRUSTED_PROXIES` must list only proxy addresses, never a range that
+  also holds clients. A client inside a trusted range is skipped by the walk
+  like a proxy, so a prefix it forged would be selected. Where clients and
+  proxies share a range (e.g. an internal network), list the proxies' exact
+  addresses, or have the first proxy discard the incoming header instead of
+  appending to it.
 - In `X-Forwarded-For` mode, each trusted proxy must *append* its peer address
   (standard behaviour for nginx `$proxy_add_x_forwarded_for`, Traefik, Envoy,
-  cloud LBs). Because the walk is right to left over trusted hops, any prefix
-  the client forged is never reached.
+  cloud LBs). Because the walk is right to left over trusted hops, and no
+  client address is trusted (previous point), any prefix the client forged is
+  never reached.
 - In single-value mode (`X-Real-IP`, `CF-Connecting-IP`, …), the outermost
   trusted proxy must *overwrite* the header with the peer address. The relay
   cannot verify this; a proxy that passes the client's value through lets

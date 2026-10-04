@@ -56,7 +56,7 @@ These are input classes the spec implies and the base design could miss. Each ha
 - Produces:
   - `async def _get_jwks(tenant_id: str, force: bool = False) -> dict`
   - constants `JWKS_FORCED_REFRESH_COOLDOWN = 60`, `JWKS_FETCH_BACKOFF = 10` and `JWKS_MAX_STALE = 86400`
-  - module state `_jwks_cache: dict[str, tuple[float, dict]]` (unchanged shape: `(time.time() at fetch, jwks)`), `_jwks_locks: dict[str, asyncio.Lock]`, `_jwks_failed_at: dict[str, float]`, `_jwks_forced_refresh: dict[str, float]` (both hold `time.monotonic()` values) and `_jwks_refreshes: set[asyncio.Task]`
+  - module state `_jwks_cache: dict[str, tuple[float, dict]]` (unchanged shape: `(time.time() at fetch, jwks)`), `_jwks_locks: dict[str, asyncio.Lock]`, `_jwks_failed_at: dict[str, float]`, `_jwks_forced_refresh: dict[str, float]` (both hold `time.monotonic()` values) and `_jwks_refreshes: dict[str, asyncio.Task]`
   - helpers `_refresh_jwks(tenant_id, force=False) -> dict` (the locked fetch) and `_refresh_jwks_quietly(tenant_id) -> None` (background wrapper)
   - new error text: `Signing keys unavailable`
 - Keeps:
@@ -71,7 +71,7 @@ In `shared/tests/test_validate_signatures.py`'s `reset_caches`, and next to the 
     monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
     monkeypatch.setattr(mod, "_jwks_failed_at", {})
     monkeypatch.setattr(mod, "_jwks_locks", {})
-    monkeypatch.setattr(mod, "_jwks_refreshes", set())
+    monkeypatch.setattr(mod, "_jwks_refreshes", {})
 ```
 
 Those existing tests patch `_get_jwks` with a one-argument fake. After this task, `validate_arm_token` calls `_get_jwks(tid, force=True)`, so update each such fake to accept `force=False` (`grep -n "def fake_get_jwks" shared/tests/*.py`). Fakes passed as `return_value=` need no change.
@@ -125,7 +125,7 @@ def fresh(monkeypatch):
     monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
     monkeypatch.setattr(mod, "_jwks_failed_at", {})
     monkeypatch.setattr(mod, "_jwks_locks", {})
-    monkeypatch.setattr(mod, "_jwks_refreshes", set())
+    monkeypatch.setattr(mod, "_jwks_refreshes", {})
     monkeypatch.setenv("NETBRIDGE_ALLOWED_TENANTS", VALID_TENANT)
 
 
@@ -136,6 +136,7 @@ class FakeMicrosoft:
         self.keys = keys
         self.calls = 0
         self.fail = False
+        self.body = None  # when set, returned as the JSON body instead of {"keys": [...]}
         self.gate: asyncio.Event | None = None
 
     async def get(self, client, url, *args, **kwargs):
@@ -144,7 +145,8 @@ class FakeMicrosoft:
             await self.gate.wait()
         if self.fail:
             raise httpx.ConnectError("down")
-        return httpx.Response(200, json={"keys": list(self.keys)}, request=httpx.Request("GET", url))
+        body = self.body if self.body is not None else {"keys": list(self.keys)}
+        return httpx.Response(200, json=body, request=httpx.Request("GET", url))
 
 
 @pytest.fixture
@@ -166,7 +168,7 @@ def _patched(ms):
 async def _drain_refreshes():
     """Let background refreshes started by expired-but-usable caches finish."""
     while mod._jwks_refreshes:
-        await asyncio.gather(*list(mod._jwks_refreshes))
+        await asyncio.gather(*list(mod._jwks_refreshes.values()))
 
 
 def _expire(seconds_past_fetch):
@@ -297,6 +299,7 @@ async def test_expired_cache_is_used_during_backoff(key):
         assert await validate_arm_token(_token(private))
         await _drain_refreshes()
         assert ms.calls == calls  # backoff: no second attempt
+        assert not mod._jwks_refreshes  # and no task was scheduled during the backoff
 
 
 @pytest.mark.asyncio
@@ -310,12 +313,27 @@ async def test_expired_usable_cache_does_not_wait_for_slow_fetch(key):
         users = await asyncio.wait_for(
             asyncio.gather(*(validate_arm_token(_token(private)) for _ in range(5))), timeout=1)
         assert len(users) == 5
+        assert len(mod._jwks_refreshes) == 1  # one pending refresh for the burst, not one per validation
         await asyncio.sleep(0.05)  # let the background refresh reach the hanging fetch
         assert ms.calls == 2  # the initial fetch plus one background refresh, still blocked
         ms.gate.set()
         await _drain_refreshes()
         assert ms.calls == 2
         assert mod._jwks_cache[VALID_TENANT][0] > time.time() - 5  # refreshed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[], {"keys": "x"}, {}, "keys"])
+async def test_malformed_jwks_response_keeps_previous_keys(key, body):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))
+        ms.body = body
+        with pytest.raises(TokenValidationError, match="Signing key not found"):
+            await validate_arm_token(_token(private, "ghost"))  # forced refresh gets the bad body
+        assert VALID_TENANT in mod._jwks_failed_at
+        assert await validate_arm_token(_token(private))  # old keys still cached
 
 
 @pytest.mark.asyncio
@@ -362,7 +380,7 @@ JWKS_MAX_STALE = 86400  # seconds
 _jwks_locks: dict[str, asyncio.Lock] = {}
 _jwks_failed_at: dict[str, float] = {}
 _jwks_forced_refresh: dict[str, float] = {}
-_jwks_refreshes: set[asyncio.Task] = set()  # strong refs to background refreshes
+_jwks_refreshes: dict[str, asyncio.Task] = {}  # at most one background refresh per tenant
 
 
 async def _fetch_jwks(tenant_id: str) -> dict:
@@ -374,7 +392,10 @@ async def _fetch_jwks(tenant_id: str) -> dict:
             # Single retry on transient failure (connection error, timeout)
             resp = await client.get(url)
         resp.raise_for_status()
-        return resp.json()
+        jwks = resp.json()
+    if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+        raise ValueError("Malformed JWKS response")  # a fetch failure: must not replace working keys
+    return jwks
 
 
 async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
@@ -389,10 +410,12 @@ async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
             return cached[1]  # fast path: a fetch in flight must not stall validations served from cache
         if age < JWKS_MAX_STALE:
             # Expired but usable: refresh in the background so no validation waits on Microsoft
-            if not _jwks_locks.setdefault(tenant_id, asyncio.Lock()).locked():
+            failed_at = _jwks_failed_at.get(tenant_id)
+            backing_off = failed_at is not None and time.monotonic() - failed_at < JWKS_FETCH_BACKOFF
+            if tenant_id not in _jwks_refreshes and not backing_off:
                 task = asyncio.create_task(_refresh_jwks_quietly(tenant_id))
-                _jwks_refreshes.add(task)
-                task.add_done_callback(_jwks_refreshes.discard)
+                _jwks_refreshes[tenant_id] = task
+                task.add_done_callback(lambda _t: _jwks_refreshes.pop(tenant_id, None))
             return cached[1]
     return await _refresh_jwks(tenant_id, force)
 
@@ -435,7 +458,7 @@ Two consequences of the code above:
 
 - When a fetch fails and the cached keys are less than `JWKS_MAX_STALE` old, `_get_jwks` returns them instead of raising. That is intended: an outage at Microsoft must not lock out users whose keys are cached. Past a day, a revoked key must not keep working, so validation fails until a fetch succeeds.
 - Every fetch failure without usable keys raises `Signing keys unavailable`, on the first failure as well as during the backoff, so clients see one message for one condition. The underlying error is chained (`from e`) for the logs.
-- Once the TTL has passed but the keys are younger than `JWKS_MAX_STALE`, callers get the cached keys immediately and one background task refreshes them (stale-while-revalidate). A slow or failing Microsoft endpoint never delays a validation that has usable keys. Several tasks may be created before the first takes the lock; the re-check under the lock makes the later ones return without fetching.
+- Once the TTL has passed but the keys are younger than `JWKS_MAX_STALE`, callers get the cached keys immediately and one background task refreshes them (stale-while-revalidate). A slow or failing Microsoft endpoint never delays a validation that has usable keys. `_jwks_refreshes` holds at most one pending task per tenant, and none is scheduled during a failure backoff, so a burst of validations cannot pile up tasks.
 - `_refresh_jwks_quietly` swallows the exception, so a failing background task does not log "Task exception was never retrieved"; the failure is recorded in `_jwks_failed_at`.
 
 - [ ] **Step 5: Implement the unknown-kid branch**
@@ -884,7 +907,7 @@ Add two rows right after it:
 Below the table, add a short paragraph:
 
 ```
-**Client IP behind a reverse proxy.** By default the relay keys the failed-auth limit on the TCP peer. Behind a proxy that is the proxy's address, which is safe: valid tokens never count against the limit. To key on the real client, set `RELAY_TRUSTED_PROXIES`, but only if clients cannot reach the relay except through those proxies. In `X-Forwarded-For` mode, every trusted proxy must append its peer to the header, which is the default for nginx (`$proxy_add_x_forwarded_for`), Traefik, Envoy and cloud load balancers. With a single-value header (`X-Real-IP`, `CF-Connecting-IP`, …), the outermost trusted proxy must overwrite it.
+**Client IP behind a reverse proxy.** By default the relay keys the failed-auth limit on the TCP peer. Behind a proxy that is the proxy's address, which is safe: valid tokens never count against the limit. To key on the real client, set `RELAY_TRUSTED_PROXIES`, but only if clients cannot reach the relay except through those proxies, and list only the proxies' own addresses: a client whose address falls inside a trusted range is skipped as if it were a proxy, and a forged `X-Forwarded-For` prefix then picks its bucket. In `X-Forwarded-For` mode, every trusted proxy must append its peer to the header, which is the default for nginx (`$proxy_add_x_forwarded_for`), Traefik, Envoy and cloud load balancers. With a single-value header (`X-Real-IP`, `CF-Connecting-IP`, …), the outermost trusted proxy must overwrite it.
 ```
 
 In `security-tests/pentest_suite.py`, change the comment near line 440 to:
@@ -921,7 +944,7 @@ git commit -m "Authenticate before the per-IP limit and charge it only for failu
   - `clients.ws_upgrade(host, port, path, token) -> (status, body)`
   - `self._tunnel_connect(relay, token, ip, targets) -> dict`
   - `stub.mint()` (valid token), and `self.check(name, fn)`
-- Produces: the journey step `auth_flood_spares_valid_users` (source mode with auth only).
+- Produces: the journey step `auth_flood_spares_valid_users`, run in both source and exe mode.
 
 - [ ] **Step 1: Measure the failed attempts before the step**
 
