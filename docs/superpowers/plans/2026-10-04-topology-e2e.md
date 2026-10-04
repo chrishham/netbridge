@@ -26,7 +26,7 @@
 
 ## Review Focus
 
-1. **Relay down behind the edge** (relay restart step): the edge accepts TLS and then cannot reach the relay. It must answer `502` and close, and the clients must treat that as a transient failure and reconnect. Pinned by `test_upstream_down_answers_502`, and in the journey by `edge_relay_down_502` (the relay stays down until both clients have met a 502) followed by `reconnect`.
+1. **Relay down behind the edge** (relay restart step): the edge accepts TLS and then cannot reach the relay. It must answer `502` and close, and the clients must treat that as a transient failure and reconnect. Pinned by `test_upstream_down_answers_502`, and in the journey by `edge_relay_down_502` (the relay stays down until the edge has counted a 502 for each client and each client has logged its `handshake failed … 502`) followed by `reconnect`.
 2. **Decrypted bytes buffered inside the SSL object**: `select` does not see them. A large transfer in both directions at once must not stall or deadlock. Pinned by `test_large_payload_round_trips` (32 MiB each way against an echo that blocks on its own writes).
 3. **A request head trickled across many segments**: it must still parse. Pinned by `test_trickled_head_is_parsed`.
 4. **Bytes sent in the same segment as the head** (a client pipelining its first frame): they must be forwarded, not dropped. Pinned by `test_bytes_after_head_are_forwarded`.
@@ -311,7 +311,8 @@ def test_large_payload_round_trips(edge):
         sent, got = 0, bytearray()
         while len(got) < len(data):
             want_write = [s] if sent < len(data) else []
-            readable, writable, _ = select.select([s], want_write, [], 5)
+            # decrypted bytes held by the SSL object are invisible to select: do not wait on them
+            readable, writable, _ = select.select([s], want_write, [], 0 if s.pending() else 5)
             assert readable or writable or s.pending(), f"stalled: sent {sent}, got {len(got)}"
             if writable:
                 try:
@@ -451,6 +452,20 @@ def test_close_does_not_wait_for_a_silent_client(tmp_path, upstream):
         e.close()
         assert time.monotonic() - start < 1.5
         assert ended_by_edge(s, 3)
+    finally:
+        s.close()
+
+
+def test_close_does_not_wait_for_a_silent_tcp_client(tmp_path, upstream):
+    e = make_edge(tmp_path, upstream.address, idle=30.0)
+    s = socket.create_connection(("127.0.0.1", e.port))  # no ClientHello: the edge sits in its handshake
+    try:
+        assert wait_until(lambda: e.active() == 1)
+        start = time.monotonic()
+        e.close()
+        assert time.monotonic() - start < 1.5
+        s.settimeout(3)
+        assert s.recv(1) == b""  # the edge closed it, well before HANDSHAKE_TIMEOUT
     finally:
         s.close()
 
@@ -723,8 +738,11 @@ class EdgeProxy:
         try:
             self._track(socks, 0, raw)
             raw.settimeout(HANDSHAKE_TIMEOUT)
-            client = self._ctx.wrap_socket(raw, server_side=True)
-            self._track(socks, 0, client)  # raw is detached now: close() must reach the TLS socket
+            client = self._ctx.wrap_socket(raw, server_side=True, do_handshake_on_connect=False)
+            # raw is detached now: track the TLS socket *before* the handshake, so close() can end
+            # a client that connected and never sent a ClientHello
+            self._track(socks, 0, client)
+            client.do_handshake()
             client.settimeout(self.idle_timeout)  # a client silent before its head is idle too
             try:
                 head, rest = _read_head(client)
@@ -1265,24 +1283,48 @@ def test_edge_appends_peer_needs_a_non_loopback_host(j):
 
 # --- edge_relay_down_502 ------------------------------------------------
 
+AGENT_502 = "ERROR Handshake failed: 502 Invalid response status\n"
+PROXY_502 = "ERROR Reconnection failed: WebSocket handshake failed (502): Invalid response status\n"
+MARKS = {"agent": None, "proxy": None}
+
+
 def test_edge_relay_down_sees_both_clients(j, monkeypatch):
     edge = fake_edge()
     edge.bad_gateways.update({"/ws": 3})  # earlier 502s do not count
+    agent, proxy = SimpleNamespace(name="agent", logs=Logs()), SimpleNamespace(name="proxy", logs=Logs())
 
     def sleep(_):
         edge.bad_gateways.update({"/ws": 1, "/tunnel": 1})
+        agent.logs, proxy.logs = Logs(AGENT_502), Logs(PROXY_502)
 
     monkeypatch.setattr(journey.time, "sleep", sleep)
-    ok, detail = j._edge_relay_down(edge)
-    assert ok and "agent (/ws) 1, proxy (/tunnel) 1" in detail
+    ok, detail = j._edge_relay_down(edge, agent, proxy, MARKS)
+    assert ok and "agent (/ws) 1, proxy (/tunnel) 1" in detail and "agent True, proxy True" in detail
 
 
 def test_edge_relay_down_fails_without_the_proxy(j, monkeypatch):
     edge = fake_edge()
+    agent, proxy = SimpleNamespace(name="agent", logs=Logs(AGENT_502)), SimpleNamespace(name="proxy", logs=Logs())
     monkeypatch.setattr(journey, "EDGE_502_WAIT", 0.2)
     monkeypatch.setattr(journey.time, "sleep", lambda _: edge.bad_gateways.update({"/ws": 1}))
-    ok, detail = j._edge_relay_down(edge)
+    ok, detail = j._edge_relay_down(edge, agent, proxy, MARKS)
     assert not ok and "proxy (/tunnel) 0" in detail
+
+
+def test_edge_relay_down_fails_when_a_client_never_saw_the_502(j, monkeypatch):
+    edge = fake_edge()
+    agent = SimpleNamespace(name="agent", logs=Logs(AGENT_502))
+    proxy = SimpleNamespace(name="proxy", logs=Logs("ERROR Reconnection failed: Connection failed: reset\n"))
+    monkeypatch.setattr(journey, "EDGE_502_WAIT", 0.2)
+    # the edge counts both 502s, but the proxy's response was lost to a reset
+    monkeypatch.setattr(journey.time, "sleep", lambda _: edge.bad_gateways.update({"/ws": 1, "/tunnel": 1}))
+    ok, detail = j._edge_relay_down(edge, agent, proxy, MARKS)
+    assert not ok and "agent True, proxy False" in detail
+
+
+def test_handshake_502_pattern_matches_both_clients():
+    assert re.search(journey.HANDSHAKE_502, AGENT_502) and re.search(journey.HANDSHAKE_502, PROXY_502)
+    assert not re.search(journey.HANDSHAKE_502, "Handshake failed: 401 Invalid response status")
 
 
 # --- idle ----------------------------------------------------------------
@@ -1366,6 +1408,9 @@ EDGE_OTHER_CLIENT = "198.51.100.8"
 EDGE_SPOOF = "203.0.113.9"  # TEST-NET-3: a client's own, untrustworthy X-Forwarded-For entry
 EDGE_IP_USER = "edge-ip@netbridge.test"
 EDGE_502_WAIT = 30.0  # both clients retry within it: the reconnect backoff starts at 5 s (+30 % jitter)
+# aiohttp's WSServerHandshakeError, as each client logs it: the agent "Handshake failed: 502 Invalid response
+# status", the proxy "WebSocket handshake failed (502): Invalid response status"
+HANDSHAKE_502 = r"[Hh]andshake failed\W{1,3}502\b"
 ```
 
 4. New methods, placed right after `_auth_flood`:
@@ -1469,17 +1514,26 @@ EDGE_502_WAIT = 30.0  # both clients retry within it: the reconnect backoff star
                     f"edge idle closes {closes}->{closes_after}, relay sessions agent/proxy {before}->{after}; "
                     f"echo round trip ok")
 
-    def _edge_relay_down(self, edge: EdgeProxy) -> tuple[bool, str]:
+    def _edge_relay_down(self, edge: EdgeProxy, agent, proxy, marks: dict) -> tuple[bool, str]:
         """With the relay stopped, both clients retry through the edge and get its 502, then must recover
-        (the reconnect step that follows proves the recovery)."""
+        (the reconnect step that follows proves the recovery). The edge's counter says it answered 502;
+        each client's own log line says the 502 reached it (a reset would log something else)."""
         paths = ("/ws", "/tunnel")  # as the relay would see them: the edge has stripped any prefix
         before = {p: edge.bad_gateways[p] for p in paths}
+
+        def logged():
+            return {c.name: re.search(HANDSHAKE_502, c.logs.text(since=marks[c.name])) is not None
+                    for c in (agent, proxy)}
+
         deadline = time.monotonic() + EDGE_502_WAIT
-        while time.monotonic() < deadline and not all(edge.bad_gateways[p] > before[p] for p in paths):
+        while time.monotonic() < deadline and not (all(edge.bad_gateways[p] > before[p] for p in paths)
+                                                   and all(logged().values())):
             time.sleep(0.5)
-        seen = {p: edge.bad_gateways[p] - before[p] for p in paths}
-        return all(seen.values()), (f"502s from the edge while the relay was down: agent (/ws) {seen['/ws']}, "
-                                    f"proxy (/tunnel) {seen['/tunnel']}, within {EDGE_502_WAIT:.0f}s")
+        seen, heard = {p: edge.bad_gateways[p] - before[p] for p in paths}, logged()
+        return all(seen.values()) and all(heard.values()), (
+            f"502s from the edge while the relay was down: agent (/ws) {seen['/ws']}, proxy (/tunnel) "
+            f"{seen['/tunnel']}; logged by the client: agent {heard[agent.name]}, proxy {heard[proxy.name]}; "
+            f"within {EDGE_502_WAIT:.0f}s")
 
     def _edge_dead_link(self, edge: EdgeProxy) -> tuple[bool, str]:
         """Counter-proof: a kept-alive HTTPS connection with no traffic is closed by the edge's idle timer."""
@@ -1564,7 +1618,7 @@ Replace `self._reconnect(relay, agent, proxy, ip, targets)` with `self._reconnec
         marks = {agent.name: agent.logs.mark(), proxy.name: proxy.logs.mark()}
         relay.stop()
         if edge:  # hold the relay down until both clients have met the edge's 502
-            self.check("edge_relay_down_502", lambda: self._edge_relay_down(edge))
+            self.check("edge_relay_down_502", lambda: self._edge_relay_down(edge, agent, proxy, marks))
         else:
             time.sleep(3)
         relay.start()

@@ -99,7 +99,7 @@ Profiles keep both clouds' quirks covered without doubling CI time:
   - the edge counted no idle closes;
   - neither client logged a new relay session;
   - an echo round trip through the SOCKS port succeeds.
-- **`edge_relay_down_502`:** during the existing relay restart, the relay stays down until both clients have retried through the edge and received its `502` (at most 30 s; reconnect backoff starts at 5 s). The `reconnect` step that follows proves they treat it as transient.
+- **`edge_relay_down_502`:** during the existing relay restart, the relay stays down until both clients have retried through the edge and received its `502`, as both the edge's count and each client's own log show (at most 30 s; reconnect backoff starts at 5 s). The `reconnect` step that follows proves they treat it as transient.
 - **`edge_idle_closes_dead_link`:** this is the counter-proof that the idle timer is real. A raw TLS connection through the edge with no traffic must be closed by the edge within `idle_timeout + 5` s.
 
 Every existing step runs unchanged through the edge. That includes the socks5 and HTTP paths, the errors, isolation, relay restart and reconnect, and all link faults. The driver's own probes (auth matrix, the existing flood step, pentest) stay direct to the relay, as the Wiring section says; `edge_client_ip` is the flood that goes through the edge. Because they still pass, the edge adds no breakage.
