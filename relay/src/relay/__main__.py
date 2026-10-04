@@ -355,7 +355,17 @@ _ip_limiters: dict[str, _TimedLimiter] = {}
 
 def _parse_trusted_proxies(raw: str) -> tuple:
     """Comma-separated CIDRs (bare IPs allowed); ValueError on an invalid entry."""
-    return tuple(ipaddress.ip_network(part.strip(), strict=False) for part in raw.split(",") if part.strip())
+    return tuple(_unmap(ipaddress.ip_network(part.strip(), strict=False)) for part in raw.split(",") if part.strip())
+
+
+_MAPPED_V4 = ipaddress.ip_network("::ffff:0:0/96")
+
+
+def _unmap(net):
+    """::ffff:10.0.0.0/104 is 10.0.0.0/8, so it matches peers _parse_ip has unmapped."""
+    if net.version == 6 and net.prefixlen >= 96 and net.subnet_of(_MAPPED_V4):
+        return ipaddress.ip_network(f"{net.network_address.ipv4_mapped}/{net.prefixlen - 96}")
+    return net
 
 
 def _parse_ip(value: str):

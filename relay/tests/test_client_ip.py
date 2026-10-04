@@ -1,5 +1,7 @@
 """Client IP resolution behind optional trusted proxies."""
 
+import ipaddress
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -144,3 +146,9 @@ def test_no_warning_for_sane_config(caplog):
     mod._warn_client_ip_config("X-Real-IP", mod._parse_trusted_proxies("10.0.0.0/8"))
     mod._warn_client_ip_config("", ())
     assert caplog.text == ""
+
+
+def test_ipv4_mapped_trusted_range_matches_unmapped_peer(trusted):
+    trusted("::ffff:10.0.0.0/104")
+    assert mod._TRUSTED_PROXIES == (ipaddress.ip_network("10.0.0.0/8"),)
+    assert mod._client_ip(_req("::ffff:10.0.0.5", {"X-Forwarded-For": "1.1.1.1"})) == "1.1.1.1"
