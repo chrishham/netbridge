@@ -97,7 +97,11 @@ for field errors), `tests/test_legacy.py`.
    `handle_tcp_connect`: `DnsError` (failure and timeout) → `dns_failed`,
    with no dial attempted (assert `open_tcp_connection` is not called);
    empty result → `dns_failed`; a resolved private address still denied →
-   `not_allowed`, judged on the passed `resolved=` list. Tests in
+   `not_allowed`, judged on the passed `resolved=` list.
+   Also a legacy dial test where `open_tcp_connection` raises
+   `ProxyConnectionError(status_code=403/502/504)` and the reply carries
+   `not_allowed`/`host_unreachable`/`timeout`. This guards the generic
+   handler. Tests in
    `test_legacy.py` follow the file's existing style.
 4. `uv sync --group dev && uv run pytest` green with floor 54. Commit.
 
