@@ -24,7 +24,8 @@
   - the `Agent auth rejected for {ip}: {reason}` and `Tunnel auth rejected for {ip}: {reason}` warnings
   - the per-user `Too many connection attempts` 429
 - Throttled-failure log: `Per-IP auth-failure limit exceeded for {ip}`.
-- JWKS cooldown: `JWKS_FORCED_REFRESH_COOLDOWN = 60` seconds per tenant. Record the timestamp before awaiting the fetch.
+- JWKS fetching: one fetch in flight per tenant; `JWKS_FETCH_BACKOFF = 10` s after a failure (serve stale keys if cached, else `Signing keys unavailable`); forced refresh at most once per `JWKS_FORCED_REFRESH_COOLDOWN = 60` s per tenant, timestamp recorded before the await, cache replaced only on success.
+- Log bounding: `Per-IP auth-failure limit exceeded for {ip} ({n} more since last report)` at most once per IP per 60 s.
 - Topology independence:
   - no hard-coded proxy vendor, header or CIDR
   - default behaviour (no trusted proxies) uses `request.remote`, exactly as today
@@ -39,155 +40,337 @@ These are input classes the spec implies and the base design could miss. Each ha
 1. **`X-Forwarded-For` entries with a port.** Azure Application Gateway sends `1.2.3.4:5678`, and some proxies send `[2001:db8::1]:443`. Expect the port stripped and the IP used. Owner: Task 2.
 2. **An IPv6 remote inside a trusted IPv6 CIDR**, e.g. `::1` with trusted `::1/128`. Expect the header honoured. Owner: Task 2.
 3. **A whitespace-only or empty header value** with a trusted remote. Expect a fallback to `request.remote`, not a crash and not `""`. Owner: Task 2.
-4. **Concurrent unknown-kid requests within the cooldown.** Expect exactly one fetch, even though all requests started before the first fetch returned. Owner: Task 1.
+4. **A slow or hanging Microsoft fetch** while the cache is fresh. Expect validations served from cache not to wait for the in-flight fetch (fast path outside the lock). Owner: Task 1.
 5. **A valid-token upgrade while the IP bucket is empty, on `/tunnel` as well as `/ws`.** Expect 101, with the per-user limit still applying afterwards. Owner: Task 3.
 
 ---
 
-### Task 1: Cooldown on forced JWKS refresh (`shared`)
+### Task 1: Bounded JWKS fetching (`shared`)
 
 **Files:**
-- Modify: `shared/src/shared_auth/validate.py`: near `_jwks_cache` (around line 100), and the unknown-kid branch in `validate_arm_token` (around lines 225-233)
-- Test: `shared/tests/test_validate_signatures.py`. Extend the `reset_caches` fixture at line 104, and the two inline `_jwks_cache` resets near lines 333 and 400.
+- Modify: `shared/src/shared_auth/validate.py`: `_jwks_cache` / `_get_jwks` (lines 100-123), and the unknown-kid branch in `validate_arm_token` (around lines 225-236)
+- Create: `shared/tests/test_jwks_fetching.py`
+- Modify: `shared/tests/test_validate_signatures.py`: the `reset_caches` fixture at line 104, and the two inline `_jwks_cache` resets near lines 333 and 400
 
 **Interfaces:**
 - Produces:
-  - `JWKS_FORCED_REFRESH_COOLDOWN: int = 60`
-  - `_jwks_forced_refresh: dict[str, float]`, keyed by tenant id; the value is `time.monotonic()` of the last forced refresh
-  - the error message for an unknown kid stays `Signing key not found: {kid}`
+  - `async def _get_jwks(tenant_id: str, force: bool = False) -> dict`
+  - constants `JWKS_FORCED_REFRESH_COOLDOWN = 60` and `JWKS_FETCH_BACKOFF = 10`
+  - module state `_jwks_cache: dict[str, tuple[float, dict]]` (unchanged shape: `(time.time() at fetch, jwks)`), `_jwks_locks: dict[str, asyncio.Lock]`, `_jwks_failed_at: dict[str, float]` and `_jwks_forced_refresh: dict[str, float]`. The last two hold `time.monotonic()` values.
+  - new error text: `Signing keys unavailable`
+- Keeps:
+  - `_get_jwks_url(tenant_id)` as the only URL source. The e2e relaysite hook patches it.
+  - `Signing key not found: {kid}`
 
-- [ ] **Step 1: Reset the new state in the test fixtures**
+- [ ] **Step 1: Reset the new state in the existing fixtures**
 
-In `reset_caches` add:
+In `shared/tests/test_validate_signatures.py`'s `reset_caches`, and next to the two inline `_jwks_cache` resets, add:
 
 ```python
     monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
+    monkeypatch.setattr(mod, "_jwks_failed_at", {})
+    monkeypatch.setattr(mod, "_jwks_locks", {})
 ```
 
-Next to the other two `monkeypatch.setattr(mod, "_jwks_cache", {})` lines (near lines 333 and 400), add the same line with the same `mod` variable those tests use.
+Those existing tests patch `_get_jwks` with a one-argument fake. After this task, `validate_arm_token` calls `_get_jwks(tid, force=True)`, so update each such fake to accept `force=False` (`grep -n "def fake_get_jwks" shared/tests/*.py`). Fakes passed as `return_value=` need no change.
 
 - [ ] **Step 2: Write the failing tests**
 
-Append to `shared/tests/test_validate_signatures.py`:
+Create `shared/tests/test_jwks_fetching.py`. These tests exercise the real `_get_jwks`, faking HTTP by patching `httpx.AsyncClient.get`:
 
 ```python
+"""JWKS fetching toward Microsoft is bounded: single flight, failure backoff, forced-refresh cooldown."""
+
+import asyncio
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+import shared_auth.validate as mod
+from shared_auth.validate import TokenValidationError, validate_arm_token
+from tests.test_validate_signatures import (
+    VALID_TENANT, _generate_rsa_keypair, _key_to_jwk, _make_valid_claims, _sign_jwt,
+)
+
+
+@pytest.fixture(autouse=True)
+def fresh(monkeypatch):
+    monkeypatch.setattr(mod, "_allowed_tenants_cache", None)
+    monkeypatch.setattr(mod, "_allowed_users_cache", None)
+    monkeypatch.setattr(mod, "_allowed_groups_cache", None)
+    monkeypatch.setattr(mod, "_jwks_cache", {})
+    monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
+    monkeypatch.setattr(mod, "_jwks_failed_at", {})
+    monkeypatch.setattr(mod, "_jwks_locks", {})
+    monkeypatch.setenv("NETBRIDGE_ALLOWED_TENANTS", VALID_TENANT)
+
+
+class FakeMicrosoft:
+    """Stands in for httpx.AsyncClient.get; counts calls, can block, fail or change keys."""
+
+    def __init__(self, keys):
+        self.keys = keys
+        self.calls = 0
+        self.fail = False
+        self.gate: asyncio.Event | None = None
+
+    async def get(self, client, url, *args, **kwargs):
+        self.calls += 1
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.fail:
+            raise httpx.ConnectError("down")
+        return httpx.Response(200, json={"keys": list(self.keys)}, request=httpx.Request("GET", url))
+
+
+@pytest.fixture
+def key():
+    private, public = _generate_rsa_keypair()
+    return private, _key_to_jwk(public, "k1")
+
+
+def _token(private, kid="k1"):
+    return _sign_jwt(private, {"alg": "RS256", "typ": "JWT", "kid": kid}, _make_valid_claims())
+
+
+def _patched(ms):
+    async def get(self, url, *args, **kwargs):
+        return await ms.get(self, url, *args, **kwargs)
+    return patch.object(httpx.AsyncClient, "get", get)
+
+
 @pytest.mark.asyncio
-async def test_second_unknown_kid_within_cooldown_does_not_refetch(reset_caches):
-    """A forced JWKS refresh happens at most once per tenant per cooldown."""
-    private_key, _ = _generate_rsa_keypair()
-    claims = _make_valid_claims()
-    first = _sign_jwt(private_key, {"alg": "RS256", "typ": "JWT", "kid": "ghost-1"}, claims)
-    second = _sign_jwt(private_key, {"alg": "RS256", "typ": "JWT", "kid": "ghost-2"}, claims)
-    fetches = []
-
-    async def fake_get_jwks(tenant_id):
-        fetches.append(tenant_id)
-        return {"keys": []}
-
-    with patch("shared_auth.validate._get_jwks", side_effect=fake_get_jwks):
-        with pytest.raises(TokenValidationError, match="Signing key not found: ghost-1"):
-            await validate_arm_token(first)
-        assert len(fetches) == 2  # cached read + one forced refresh
-        with pytest.raises(TokenValidationError, match="Signing key not found: ghost-2"):
-            await validate_arm_token(second)
-    assert len(fetches) == 3  # cached read only: no second forced refresh
+async def test_concurrent_cache_misses_fetch_once(key):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    ms.gate = asyncio.Event()
+    with _patched(ms):
+        tasks = [asyncio.create_task(validate_arm_token(_token(private))) for _ in range(5)]
+        await asyncio.sleep(0.05)
+        ms.gate.set()
+        users = await asyncio.gather(*tasks)
+    assert ms.calls == 1
+    assert len(set(users)) == 1
 
 
 @pytest.mark.asyncio
-async def test_forced_refresh_allowed_again_after_cooldown(reset_caches, monkeypatch):
-    import shared_auth.validate as mod
-    private_key, _ = _generate_rsa_keypair()
-    token = _sign_jwt(private_key, {"alg": "RS256", "typ": "JWT", "kid": "ghost"}, _make_valid_claims())
+async def test_cached_validations_do_not_wait_for_forced_refresh(key):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))
+        ms.gate = asyncio.Event()  # the forced refresh below hangs
+        forced = asyncio.create_task(validate_arm_token(_token(private, "ghost")))
+        await asyncio.sleep(0.05)
+        assert await asyncio.wait_for(validate_arm_token(_token(private)), 1)
+        ms.gate.set()
+        with pytest.raises(TokenValidationError):
+            await forced
+
+
+@pytest.mark.asyncio
+async def test_unknown_kid_forced_refresh_is_rate_limited(key, monkeypatch):
+    private, jwk = key
     clock = [1000.0]
     monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
-    fetches = []
-
-    async def fake_get_jwks(tenant_id):
-        fetches.append(tenant_id)
-        return {"keys": []}
-
-    with patch("shared_auth.validate._get_jwks", side_effect=fake_get_jwks):
-        with pytest.raises(TokenValidationError):
-            await validate_arm_token(token)
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))  # warm cache
+        assert ms.calls == 1
+        with pytest.raises(TokenValidationError, match="Signing key not found: ghost-1"):
+            await validate_arm_token(_token(private, "ghost-1"))
+        assert ms.calls == 2  # one forced refresh
+        with pytest.raises(TokenValidationError, match="Signing key not found: ghost-2"):
+            await validate_arm_token(_token(private, "ghost-2"))
+        assert ms.calls == 2  # within cooldown: no fetch
         clock[0] += mod.JWKS_FORCED_REFRESH_COOLDOWN + 1
-        with pytest.raises(TokenValidationError):
-            await validate_arm_token(token)
-    assert len(fetches) == 4  # two cached reads + two forced refreshes
+        with pytest.raises(TokenValidationError, match="Signing key not found: ghost-3"):
+            await validate_arm_token(_token(private, "ghost-3"))
+        assert ms.calls == 3
 
 
 @pytest.mark.asyncio
-async def test_concurrent_unknown_kids_force_one_refresh(reset_caches):
-    """Requests racing inside the window share one forced refresh (timestamp set before the await)."""
-    import asyncio
-    private_key, _ = _generate_rsa_keypair()
-    tokens = [_sign_jwt(private_key, {"alg": "RS256", "typ": "JWT", "kid": f"ghost-{i}"}, _make_valid_claims())
-              for i in range(5)]
-    calls = []
-    gate = asyncio.Event()
+async def test_concurrent_unknown_kids_force_one_fetch(key):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))  # warm cache: 1 call
+        ms.gate = asyncio.Event()
+        tasks = [asyncio.create_task(validate_arm_token(_token(private, f"ghost-{i}"))) for i in range(5)]
+        await asyncio.sleep(0.05)
+        ms.gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert all(isinstance(r, TokenValidationError) for r in results)
+    assert ms.calls == 2
 
-    async def fake_get_jwks(tenant_id):
-        calls.append(tenant_id)
-        if len(calls) == 2:  # the first request's forced refresh: hold it open while the others run
-            await gate.wait()
-        return {"keys": []}
 
-    async def attempt(tok):
-        with pytest.raises(TokenValidationError, match="Signing key not found"):
-            await validate_arm_token(tok)
+@pytest.mark.asyncio
+async def test_rollover_kid_succeeds_via_forced_refresh(key):
+    private, jwk = key
+    new_private, new_public = _generate_rsa_keypair()
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))
+        ms.keys = [jwk, _key_to_jwk(new_public, "k2")]
+        assert await validate_arm_token(_token(new_private, "k2"))
+    assert ms.calls == 2
 
-    with patch("shared_auth.validate._get_jwks", side_effect=fake_get_jwks):
-        tasks = [asyncio.create_task(attempt(t)) for t in tokens]
-        await asyncio.sleep(0.05)  # the other four finish while the forced refresh is pending
-        gate.set()
-        await asyncio.gather(*tasks)
-    assert len(calls) == 6  # five cached reads + exactly one forced refresh
+
+@pytest.mark.asyncio
+async def test_failed_forced_refresh_keeps_previous_keys(key):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))
+        ms.fail = True
+        with pytest.raises(TokenValidationError):
+            await validate_arm_token(_token(private, "ghost"))
+        assert await validate_arm_token(_token(private))  # old keys still cached
+
+
+@pytest.mark.asyncio
+async def test_failure_backoff_with_empty_cache(key, monkeypatch):
+    private, jwk = key
+    clock = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    ms = FakeMicrosoft([jwk])
+    ms.fail = True
+    with _patched(ms):
+        with pytest.raises(TokenValidationError):
+            await validate_arm_token(_token(private))
+        calls = ms.calls
+        with pytest.raises(TokenValidationError, match="Signing keys unavailable"):
+            await validate_arm_token(_token(private))
+        assert ms.calls == calls  # within backoff: no HTTP call
+        clock[0] += mod.JWKS_FETCH_BACKOFF + 1
+        ms.fail = False
+        assert await validate_arm_token(_token(private))
+
+
+@pytest.mark.asyncio
+async def test_expired_cache_is_used_during_backoff(key, monkeypatch):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))
+        fetched_at, jwks = mod._jwks_cache[VALID_TENANT]
+        mod._jwks_cache[VALID_TENANT] = (fetched_at - mod.JWKS_CACHE_TTL - 1, jwks)  # expire it
+        ms.fail = True
+        assert await validate_arm_token(_token(private))  # fetch fails, expired keys used
+        calls = ms.calls
+        assert await validate_arm_token(_token(private))
+        assert ms.calls == calls  # backoff: no second attempt
 ```
+
+Check `tests/test_validate_signatures.py` for the exact helper names (`VALID_TENANT`, `_make_valid_claims` defaults), and adjust the import if `shared/tests` is not importable as `tests.` (see `shared/tests/conftest.py` / `__init__.py`). If not, copy the four helpers into the new file.
+
+The existing `_get_jwks` retries once on `httpx.TransportError`, so one failed fetch makes two `get` calls. The assertions above compare call counts before and after rather than hard-coding failure counts.
 
 - [ ] **Step 3: Run the tests and verify they fail**
 
-Run: `cd shared && uv run pytest tests/test_validate_signatures.py -k "cooldown or concurrent_unknown" -v`
-Expected: FAIL, with `AttributeError: ... _jwks_forced_refresh`, or a wrong fetch count.
+Run: `cd shared && uv run pytest tests/test_jwks_fetching.py -q`
+Expected: several FAIL, on call counts, `force` not accepted, or the missing `Signing keys unavailable`.
 
-- [ ] **Step 4: Implement**
+- [ ] **Step 4: Implement `_get_jwks`**
 
-In `validate.py`, below `JWKS_CACHE_TTL = 3600`:
+Replace lines 100-123 of `validate.py` with:
 
 ```python
-# An unknown kid forces a refetch at most this often per tenant: a stream of
-# forged kids must not turn the relay into a request amplifier toward Microsoft.
+# Cache for JWKS (public keys) - keyed by tenant ID
+_jwks_cache: dict[str, tuple[float, dict]] = {}
+JWKS_CACHE_TTL = 3600  # 1 hour
+
+# Fetches toward Microsoft are bounded however many requests arrive: one fetch
+# in flight per tenant, no refetch for a while after a failure, and an unknown
+# kid forces a refresh at most once per cooldown.
+JWKS_FETCH_BACKOFF = 10  # seconds
 JWKS_FORCED_REFRESH_COOLDOWN = 60  # seconds
+_jwks_locks: dict[str, asyncio.Lock] = {}
+_jwks_failed_at: dict[str, float] = {}
 _jwks_forced_refresh: dict[str, float] = {}
+
+
+async def _fetch_jwks(tenant_id: str) -> dict:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        url = _get_jwks_url(tenant_id)
+        try:
+            resp = await client.get(url)
+        except httpx.TransportError:
+            # Single retry on transient failure (connection error, timeout)
+            resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
+    """Microsoft's public keys for a tenant: cached, single-flight, backed off after failures.
+
+    force=True bypasses the TTL (unknown kid) and only replaces the cache on success.
+    """
+    cached = _jwks_cache.get(tenant_id)
+    if not force and cached is not None and (time.time() - cached[0]) < JWKS_CACHE_TTL:
+        return cached[1]  # fast path: a fetch in flight must not stall validations served from cache
+    lock = _jwks_locks.setdefault(tenant_id, asyncio.Lock())
+    async with lock:
+        cached = _jwks_cache.get(tenant_id)
+        fresh = cached is not None and (time.time() - cached[0]) < JWKS_CACHE_TTL
+        if fresh and not force:
+            return cached[1]
+        failed_at = _jwks_failed_at.get(tenant_id)
+        if failed_at is not None and time.monotonic() - failed_at < JWKS_FETCH_BACKOFF:
+            if cached is not None:
+                return cached[1]
+            raise TokenValidationError("Signing keys unavailable")
+        try:
+            jwks = await _fetch_jwks(tenant_id)
+        except Exception:
+            _jwks_failed_at[tenant_id] = time.monotonic()
+            if cached is not None:
+                return cached[1]  # keep serving the previous keys
+            raise
+        _jwks_failed_at.pop(tenant_id, None)
+        _jwks_cache[tenant_id] = (time.time(), jwks)
+        return jwks
 ```
 
-Replace the unknown-kid branch:
+Add `import asyncio` to the imports. Keep `global` statements out: the dicts are mutated, not rebound.
+
+Two consequences of the code above:
+
+- When a fetch fails and a cache exists, `_get_jwks` returns the old keys instead of raising. That is intended: an outage at Microsoft must not lock out users whose keys are cached.
+- A `TokenValidationError` raised from `_fetch_jwks` falls into the generic `except Exception` as well. That is fine, because both record the failure.
+
+- [ ] **Step 5: Implement the unknown-kid branch**
+
+Replace the unknown-kid branch in `validate_arm_token`:
 
 ```python
         if not signing_key:
-            # Key not found - maybe a key rollover; refresh, but not more than once per cooldown
+            # Maybe a key rollover: force a refresh, at most once per tenant per cooldown
             now = time.monotonic()
             last = _jwks_forced_refresh.get(tid)
             if last is None or now - last >= JWKS_FORCED_REFRESH_COOLDOWN:
                 _jwks_forced_refresh[tid] = now  # before the await: concurrent requests skip
-                _jwks_cache.pop(tid, None)
-                jwks = await _get_jwks(tid)
+                jwks = await _get_jwks(tid, force=True)
                 for key in jwks.get("keys", []):
                     if key.get("kid") == kid:
                         signing_key = key
                         break
 ```
 
-Drop the now-unneeded `global _jwks_cache` line in this branch. `pop` mutates the dict and does not rebind it.
+This removes the old `global _jwks_cache` and the `_jwks_cache.pop(tid, None)`.
 
-- [ ] **Step 5: Run all shared tests**
+- [ ] **Step 6: Run all shared tests**
 
 Run: `cd shared && uv run pytest -q`
-Expected: all pass. That includes the existing `test_unknown_kid_refetches_once`, a rollover with exactly one refetch, now covered by the fixture reset.
+Expected: all pass, including the existing `test_unknown_kid_refetches_once` and `test_unknown_kid_still_not_found_after_refetch`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add shared/src/shared_auth/validate.py shared/tests/test_validate_signatures.py
-git commit -m "Throttle forced JWKS refreshes to one per tenant per minute"
+git add shared/src/shared_auth/validate.py shared/tests/test_jwks_fetching.py shared/tests/test_validate_signatures.py
+git commit -m "Bound JWKS fetches: single flight, failure backoff, forced-refresh cooldown"
 ```
 
 ---
@@ -499,8 +682,25 @@ async def test_failed_auth_logs_keep_their_text(client, monkeypatch, caplog):
         await client.get("/ws", headers=bad)
     text = caplog.text
     assert "Agent auth rejected for 127.0.0.1: Invalid JWT format" in text
-    assert "Per-IP auth-failure limit exceeded for 127.0.0.1" in text
+    assert "Per-IP auth-failure limit exceeded for 127.0.0.1 (0 more since last report)" in text
+
+
+@pytest.mark.asyncio
+async def test_throttle_warning_is_logged_once_per_window(client, monkeypatch, caplog):
+    monkeypatch.setattr(mod, "RATE_LIMIT_IP_PER_MIN", 1)
+    clock = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    bad = {"Authorization": "Bearer bad"}
+    with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
+        for _ in range(6):  # 1 x 401, then 5 x 429
+            await client.get("/ws", headers=bad)
+        assert caplog.text.count("Per-IP auth-failure limit exceeded") == 1
+        clock[0] += mod.IP_THROTTLE_REPORT_INTERVAL + 1
+        await client.get("/ws", headers=bad)
+    assert "(4 more since last report)" in caplog.text
 ```
+
+Patching `mod.time.monotonic` affects the whole `time` module, including aiolimiter's and aiohttp's clocks. If that breaks the test (the bucket refilling, or timeouts), patch a module-level indirection instead: add `_now = time.monotonic` in `__main__.py`, use `_now()` in the helper, and patch `mod._now`.
 
 If `caplog` does not capture the relay logger, check how other relay tests assert log lines (`grep -rn caplog relay/tests`) and follow that. The relay logs through `logging.getLogger(__name__)` with JSON formatting.
 
@@ -526,11 +726,32 @@ async def _authenticate_upgrade(request: web.Request, kind: str) -> tuple[str | 
         return result, None
     ip_entry = _get_ip_limiter(client_ip)
     if not ip_entry.limiter.has_capacity():
-        logger.warning(f"Per-IP auth-failure limit exceeded for {client_ip}")
+        now = time.monotonic()
+        if now - ip_entry.last_report >= IP_THROTTLE_REPORT_INTERVAL:
+            logger.warning(f"Per-IP auth-failure limit exceeded for {client_ip} "
+                           f"({ip_entry.suppressed} more since last report)")
+            ip_entry.last_report, ip_entry.suppressed = now, 0
+        else:
+            ip_entry.suppressed += 1
         return None, web.Response(status=429, text="Too many failed attempts from this IP")
     await ip_entry.limiter.acquire()
     logger.warning(f"{kind} auth rejected for {client_ip}: {result}")
     return None, web.Response(status=401, text=result)
+```
+
+Extend `_TimedLimiter` (it already exists, shared by all limiters) and add the interval constant next to it:
+
+```python
+IP_THROTTLE_REPORT_INTERVAL = 60  # seconds between "limit exceeded" log lines per IP
+
+
+@dataclass
+class _TimedLimiter:
+    """Rate limiter with last-used timestamp for cleanup."""
+    limiter: AsyncLimiter
+    last_used: float = field(default_factory=time.monotonic)
+    last_report: float = float("-inf")  # last "limit exceeded" log line (per-IP limiters only)
+    suppressed: int = 0                  # throttled requests not logged since then
 ```
 
 In `handle_websocket`, replace everything from `# Per-IP rate limit` through `user_email = result` with:
@@ -560,6 +781,12 @@ Add two rows right after it:
 ```
 | `RELAY_TRUSTED_PROXIES` | Comma-separated CIDRs of reverse proxies whose client-IP header is trusted. Only set when clients cannot bypass the proxy. | (empty: use the peer address) |
 | `RELAY_CLIENT_IP_HEADER` | Header carrying the client IP from a trusted proxy; `X-Forwarded-For` is parsed right to left, any other header must hold one IP | `X-Forwarded-For` |
+```
+
+Below the table, add a short paragraph:
+
+```
+**Client IP behind a reverse proxy.** By default the relay keys the failed-auth limit on the TCP peer. Behind a proxy that is the proxy's address, which is safe: valid tokens never count against the limit. To key on the real client, set `RELAY_TRUSTED_PROXIES`, but only if clients cannot reach the relay except through those proxies. In `X-Forwarded-For` mode, every trusted proxy must append its peer to the header, which is the default for nginx (`$proxy_add_x_forwarded_for`), Traefik, Envoy and cloud load balancers. With a single-value header (`X-Real-IP`, `CF-Connecting-IP`, …), the outermost trusted proxy must overwrite it.
 ```
 
 In `security-tests/pentest_suite.py`, change the comment near line 440 to:
@@ -642,31 +869,35 @@ In `journey.py`, next to `_user_isolation`:
                 break
         if throttled_at is None:
             return False, f"no 429 within {cap} bad-token upgrades; last {last}"
+        agent_status, _ = clients.ws_upgrade("127.0.0.1", relay.port, "/ws", stub.mint(upn=FLOOD_AGENT_USER))
         reply = self._tunnel_connect(relay, stub.mint(), ip, targets)
-        ok = reply.get("type") == "tcp_connect_result" and reply.get("success") is True
-        return ok, f"429 after {throttled_at} bad-token upgrades; valid user then: {json.dumps(reply)}"
+        ok = (agent_status == 101 and reply.get("type") == "tcp_connect_result"
+              and reply.get("success") is True)
+        return ok, (f"429 after {throttled_at} bad-token upgrades; then valid /ws upgrade: HTTP {agent_status}, "
+                    f"valid /tunnel connect: {json.dumps(reply)}")
 ```
 
-Import `FAULT_TUNING` from `.stack` if `journey.py` does not already. In `_journey`, after `self._pentest_step(relay, stub, env, logs)`:
+Next to `OTHER_USER` / `PENTEST_USER` add `FLOOD_AGENT_USER = "flood-agent@netbridge.test"`. A second user is needed so the `/ws` upgrade does not displace the journey user's connected agent. Import `FAULT_TUNING` from `.stack` if `journey.py` does not already. In `_journey`, after `self._pentest_step(relay, stub, env, logs)`:
 
 ```python
         self.check("auth_flood_spares_valid_users", lambda: self._auth_flood(relay, stub, ip, targets))
 ```
 
-If the journey has a path where the relay runs without auth (for example `--relay-image` or exe mode with `--no-auth`), the step cannot apply: no failures are possible. Guard it the way `_pentest_step` guards exe mode, with `self.step(name, True, "skipped: relay runs without auth")`. Check `stack.py` for how auth mode is chosen. Only skip when auth really is off.
+The relay always runs with the auth stub, in both source and exe mode (`journey.py`, `Relay(..., auth=stub)`), so the step runs unguarded in both modes. In exe mode it runs in `e2e-windows.yml`, where the pentest suite is skipped, so fewer failures precede it.
 
 - [ ] **Step 4: Add a unit test for the step's decision logic**
 
 Follow the style of the existing `e2e/tests/test_journey_auth.py`, which fakes `clients` and the relay. Cover three cases:
-- 429 on attempt 3 followed by a successful tunnel connect: pass, and the detail contains `429 after 3`
+- 429 on attempt 3, then `/ws` 101 and a successful tunnel connect: pass, and the detail contains `429 after 3`
 - no 429 within the cap: fail
-- a 429 followed by a failed connect: fail
+- a 429, then `/ws` 101 and a failed connect: fail
+- a 429, then `/ws` 429 and a successful connect: fail
 
 - [ ] **Step 5: Run the e2e unit tests and the full journey**
 
 Run: `cd e2e && uv run pytest -q`, then the journey command from Step 1. All steps must pass, including:
 - `auth_flood_spares_valid_users`
-- the `_reconnect` and fault steps after it. They reconnect with valid tokens while the IP bucket is empty, which is the end-to-end proof.
+- the `_reconnect` and fault steps after it. They pass with the lowered limit. They do not prove anything about an empty bucket, because `_reconnect` restarts the relay; the flood step itself is that proof.
 
 - [ ] **Step 6: Commit**
 

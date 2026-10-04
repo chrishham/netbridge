@@ -35,7 +35,8 @@ That is an unthrottled request amplifier.
   from the same IP.
 - Failed authentication stays throttled per IP, so floods are cheap to reject
   and do not flood the logs unbounded.
-- Forced JWKS refreshes are bounded per tenant.
+- JWKS fetches toward Microsoft are bounded per tenant: single flight,
+  failure backoff, and a forced-refresh cooldown.
 - The fix works without any infrastructure change. An optional, off-by-default
   setting can recover the real client IP behind trusted proxies.
 
@@ -88,30 +89,79 @@ Details:
 - With `--no-auth` (dev/e2e only), authentication always succeeds, so the IP
   bucket is never used. That is acceptable for a mode that refuses to start
   without `NETBRIDGE_ALLOW_NO_AUTH`.
-- The 429 warning is logged on every throttled request, as today; no
-  log-rate-limiting is added.
+- **Bounded logging.** The 401 warning is already bounded by the bucket, to at
+  most `RELAY_RATE_IP_CONNECTIONS_PER_MIN` per IP per minute. The
+  `Per-IP auth-failure limit exceeded` warning is logged at most once per IP
+  per 60 s. When it is logged, it includes the number of throttled requests
+  suppressed since the last such line, e.g.
+  `Per-IP auth-failure limit exceeded for {ip} (12 more since last report)`.
+  Keep the suppression state on the `_TimedLimiter` entry, as two fields
+  `last_report: float` and `suppressed: int`, so the existing stale-entry
+  cleanup also clears it.
+- **Validation work while throttled.** The relay cannot tell a valid token
+  from a forged one without validating it, so any pre-validation shortcut would
+  lock out valid users. That is the bug being fixed.
+  - Missing headers, malformed JWTs and disallowed tenants are rejected
+    before any crypto or key fetch.
+  - The most expensive case is a forged token for an allowed tenant with a
+    known `kid`. It costs one RSA-2048 verify (tens of µs), which is small
+    next to accepting the TCP connection and parsing the HTTP upgrade. The
+    attacker pays the same per-connection cost.
+  - Key fetches are bounded by section 2.
+  - Volumetric floods are out of scope for an application-level limiter;
+    they belong to the edge (CDN or LB connection limits).
 
-### 2. Cooldown on forced JWKS refresh
+### 2. Bounded JWKS fetching
 
-In `validate_arm_token`, the unknown-kid branch pops the cache and refetches.
-Gate it with a per-tenant timestamp,
-`_jwks_forced_refresh: dict[str, float]`, and a constant
-`JWKS_FORCED_REFRESH_COOLDOWN = 60` (seconds):
+Moving authentication before the limiter means every request for an allowed
+tenant reaches `_get_jwks`. Today the shared per-IP bucket caps how often that
+happens, by accident. Three rules in `shared/src/shared_auth/validate.py`
+bound fetches toward Microsoft regardless of request rate:
 
-- If the tenant's last forced refresh was less than the cooldown ago, skip the
-  refetch. The token then fails with the existing
-  `Signing key not found: {kid}`.
-- Record the timestamp *before* awaiting the fetch, so concurrent requests
-  inside the window do not all refetch.
-- The normal TTL refresh (`JWKS_CACHE_TTL`, 1 h) is unchanged.
-- A failed forced fetch still counts as an attempt. The exception propagates as
-  today.
-- Microsoft key rollover still works. A new kid appears; the first request
-  carrying it refreshes, and legitimate tokens with the new kid succeed from
-  then on. Only a second *unknown* kid within 60 s is refused without a fetch.
+1. **Single flight per tenant.** `_get_jwks` takes a per-tenant `asyncio.Lock`
+   (`_jwks_locks: dict[str, asyncio.Lock]`, created on demand) around the
+   fetch. After acquiring it, it re-checks the cache. Concurrent cache misses,
+   for example at TTL expiry, cause one fetch; the rest wait and reuse the
+   result.
+2. **Failure backoff.** When a fetch fails (transport error, HTTP error,
+   invalid JSON), record `_jwks_failed_at[tid] = time.monotonic()`.
+   - For `JWKS_FETCH_BACKOFF = 10` seconds after a failure, further cache
+     misses for that tenant do not fetch. If a cached JWKS exists, even an
+     expired one, they use it; otherwise they raise `TokenValidationError("Signing keys unavailable")`.
+   - An expired-but-present cache keeps being used through a backoff, so a
+     Microsoft outage does not lock out users whose keys are cached.
+3. **Forced refresh, rate-limited and non-destructive.** The unknown-kid branch
+   no longer evicts the cache before fetching. It calls
+   `_get_jwks(tid, force=True)`. That bypasses the TTL check, still respects
+   single flight and backoff, and replaces the cache only on success. A failed
+   forced fetch leaves the previous keys in place.
+   - A forced refresh happens at most once per tenant per
+     `JWKS_FORCED_REFRESH_COOLDOWN = 60` seconds, tracked in
+     `_jwks_forced_refresh: dict[str, float]`.
+   - The timestamp is recorded before the fetch is awaited, so concurrent
+     unknown-kid requests in the window do not fetch.
+   - Within the cooldown, an unknown kid fails with the existing
+     `Signing key not found: {kid}`.
 
-`shared/tests` must reset `_jwks_forced_refresh` wherever they reset
-`_jwks_cache`.
+Key rollover trade-off:
+
+- Microsoft publishes new signing keys in the JWKS well before it issues tokens
+  with them. The normal TTL refresh (`JWKS_CACHE_TTL`, 1 h, unchanged) picks
+  them up ahead of use, so a legitimate token with an unknown kid is already
+  rare.
+- Worst case: an attacker has just used the forced refresh, *and* Microsoft
+  starts signing with a key published less than an hour earlier. Tokens with
+  that kid then fail for up to 60 s, and clients retry.
+- That bounded, unlikely window is accepted in exchange for capping forced
+  fetches at 1/min/tenant. The alternative is unbounded amplification toward
+  Microsoft.
+
+`shared/tests` must reset `_jwks_forced_refresh`, `_jwks_failed_at` and
+`_jwks_locks` wherever they reset `_jwks_cache`. Tests for rules 1-3 must run
+against the real `_get_jwks`, with `httpx` mocked at the transport (for example
+`httpx.MockTransport`, or by patching `httpx.AsyncClient.get`), not by
+patching `_get_jwks` itself. Otherwise single flight and backoff go
+untested.
 
 ### 3. Optional real client IP behind trusted proxies (off by default)
 
@@ -132,8 +182,22 @@ Gate it with a per-tenant timestamp,
     parses as an IP.
   - If nothing usable is found, fall back to `request.remote`.
 
-The function feeds both the log lines and the IP bucket key. Document in the
-README that it must only be enabled when the proxy chain cannot be bypassed.
+The function feeds both the log lines and the IP bucket key.
+
+Requirements for trusting a proxy, documented in the README next to the
+settings:
+
+- Clients must not be able to reach the relay except through the trusted
+  proxies.
+- In `X-Forwarded-For` mode, each trusted proxy must *append* its peer address
+  (standard behaviour for nginx `$proxy_add_x_forwarded_for`, Traefik, Envoy,
+  cloud LBs). Because the walk is right to left over trusted hops, any prefix
+  the client forged is never reached.
+- In single-value mode (`X-Real-IP`, `CF-Connecting-IP`, …), the outermost
+  trusted proxy must *overwrite* the header with the peer address. The relay
+  cannot verify this; a proxy that passes the client's value through lets
+  clients choose their bucket key.
+
 The production origin can be bypassed today, so production stays on the
 default.
 
@@ -143,7 +207,9 @@ failed-auth throttle (section 1). It cannot affect valid users.
 ### 4. Tests
 
 Relay (`relay/tests/test_relay_limits.py`, alongside the existing per-IP test,
-which changes):
+which changes). Include a test that the `Per-IP auth-failure limit exceeded`
+warning is logged once per window, with the suppressed count on the next
+report:
 
 - With `RATE_LIMIT_IP_PER_MIN` patched to 2 on an auth-required relay:
   - two bad-token upgrades get 401, the third gets 429 with the new text
@@ -168,34 +234,51 @@ which changes):
 
 Shared (`shared/tests`):
 
-- An unknown kid triggers one refetch.
-- A second unknown kid within the cooldown triggers no fetch (assert the fetch
-  call count).
-- After the cooldown (monkeypatched clock), it refetches again.
+All of these run against the real `_get_jwks`, with HTTP mocked at the
+transport:
+
+- An unknown kid triggers one forced fetch.
+- A second unknown kid within the cooldown triggers no fetch.
+- After the cooldown (monkeypatched clock), a forced fetch happens again.
 - A rolled-over valid kid succeeds through the first forced refresh.
+- Concurrent cache misses (empty cache, N concurrent validations) cause exactly
+  one HTTP fetch.
+- Concurrent unknown-kid validations cause exactly one forced HTTP fetch.
+- A failed forced fetch keeps the previous keys: a token with a known kid still
+  validates afterwards.
+- After a fetch failure with an empty cache, further validations within the
+  backoff make no HTTP call and fail with `Signing keys unavailable`. After
+  the backoff they fetch again.
+- An expired cache plus a failing fetch: validation uses the expired keys, and
+  no second fetch happens within the backoff.
 
-E2E (`e2e/src/netbridge_e2e/journey.py`, source mode only, after
-`pentest_suite` and before `_reconnect`):
+E2E (`e2e/src/netbridge_e2e/journey.py`, after `pentest_suite` and before
+`_reconnect`):
 
+- The step runs in both journey modes. The relay always runs with the auth
+  stub (source and exe mode), so the step also runs against the Windows exes'
+  relay in `e2e-windows.yml`.
 - Lower `FAULT_TUNING["RELAY_RATE_IP_CONNECTIONS_PER_MIN"]` from 600 to the
-  production default of 30. Valid reconnects no longer touch it, so the fault
-  steps no longer need it raised. This in itself proves that the fault
-  journey's many reconnects from 127.0.0.1 are not throttled.
-- The new step, `auth_flood_spares_valid_users`:
-  - send bad-token upgrades to `/tunnel` until one returns 429 (at most 40
-    attempts)
-  - then open a `/tunnel` session with a valid token and complete one
-    `tcp_connect` to the HTTP target
-  - pass if a 429 was seen and the valid connect succeeded
+  production default of 30. Valid reconnects no longer touch it. The fault
+  steps passing with this lowered limit shows that valid reconnects are not
+  throttled. It does not show it under an *empty* bucket: `_reconnect`
+  restarts the relay, which resets the in-memory buckets.
+- The new step, `auth_flood_spares_valid_users`, is the proof under an empty
+  bucket:
+  - send bad-token upgrades to `/tunnel` until one returns 429 (capped, see
+    below)
+  - then, with the bucket still empty:
+    - a valid-token `/ws` upgrade, for a second user so the journey's agent
+      is not displaced, must return 101
+    - a `/tunnel` session with the journey user's valid token must complete
+      one `tcp_connect` to the HTTP target
+  - pass if a 429 was seen and both valid checks succeeded
   - the detail reports the attempt count at which 429 appeared
-- The steps that follow (`_reconnect` and the fault steps) reconnect with
-  valid tokens while the bucket is still empty. Their passing is the
-  end-to-end proof.
-- The auth matrix (24 failures) and the pentest suite run *before* this step,
-  under the 30/min limit. Check whether their combined failed attempts within
-  one minute stay below 30. If not, keep the override at the smallest value
-  above their count, and make the flood step's attempt cap that value + 10.
-  The bucket refills continuously (a leaky bucket), so pick the value from a
+- The auth matrix (24 failures), and in source mode the pentest suite, run
+  *before* this step under the lowered limit. Measure their combined failed
+  attempts. If the count exceeds 20, set the override to the measured count
+  + 15 instead of 30. The flood step's attempt cap is the override + 10. The
+  bucket refills continuously (a leaky bucket), so pick the value from a
   measured count plus headroom, not by guesswork.
 - The pentest's `rapid_connection_dos` (skipped in the journey) uses a valid
   token and expects 429 within 35 connections. The per-user limit (10/min)
