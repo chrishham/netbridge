@@ -130,6 +130,10 @@ bound fetches toward Microsoft regardless of request rate:
      expired one, they use it; otherwise they raise `TokenValidationError("Signing keys unavailable")`.
    - An expired-but-present cache keeps being used through a backoff, so a
      Microsoft outage does not lock out users whose keys are cached.
+   - Stale keys are served for at most `JWKS_MAX_STALE = 86400` seconds
+     after their fetch. Past that, a failed fetch (or a backoff) raises
+     `Signing keys unavailable`, so a key Microsoft revoked cannot keep
+     validating indefinitely while fetches fail.
 3. **Forced refresh, rate-limited and non-destructive.** The unknown-kid branch
    no longer evicts the cache before fetching. It calls
    `_get_jwks(tid, force=True)`. That bypasses the TTL check, still respects
@@ -258,8 +262,8 @@ E2E (`e2e/src/netbridge_e2e/journey.py`, after `pentest_suite` and before
 - The step runs in both journey modes. The relay always runs with the auth
   stub (source and exe mode), so the step also runs against the Windows exes'
   relay in `e2e-windows.yml`.
-- Lower `FAULT_TUNING["RELAY_RATE_IP_CONNECTIONS_PER_MIN"]` from 600 to the
-  production default of 30. Valid reconnects no longer touch it. The fault
+- Lower `FAULT_TUNING["RELAY_RATE_IP_CONNECTIONS_PER_MIN"]` from 600 to near
+  the production default (the measured value below). Valid reconnects no longer touch it. The fault
   steps passing with this lowered limit shows that valid reconnects are not
   throttled. It does not show it under an *empty* bucket: `_reconnect`
   restarts the relay, which resets the in-memory buckets.
@@ -276,10 +280,11 @@ E2E (`e2e/src/netbridge_e2e/journey.py`, after `pentest_suite` and before
   - the detail reports the attempt count at which 429 appeared
 - The auth matrix (24 failures), and in source mode the pentest suite, run
   *before* this step under the lowered limit. Measure their combined failed
-  attempts. If the count exceeds 20, set the override to the measured count
-  + 15 instead of 30. The flood step's attempt cap is the override + 10. The
-  bucket refills continuously (a leaky bucket), so pick the value from a
-  measured count plus headroom, not by guesswork.
+  attempts and set the override to that count + 15. The matrix alone makes
+  24, so the override is at least 39, not the production 30. The flood
+  step's attempt cap is the override + 10. The bucket refills continuously
+  (a leaky bucket), so the value comes from a measured count plus headroom,
+  not guesswork.
 - The pentest's `rapid_connection_dos` (skipped in the journey) uses a valid
   token and expects 429 within 35 connections. The per-user limit (10/min)
   still provides that. Update its comment, which mentions the per-IP limit,

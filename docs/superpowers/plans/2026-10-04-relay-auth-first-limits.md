@@ -24,7 +24,7 @@
   - the `Agent auth rejected for {ip}: {reason}` and `Tunnel auth rejected for {ip}: {reason}` warnings
   - the per-user `Too many connection attempts` 429
 - Throttled-failure log: `Per-IP auth-failure limit exceeded for {ip}`.
-- JWKS fetching: one fetch in flight per tenant; `JWKS_FETCH_BACKOFF = 10` s after a failure (serve stale keys if cached, else `Signing keys unavailable`); forced refresh at most once per `JWKS_FORCED_REFRESH_COOLDOWN = 60` s per tenant, timestamp recorded before the await, cache replaced only on success.
+- JWKS fetching: one fetch in flight per tenant; `JWKS_FETCH_BACKOFF = 10` s after a failure (serve cached keys, even expired, if fetched less than `JWKS_MAX_STALE = 86400` s ago, else `Signing keys unavailable`); forced refresh at most once per `JWKS_FORCED_REFRESH_COOLDOWN = 60` s per tenant, timestamp recorded before the await, cache replaced only on success.
 - Log bounding: `Per-IP auth-failure limit exceeded for {ip} ({n} more since last report)` at most once per IP per 60 s.
 - Topology independence:
   - no hard-coded proxy vendor, header or CIDR
@@ -50,12 +50,12 @@ These are input classes the spec implies and the base design could miss. Each ha
 **Files:**
 - Modify: `shared/src/shared_auth/validate.py`: `_jwks_cache` / `_get_jwks` (lines 100-123), and the unknown-kid branch in `validate_arm_token` (around lines 225-236)
 - Create: `shared/tests/test_jwks_fetching.py`
-- Modify: `shared/tests/test_validate_signatures.py`: the `reset_caches` fixture at line 104, and the two inline `_jwks_cache` resets near lines 333 and 400
+- Modify: `shared/tests/test_validate_signatures.py`: the `reset_caches` fixture at line 104, the two inline `_jwks_cache` resets near lines 333 and 400, and the last assertion of `test_key_rotation_via_real_get_jwks` (line 261)
 
 **Interfaces:**
 - Produces:
   - `async def _get_jwks(tenant_id: str, force: bool = False) -> dict`
-  - constants `JWKS_FORCED_REFRESH_COOLDOWN = 60` and `JWKS_FETCH_BACKOFF = 10`
+  - constants `JWKS_FORCED_REFRESH_COOLDOWN = 60`, `JWKS_FETCH_BACKOFF = 10` and `JWKS_MAX_STALE = 86400`
   - module state `_jwks_cache: dict[str, tuple[float, dict]]` (unchanged shape: `(time.time() at fetch, jwks)`), `_jwks_locks: dict[str, asyncio.Lock]`, `_jwks_failed_at: dict[str, float]` and `_jwks_forced_refresh: dict[str, float]`. The last two hold `time.monotonic()` values.
   - new error text: `Signing keys unavailable`
 - Keeps:
@@ -73,6 +73,24 @@ In `shared/tests/test_validate_signatures.py`'s `reset_caches`, and next to the 
 ```
 
 Those existing tests patch `_get_jwks` with a one-argument fake. After this task, `validate_arm_token` calls `_get_jwks(tid, force=True)`, so update each such fake to accept `force=False` (`grep -n "def fake_get_jwks" shared/tests/*.py`). Fakes passed as `return_value=` need no change.
+
+`test_key_rotation_via_real_get_jwks` (line 201) runs against the real `_get_jwks`. Its last check validates token A after the rollover to key B and expects a third fetch (`assert len(requests) == 3`). The forced refresh for kid B, a few lines earlier, started the cooldown, so after this task token A fails without fetching. Replace the tail of the test:
+
+```python
+            # Token A should now fail (key no longer served). The forced refresh for
+            # kid B started the cooldown, so this unknown kid does not fetch again.
+            with pytest.raises(TokenValidationError, match="Signing key not found"):
+                await validate_arm_token(token_a)
+            assert len(requests) == 2
+
+            # After the cooldown an unknown kid may force one more refresh
+            mod._jwks_forced_refresh[VALID_TENANT] -= mod.JWKS_FORCED_REFRESH_COOLDOWN + 1
+            with pytest.raises(TokenValidationError, match="Signing key not found"):
+                await validate_arm_token(token_a)
+            assert len(requests) == 3
+```
+
+Check the tenant constant the test's claims use (`_make_valid_claims` sets `tid`), and use that name in place of `VALID_TENANT` if it differs.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -261,6 +279,21 @@ async def test_expired_cache_is_used_during_backoff(key, monkeypatch):
         calls = ms.calls
         assert await validate_arm_token(_token(private))
         assert ms.calls == calls  # backoff: no second attempt
+
+
+@pytest.mark.asyncio
+async def test_keys_older_than_max_stale_are_not_served(key):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))
+        fetched_at, jwks = mod._jwks_cache[VALID_TENANT]
+        mod._jwks_cache[VALID_TENANT] = (fetched_at - mod.JWKS_MAX_STALE - 1, jwks)
+        ms.fail = True
+        with pytest.raises(TokenValidationError):
+            await validate_arm_token(_token(private))  # fetch fails, keys too old to serve
+        with pytest.raises(TokenValidationError, match="Signing keys unavailable"):
+            await validate_arm_token(_token(private))  # within backoff
 ```
 
 Check `tests/test_validate_signatures.py` for the exact helper names (`VALID_TENANT`, `_make_valid_claims` defaults), and adjust the import if `shared/tests` is not importable as `tests.` (see `shared/tests/conftest.py` / `__init__.py`). If not, copy the four helpers into the new file.
@@ -286,6 +319,9 @@ JWKS_CACHE_TTL = 3600  # 1 hour
 # kid forces a refresh at most once per cooldown.
 JWKS_FETCH_BACKOFF = 10  # seconds
 JWKS_FORCED_REFRESH_COOLDOWN = 60  # seconds
+# During a Microsoft outage expired keys keep being served, but not forever:
+# a key Microsoft revoked must stop working within a day.
+JWKS_MAX_STALE = 86400  # seconds
 _jwks_locks: dict[str, asyncio.Lock] = {}
 _jwks_failed_at: dict[str, float] = {}
 _jwks_forced_refresh: dict[str, float] = {}
@@ -317,16 +353,17 @@ async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
         fresh = cached is not None and (time.time() - cached[0]) < JWKS_CACHE_TTL
         if fresh and not force:
             return cached[1]
+        usable = cached is not None and (time.time() - cached[0]) < JWKS_MAX_STALE
         failed_at = _jwks_failed_at.get(tenant_id)
         if failed_at is not None and time.monotonic() - failed_at < JWKS_FETCH_BACKOFF:
-            if cached is not None:
+            if usable:
                 return cached[1]
             raise TokenValidationError("Signing keys unavailable")
         try:
             jwks = await _fetch_jwks(tenant_id)
         except Exception:
             _jwks_failed_at[tenant_id] = time.monotonic()
-            if cached is not None:
+            if usable:
                 return cached[1]  # keep serving the previous keys
             raise
         _jwks_failed_at.pop(tenant_id, None)
@@ -338,7 +375,7 @@ Add `import asyncio` to the imports. Keep `global` statements out: the dicts are
 
 Two consequences of the code above:
 
-- When a fetch fails and a cache exists, `_get_jwks` returns the old keys instead of raising. That is intended: an outage at Microsoft must not lock out users whose keys are cached.
+- When a fetch fails and the cached keys are less than `JWKS_MAX_STALE` old, `_get_jwks` returns them instead of raising. That is intended: an outage at Microsoft must not lock out users whose keys are cached. Past a day, a revoked key must not keep working, so validation fails until a fetch succeeds.
 - A `TokenValidationError` raised from `_fetch_jwks` falls into the generic `except Exception` as well. That is fine, because both record the failure.
 
 - [ ] **Step 5: Implement the unknown-kid branch**
@@ -689,7 +726,7 @@ async def test_failed_auth_logs_keep_their_text(client, monkeypatch, caplog):
 async def test_throttle_warning_is_logged_once_per_window(client, monkeypatch, caplog):
     monkeypatch.setattr(mod, "RATE_LIMIT_IP_PER_MIN", 1)
     clock = [1000.0]
-    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mod, "_now", lambda: clock[0])  # report clock only; aiolimiter keeps the real one
     bad = {"Authorization": "Bearer bad"}
     with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
         for _ in range(6):  # 1 x 401, then 5 x 429
@@ -700,7 +737,7 @@ async def test_throttle_warning_is_logged_once_per_window(client, monkeypatch, c
     assert "(4 more since last report)" in caplog.text
 ```
 
-Patching `mod.time.monotonic` affects the whole `time` module, including aiolimiter's and aiohttp's clocks. If that breaks the test (the bucket refilling, or timeouts), patch a module-level indirection instead: add `_now = time.monotonic` in `__main__.py`, use `_now()` in the helper, and patch `mod._now`.
+The test patches `mod._now`, not `mod.time.monotonic`. Patching `time.monotonic` would change the whole `time` module, including the event-loop clock aiolimiter refills from, so the bucket would refill when the fake clock jumps and the test would see a 401 instead of a 429.
 
 If `caplog` does not capture the relay logger, check how other relay tests assert log lines (`grep -rn caplog relay/tests`) and follow that. The relay logs through `logging.getLogger(__name__)` with JSON formatting.
 
@@ -726,7 +763,7 @@ async def _authenticate_upgrade(request: web.Request, kind: str) -> tuple[str | 
         return result, None
     ip_entry = _get_ip_limiter(client_ip)
     if not ip_entry.limiter.has_capacity():
-        now = time.monotonic()
+        now = _now()
         if now - ip_entry.last_report >= IP_THROTTLE_REPORT_INTERVAL:
             logger.warning(f"Per-IP auth-failure limit exceeded for {client_ip} "
                            f"({ip_entry.suppressed} more since last report)")
@@ -743,6 +780,7 @@ Extend `_TimedLimiter` (it already exists, shared by all limiters) and add the i
 
 ```python
 IP_THROTTLE_REPORT_INTERVAL = 60  # seconds between "limit exceeded" log lines per IP
+_now = time.monotonic  # report clock, patched by tests without touching aiolimiter's clock
 
 
 @dataclass
@@ -838,9 +876,7 @@ uv run --project e2e python -m netbridge_e2e --mode source --work /tmp/e2e-flood
 grep -c "auth rejected" /tmp/e2e-flood/logs/relay-*.log
 ```
 
-Pick `IP_FAILURE_LIMIT`:
-- `30` if the measured count is ≤ 20, leaving headroom for continuous refill timing
-- otherwise the measured count + 15
+Set the override to the measured count + 15. The auth matrix alone makes 24 failures, so the value is at least 39; the production default of 30 would throttle the matrix itself. The 15 leaves headroom so the flood step, not the earlier steps, empties the bucket.
 
 Record the number and the reason in the commit message.
 
