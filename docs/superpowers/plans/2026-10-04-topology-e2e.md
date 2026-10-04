@@ -374,53 +374,48 @@ def test_oversized_head_answers_400(edge, upstream):
     assert upstream.heads == []
 
 
-class Sink(Upstream):
-    """Answers 101 and then reads nothing until `release` is set: the edge has to queue what it gets."""
+class RaggedEnd(socket.socket):
+    """A client transport that ends without close_notify: recv raises SSLEOFError where a plain socket returns b""."""
 
-    def __init__(self):
-        self.release, self.received = threading.Event(), 0
-        super().__init__()
+    def recv(self, n, *args):
+        data = super().recv(n, *args)
+        if not data:
+            raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+        return data
 
-    def _handle(self, c):
-        with c:
-            try:
-                buf = b""
-                while b"\r\n\r\n" not in buf:
-                    chunk = c.recv(65536)
-                    if not chunk:
-                        return
-                    buf += chunk
-                head, _, rest = buf.partition(b"\r\n\r\n")
-                self.heads.append(head + b"\r\n\r\n")
-                self.received += len(rest)
-                c.sendall(self.answer)
-                self.release.wait(10)
-                while data := c.recv(65536):
-                    self.received += len(data)
-            except OSError:
-                pass
+    def pending(self):
+        return 0
 
 
-def test_ragged_client_end_still_delivers_what_the_edge_queued(tmp_path):
-    sink = Sink()
-    e = make_edge(tmp_path, sink.address)
+def test_ragged_client_end_still_delivers_what_the_edge_queued(edge):
+    """Drives the pump directly, so an SSLEOFError escaping it fails the test whatever the timing."""
+    a, peer = socket.socketpair()
+    client = RaggedEnd(fileno=a.detach())
+    up, sink = socket.socketpair()
+    payload = os.urandom(4 * 1024 * 1024)  # more than MAX_BUFFERED plus the socket buffers
+    got = bytearray()
+
+    def send():
+        peer.sendall(payload)
+        peer.shutdown(socket.SHUT_WR)  # the client's end arrives behind its data
+
+    def drain():
+        time.sleep(0.3)  # meanwhile the edge queues up to MAX_BUFFERED for the upstream
+        while chunk := sink.recv(65536):
+            got.extend(chunk)
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (send, drain)]
     try:
-        s = tls(e)
-        s.sendall(get())
-        read_until(s, b"\r\n\r\n")
-        payload = 512 * 1024  # under MAX_BUFFERED plus the loopback buffers: sendall does not block
-        s.sendall(b"x" * payload)
-        # end TCP under the TLS session without close_notify: the edge sees a ragged EOF (SSLEOFError or b"",
-        # depending on the OpenSSL build) after the data, while most of it still waits for the sink
-        raw = socket.socket(fileno=s.detach())
-        raw.shutdown(socket.SHUT_WR)  # a FIN, unlike an RST, never discards bytes still in flight
-        sink.release.set()
-        assert wait_until(lambda: sink.received == payload, 5), f"sink got {sink.received} of {payload}"
-        assert wait_until(lambda: e.active() == 0)
-        raw.close()
+        for t in threads:
+            t.start()
+        edge._pump(client, up)  # returns once everything the client sent is delivered
+        up.close()  # the sink sees EOF
+        for t in threads:
+            t.join(5)
+        assert len(got) == len(payload) and bytes(got) == payload
     finally:
-        e.close()
-        sink.close()
+        for s in (client, peer, up, sink):
+            s.close()
 
 
 def test_upstream_down_answers_502(tmp_path):
@@ -857,7 +852,7 @@ class EdgeProxy:
             room = {s: 0 if s in ended else MAX_BUFFERED - len(pending[other[s]]) for s in other}
             readers = [s for s in other if (room[s] > 0 and not read_wants_write[s]) or write_wants_read[s]]
             writers = [s for s in other if (pending[s] and not write_wants_read[s]) or read_wants_write[s]]
-            if room[client] > 0 and client.pending():
+            if room[client] > 0 and client.pending() and not read_wants_write[client]:
                 ready = {client}  # decrypted bytes already inside the SSL object are invisible to select
             else:
                 readable, writable, _ = select.select(readers, writers, [], TICK)
@@ -1394,6 +1389,27 @@ def test_edge_relay_down_counts_502s_from_during_the_stop(j, monkeypatch):
     monkeypatch.setattr(journey.time, "sleep", lambda _: pytest.fail("no wait needed"))
     ok, detail = j._edge_relay_down(edge, agent, proxy, MARKS, before)
     assert ok, detail
+
+
+def test_reconnect_snapshots_502s_before_stopping_the_relay(j, monkeypatch):
+    class Stop(Exception):
+        pass
+
+    edge = fake_edge()
+    agent, proxy = SimpleNamespace(name="agent", logs=Logs(AGENT_502)), SimpleNamespace(name="proxy", logs=Logs(PROXY_502))
+
+    def start():
+        raise Stop  # the rest of _reconnect is not under test
+
+    # both clients meet the 502 while relay.stop() is still running
+    relay = SimpleNamespace(stop=lambda: edge.bad_gateways.update({"/ws": 1, "/tunnel": 1}), start=start)
+    results = {}
+    monkeypatch.setattr(j, "check", lambda name, fn: results.setdefault(name, fn()))
+    monkeypatch.setattr(journey, "EDGE_502_WAIT", 0.2)
+    monkeypatch.setattr(journey.time, "sleep", lambda _: None)
+    with pytest.raises(Stop):
+        j._reconnect(relay, agent, proxy, "10.0.0.1", None, edge)
+    assert results["edge_relay_down_502"][0], results
 
 
 def test_handshake_502_pattern_matches_both_clients():
