@@ -43,7 +43,7 @@ The edge is an in-process proxy in the driver, written in the same style as `fau
 For each accepted connection, the edge:
 
 1. **Terminates TLS** with a server certificate for `localhost` and `127.0.0.1`, signed by a CA created for the run.
-2. **Reads the HTTP/1.1 request head**, up to 16 KiB. If the head is malformed or too large, it answers `400` and closes.
+2. **Reads the HTTP/1.1 request head**, up to 64 KiB (the relay itself accepts 32 KiB header fields for large Entra ID tokens). If the head is malformed or too large, it answers `400` and closes.
 3. **Rewrites the head:**
    - It appends the peer to `X-Forwarded-For`, either as `ip` or as `ip:port` (`xff_port` option). Existing fields from the client are kept, as Traefik and ARR keep them.
    - If a `prefix` is configured, it removes that prefix from the path. A request outside the prefix gets `404`.
@@ -70,7 +70,7 @@ client --wss--> FaultProxy (TCP) --> edge (TLS, HTTP) --ws--> relay
 ```
 
 - The fault links stay on the client side of the edge. A cut or a blackhole then behaves like a network fault between the user and the proxy, which is the realistic place for one. Fault steps work unchanged, because the FaultProxy forwards TLS bytes as readily as plain ones.
-- Clients get `NETBRIDGE_CA_BUNDLE=work/edge/ca.pem`. Both the agent and the proxy build their SSL context in `shared_auth.connection.create_tunnel_ssl_context`. That function adds this CA to the default store and keeps verification on. No `NETBRIDGE_VERIFY_SSL=false` is used anywhere.
+- Clients get `NETBRIDGE_CA_BUNDLE=work/edge/ca.pem`, `NETBRIDGE_VERIFY_SSL=true`, and no inherited `NETBRIDGE_ALLOW_INSECURE`. Both the agent and the proxy build their SSL context in `shared_auth.connection.create_tunnel_ssl_context`. That function adds this CA to the default store and keeps verification on. No `NETBRIDGE_VERIFY_SSL=false` is used anywhere.
 - The client relay URL becomes `wss://127.0.0.1:<link port><prefix>/ws` for the agent and `/tunnel` for the proxy. The URL always includes the explicit path, as the edge's prefix option requires.
 - The relay gets `RELAY_TRUSTED_PROXIES=127.0.0.1/32` and `RELAY_CLIENT_IP_HEADER=X-Forwarded-For`.
 - The driver's own probes, the auth matrix and the pentest suite keep talking to the relay directly. They test the relay, not the path.
@@ -102,7 +102,7 @@ Profiles keep both clouds' quirks covered without doubling CI time:
 - **`edge_relay_down_502`:** during the existing relay restart, the relay stays down until both clients have retried through the edge and received its `502` (at most 30 s; reconnect backoff starts at 5 s). The `reconnect` step that follows proves they treat it as transient.
 - **`edge_idle_closes_dead_link`:** this is the counter-proof that the idle timer is real. A raw TLS connection through the edge with no traffic must be closed by the edge within `idle_timeout + 5` s.
 
-Every existing step runs unchanged through the edge. That includes the socks5 and HTTP paths, the errors, isolation, the flood, relay restart and reconnect, and all link faults. Because they still pass, the edge adds no breakage.
+Every existing step runs unchanged through the edge. That includes the socks5 and HTTP paths, the errors, isolation, relay restart and reconnect, and all link faults. The driver's own probes (auth matrix, the existing flood step, pentest) stay direct to the relay, as the Wiring section says; `edge_client_ip` is the flood that goes through the edge. Because they still pass, the edge adds no breakage.
 
 ### Default (no `--edge`) runs
 

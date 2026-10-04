@@ -15,7 +15,7 @@
 - No product code changes. If one turns out to be needed, it is a compatibility finding: stop, record it, and fix it with its own test in a separate commit.
 - Default (no `--edge`) runs behave exactly as today: plain `ws://`, no edge, and `RELAY_TRUSTED_PROXIES` unset.
 - Edge profiles: `traefik` = `xff_port=False, prefix=""`; `arr` = `xff_port=True, prefix="/netbridge"`. Default is `traefik` in source mode and `arr` in exe mode. `--edge-profile` overrides the default.
-- Edge head cap 16 KiB, then `400`. A request outside the prefix gets `404`. If the relay is unreachable, the edge answers `502`.
+- Edge head cap 64 KiB (the relay accepts 32 KiB header fields), then `400`. A request outside the prefix gets `404`. If the relay is unreachable, the edge answers `502`.
 - e2e `idle_timeout` = 25 s, against heartbeats of 10 s (`CLIENT_TUNING` / `FAULT_TUNING`, unchanged).
 - Relay env with `--edge`: `RELAY_TRUSTED_PROXIES=127.0.0.1/32`, `RELAY_CLIENT_IP_HEADER=X-Forwarded-For`.
 - Client URLs with `--edge`: `wss://127.0.0.1:<link port><prefix>/ws` (agent) and `.../tunnel` (proxy). Certificate SANs: DNS `localhost` and IP `127.0.0.1`.
@@ -30,6 +30,7 @@
 2. **Decrypted bytes buffered inside the SSL object**: `select` does not see them. A large transfer in both directions at once must not stall or deadlock. Pinned by `test_large_payload_round_trips` (32 MiB each way against an echo that blocks on its own writes).
 3. **A request head trickled across many segments**: it must still parse. Pinned by `test_trickled_head_is_parsed`.
 4. **Bytes sent in the same segment as the head** (a client pipelining its first frame): they must be forwarded, not dropped. Pinned by `test_bytes_after_head_are_forwarded`.
+7. **TLS reads that need a write and writes that need a read** (post-handshake records): the pump retries both operations on either readiness and tracks `SSLWantWriteError` on reads and `SSLWantReadError` on writes, so neither spins nor stalls; the server sends no session tickets (`num_tickets = 0`). No unit test can force these states deterministically: the code is the guard, and the 32 MiB test plus the journey are the net.
 6. **A spoofed X-Forwarded-For from a direct client**: the relay must key on the edge's peer, never on what the client wrote. Pinned by `test_listening_on_all_interfaces_appends_the_real_peer` and the journey's `edge_appends_peer`.
 5. **Client-supplied forwarding headers**: repeated `X-Forwarded-For` fields merge in order into one field, and a client's `X-Forwarded-Proto` is replaced, not duplicated. Pinned by `test_repeated_xff_fields_merge_in_order` and `test_xff_appended_bare_ip_and_proto_replaced`.
 
@@ -275,6 +276,14 @@ def test_head_reaches_the_relay_rewritten(edge, upstream):
     assert edge.accepted == 1
 
 
+def test_large_authorization_header_passes(edge, upstream):
+    """Entra ID tokens with many groups exceed 12 KiB; the relay accepts 32 KiB fields, so must the edge."""
+    with tls(edge) as s:
+        s.sendall(get(extra=f"Authorization: Bearer {'a' * 30_000}\r\n"))
+        assert read_until(s, b"\r\n\r\n").startswith(b"HTTP/1.1 101")
+    assert b"a" * 30_000 in upstream.heads[0]
+
+
 def test_trickled_head_is_parsed(edge, upstream):
     with tls(edge) as s:
         for b in get():
@@ -496,7 +505,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 TICK = 0.2
-MAX_HEAD = 16 * 1024
+MAX_HEAD = 64 * 1024  # the relay itself accepts 32 KiB header fields (large Entra ID tokens)
 HANDSHAKE_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 5.0
 MAX_BUFFERED = 1024 * 1024  # per direction, toward a side that is not reading
@@ -634,6 +643,7 @@ class EdgeProxy:
         self.ca_path, cert, key = make_tls_material(tls_dir)
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.load_cert_chain(cert, key)
+        self._ctx.num_tickets = 0  # no post-handshake session tickets for the pump to carry
         self._srv = socket.create_server((host, 0))
         self.port = self._srv.getsockname()[1]
         self.accepted = 0
@@ -744,7 +754,7 @@ class EdgeProxy:
             self._track(socks, 1, upstream)
             upstream.sendall(out + rest)
             self._pump(client, upstream)
-        except OSError:  # includes ssl.SSLError and socket.timeout mid-record
+        except (OSError, ValueError):  # OSError includes SSLError; ValueError: a socket close() shut mid-select
             pass
         finally:
             with self._lock:
@@ -756,10 +766,13 @@ class EdgeProxy:
 
     def _pump(self, client: ssl.SSLSocket, upstream: socket.socket) -> None:
         """Both directions in one thread that never blocks on a write: a side that stops reading
-        stalls only the direction toward it (up to MAX_BUFFERED bytes), never the other one."""
+        stalls only the direction toward it (at most MAX_BUFFERED bytes), never the other one."""
         other = {client: upstream, upstream: client}
         pending = {client: bytearray(), upstream: bytearray()}  # bytes waiting to be written to that socket
         ended: set[socket.socket] = set()
+        # a TLS read can need the socket writable, and a TLS write readable (post-handshake records)
+        read_wants_write = {client: False, upstream: False}
+        write_wants_read = {client: False, upstream: False}
         for s in other:
             s.setblocking(False)
         last = time.monotonic()
@@ -767,31 +780,41 @@ class EdgeProxy:
             # one side hung up: finish delivering what it sent, then end both (FIN is not forwarded)
             if ended and not any(pending[other[s]] for s in ended):
                 return
-            readers = [s for s in other if s not in ended and len(pending[other[s]]) < MAX_BUFFERED]
-            writers = [s for s in other if pending[s]]
-            if client in readers and client.pending():
-                # decrypted bytes already inside the SSL object are invisible to select
-                readable, writable = [client], []
+            room = {s: 0 if s in ended else MAX_BUFFERED - len(pending[other[s]]) for s in other}
+            readers = [s for s in other if (room[s] > 0 and not read_wants_write[s]) or write_wants_read[s]]
+            writers = [s for s in other if (pending[s] and not write_wants_read[s]) or read_wants_write[s]]
+            if room[client] > 0 and client.pending():
+                ready = {client}  # decrypted bytes already inside the SSL object are invisible to select
             else:
                 readable, writable, _ = select.select(readers, writers, [], TICK)
+                ready = set(readable) | set(writable)
             moved = False
-            for s in writable:
-                try:
-                    n = s.send(pending[s][:65536])
-                except (ssl.SSLWantWriteError, ssl.SSLWantReadError, BlockingIOError):
-                    continue
-                del pending[s][:n]
-                moved = moved or n > 0
-            for s in readable:
-                try:
-                    data = s.recv(65536)
-                except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
-                    continue  # a partial TLS record: nothing to deliver yet
-                if data:
-                    pending[other[s]] += data
-                    moved = True
-                else:
-                    ended.add(s)
+            for s in ready:  # retry both operations: either may have been waiting for this readiness
+                if pending[s]:
+                    try:
+                        n = s.send(pending[s][:65536])
+                    except ssl.SSLWantReadError:
+                        write_wants_read[s] = True
+                    except (ssl.SSLWantWriteError, BlockingIOError):
+                        write_wants_read[s] = False
+                    else:
+                        write_wants_read[s] = False
+                        del pending[s][:n]
+                        moved = moved or n > 0
+                if room[s] > 0:
+                    try:
+                        data = s.recv(min(65536, room[s]))
+                    except ssl.SSLWantWriteError:
+                        read_wants_write[s] = True
+                    except (ssl.SSLWantReadError, BlockingIOError):  # e.g. a partial TLS record
+                        read_wants_write[s] = False
+                    else:
+                        read_wants_write[s] = False
+                        if data:
+                            pending[other[s]] += data
+                            moved = True
+                        else:
+                            ended.add(s)
             now = time.monotonic()
             if moved:
                 last = now
@@ -1090,6 +1113,14 @@ def test_exe_mode_defaults_to_the_arr_profile():
     assert journey.EDGE_DEFAULT_PROFILE == {"source": "traefik", "exe": "arr"}
 
 
+# --- client env ----------------------------------------------------------
+
+def test_edge_client_env_forces_verification_with_the_run_ca(j):
+    env = {"NETBRIDGE_VERIFY_SSL": "false", "NETBRIDGE_ALLOW_INSECURE": "1", "OTHER": "x"}
+    j._edge_client_env(env, fake_edge())
+    assert env == {"NETBRIDGE_CA_BUNDLE": "ca.pem", "NETBRIDGE_VERIFY_SSL": "true", "OTHER": "x"}
+
+
 # --- client urls ---------------------------------------------------------
 
 def test_client_urls_plain_without_edge(j):
@@ -1348,11 +1379,19 @@ EDGE_502_WAIT = 30.0  # both clients retry within it: the reconnect backoff star
                          EDGE_IDLE_TIMEOUT, host="0.0.0.0")
         self.cleanups.append(edge.close)
         edge.start()
-        env["NETBRIDGE_CA_BUNDLE"] = str(edge.ca_path)  # clients verify the edge with the run's CA
+        self._edge_client_env(env, edge)
         self.check("edge_up", lambda: self._edge_status(edge))
         self.check("edge_appends_peer", lambda: self._edge_appends_peer(edge, relay, ip))
         self.check("edge_client_ip", lambda: self._edge_client_ip(edge, relay, stub))
         return edge
+
+    @staticmethod
+    def _edge_client_env(env: dict, edge: EdgeProxy) -> None:
+        """Clients verify the edge with the run's CA, and nothing inherited may switch verification off:
+        a run with NETBRIDGE_VERIFY_SSL=false + NETBRIDGE_ALLOW_INSECURE=1 would pass without the CA."""
+        env["NETBRIDGE_CA_BUNDLE"] = str(edge.ca_path)
+        env["NETBRIDGE_VERIFY_SSL"] = "true"
+        env.pop("NETBRIDGE_ALLOW_INSECURE", None)
 
     def _client_urls(self, agent_link: FaultProxy, proxy_link: FaultProxy, edge: EdgeProxy | None) -> tuple[str, str]:
         if edge is None:
