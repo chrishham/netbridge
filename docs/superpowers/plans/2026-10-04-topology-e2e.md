@@ -78,6 +78,7 @@ import os
 import select
 import socket
 import ssl
+import struct
 import threading
 import time
 
@@ -359,6 +360,14 @@ def test_malformed_head_answers_400(edge, upstream):
     assert upstream.heads == []
 
 
+def test_head_of_exactly_the_cap_without_terminator_answers_400(edge, upstream):
+    with tls(edge) as s:
+        line = "GET /ws HTTP/1.1\r\nX-Pad: "
+        s.sendall((line + "a" * (MAX_HEAD - len(line))).encode())  # exactly MAX_HEAD bytes, no blank line
+        assert read_until(s, b"\r\n\r\n").startswith(b"HTTP/1.1 400")
+    assert upstream.heads == []
+
+
 def test_oversized_head_answers_400(edge, upstream):
     with tls(edge) as s:
         s.sendall(get(extra=f"X-Pad: {'a' * MAX_HEAD}\r\n"))
@@ -366,10 +375,58 @@ def test_oversized_head_answers_400(edge, upstream):
     assert upstream.heads == []
 
 
+class Sink(Upstream):
+    """Answers 101 and then reads nothing until `release` is set: the edge has to queue what it gets."""
+
+    def __init__(self):
+        self.release, self.received = threading.Event(), 0
+        super().__init__()
+
+    def _handle(self, c):
+        with c:
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = c.recv(65536)
+                    if not chunk:
+                        return
+                    buf += chunk
+                head, _, rest = buf.partition(b"\r\n\r\n")
+                self.heads.append(head + b"\r\n\r\n")
+                self.received += len(rest)
+                c.sendall(self.answer)
+                self.release.wait(10)
+                while data := c.recv(65536):
+                    self.received += len(data)
+            except OSError:
+                pass
+
+
+def test_client_reset_still_delivers_what_the_edge_queued(tmp_path):
+    sink = Sink()
+    e = make_edge(tmp_path, sink.address)
+    try:
+        s = tls(e)
+        s.sendall(get())
+        read_until(s, b"\r\n\r\n")
+        payload = 512 * 1024  # under MAX_BUFFERED plus the loopback buffers: sendall does not block
+        s.sendall(b"x" * payload)
+        time.sleep(0.5)  # the edge reads it all and queues what the sink will not take yet
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        s.close()  # RST, no close_notify: the edge's recv raises instead of returning b""
+        time.sleep(0.2)
+        sink.release.set()
+        assert wait_until(lambda: sink.received == payload, 5), f"sink got {sink.received} of {payload}"
+        assert wait_until(lambda: e.active() == 0)
+    finally:
+        e.close()
+        sink.close()
+
+
 def test_upstream_down_answers_502(tmp_path):
-    with socket.create_server(("127.0.0.1", 0)) as s:
-        dead = s.getsockname()  # closed on exit: nothing listens there
-    e = make_edge(tmp_path, dead)
+    held = socket.socket()
+    held.bind(("127.0.0.1", 0))  # bound but never listening: connects are refused, and no one else gets the port
+    e = make_edge(tmp_path, held.getsockname())
     try:
         with tls(e) as c:
             c.sendall(get())
@@ -377,6 +434,7 @@ def test_upstream_down_answers_502(tmp_path):
         assert e.bad_gateways == {"/ws": 1}
     finally:
         e.close()
+        held.close()
 
 
 def test_failed_handshake_does_not_stop_the_edge(edge):
@@ -615,16 +673,14 @@ def _read_head(sock: socket.socket) -> tuple[bytes | None, bytes]:
     """(head, bytes after it); (None, b"") on EOF before any byte. ValueError if too large or cut short."""
     buf = b""
     while (end := buf.find(b"\r\n\r\n")) < 0:
-        if len(buf) > MAX_HEAD:
+        if len(buf) >= MAX_HEAD:  # never reads past the cap, so the cap is exact
             raise ValueError("request head too large")
-        chunk = sock.recv(4096)
+        chunk = sock.recv(min(4096, MAX_HEAD - len(buf)))
         if not chunk:
             if buf:
                 raise ValueError("connection closed inside the request head")
             return None, b""
         buf += chunk
-    if end + 4 > MAX_HEAD:
-        raise ValueError("request head too large")
     return buf[:end + 4], buf[end + 4:]
 
 
@@ -811,6 +867,10 @@ class EdgeProxy:
                 if pending[s]:
                     try:
                         n = s.send(pending[s][:65536])
+                    except (ssl.SSLEOFError, ConnectionError):  # s is gone: what was queued for it is lost
+                        pending[s].clear()
+                        ended.add(s)
+                        continue
                     except ssl.SSLWantReadError:
                         write_wants_read[s] = True
                     except (ssl.SSLWantWriteError, BlockingIOError):
@@ -822,6 +882,9 @@ class EdgeProxy:
                 if room[s] > 0:
                     try:
                         data = s.recv(min(65536, room[s]))
+                    except (ssl.SSLEOFError, ConnectionError):  # abrupt end: still deliver what s sent
+                        ended.add(s)
+                        continue
                     except ssl.SSLWantWriteError:
                         read_wants_write[s] = True
                     except (ssl.SSLWantReadError, BlockingIOError):  # e.g. a partial TLS record
@@ -1654,6 +1717,7 @@ Expected: all pass.
 Run these from the repo root (Linux). Each takes about 10 min:
 
 ```bash
+set -o pipefail  # the exit status is the journey's, not tail's
 for p in relay netbridge-agent socks-proxy security-tests e2e; do (cd "$p" && uv sync -q); done
 uv run --project e2e python -m netbridge_e2e --mode source --edge --work /tmp/nb-e2e-edge 2>&1 | tail -n 60
 uv run --project e2e python -m netbridge_e2e --mode source --edge --edge-profile arr --work /tmp/nb-e2e-arr 2>&1 | tail -n 60
