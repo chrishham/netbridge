@@ -138,7 +138,8 @@ bound fetches toward Microsoft regardless of request rate:
    - At most one background refresh is pending per tenant, and none is
      started during a failure backoff.
    - A 200 response that is not a JSON object with a `keys` list counts as a
-     failed fetch and never replaces the cached keys. Entries from which
+     failed fetch and never replaces the cached keys. Entries with an empty
+     or missing `kid`, and entries from which
      signature verification could not build an RS256 public key (built with
      the same helper verification uses) are dropped; a response with no
      usable entry left is a failed fetch too.
@@ -193,11 +194,13 @@ untested.
 - If the list is empty, or `request.remote` is not inside a trusted CIDR,
   return `request.remote or "unknown"`. That is exactly today's behaviour.
 - Otherwise, read the header:
-  - For `X-Forwarded-For` (compared case-insensitively), split on commas and
-    walk right to left. Return the first entry that parses as an IP and is not
-    inside a trusted CIDR.
-  - For any other header, e.g. `CF-Connecting-IP`, use the whole value if it
-    parses as an IP.
+  - For `X-Forwarded-For` (compared case-insensitively), join repeated
+    fields in order (one list, per RFC 9110), split on commas and walk right
+    to left. Return the first entry that parses as an IP and is not inside a
+    trusted CIDR. Reading only the first field would let a client's own field
+    win over the one its proxy appended.
+  - For any other header, e.g. `CF-Connecting-IP`, use the value if exactly
+    one field is present and it parses as an IP.
   - If nothing usable is found, fall back to `request.remote`.
 
 The function feeds both the log lines and the IP bucket key.

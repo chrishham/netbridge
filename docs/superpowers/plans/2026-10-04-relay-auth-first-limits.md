@@ -326,9 +326,11 @@ async def test_expired_usable_cache_does_not_wait_for_slow_fetch(key):
 @pytest.mark.parametrize("body", [[], {"keys": "x"}, {}, "keys", {"keys": []}, {"keys": [None]},
                                   {"keys": [{"kid": "k1"}]}, {"keys": [{"kid": "k1", "n": 1, "e": "AQAB"}]},
                                   {"keys": [{"kid": "k1", "n": "", "e": ""}]},
-                                  {"keys": [{"kid": "k1", "n": "!!", "e": "AQAB"}]}])
+                                  {"keys": [{"kid": "k1", "n": "!!", "e": "AQAB"}]}, "empty-kid"])
 async def test_malformed_jwks_response_keeps_previous_keys(key, body):
     private, jwk = key
+    if body == "empty-kid":
+        body = {"keys": [{**jwk, "kid": ""}]}  # valid key material, but no token can select it
     ms = FakeMicrosoft([jwk])
     with _patched(ms):
         await validate_arm_token(_token(private))
@@ -419,8 +421,8 @@ async def _fetch_jwks(tenant_id: str) -> dict:
 
 def _usable_jwk(jwk) -> bool:
     """Whether _verify_signature could build a key from this entry."""
-    if not isinstance(jwk, dict) or not isinstance(jwk.get("kid"), str):
-        return False
+    if not isinstance(jwk, dict) or not isinstance(jwk.get("kid"), str) or not jwk["kid"]:
+        return False  # validate_arm_token rejects tokens without a kid, so such a key is unselectable
     try:
         _jwk_public_key(jwk)
     except Exception:
@@ -575,13 +577,16 @@ Create `relay/tests/test_client_ip.py`:
 import pytest
 from unittest.mock import MagicMock
 
+from multidict import CIMultiDict
+
 import relay.__main__ as mod
 
 
 def _req(remote, headers=None):
+    """headers: a dict, or a list of (name, value) pairs to send a field more than once."""
     r = MagicMock()
     r.remote = remote
-    r.headers = headers or {}
+    r.headers = CIMultiDict(headers or {})  # what aiohttp's request.headers is
     return r
 
 
@@ -655,6 +660,19 @@ def test_single_value_header_invalid_falls_back(trusted):
     assert mod._client_ip(_req("10.0.0.5", {"CF-Connecting-IP": "1.1.1.1, 2.2.2.2"})) == "10.0.0.5"
 
 
+def test_repeated_xff_fields_are_joined_in_order(trusted):
+    # The client sends its own field; the trusted proxy appends the real peer as a second field
+    trusted("10.0.0.0/8")
+    req = _req("10.0.0.5", [("X-Forwarded-For", "6.6.6.6"), ("X-Forwarded-For", "1.1.1.1")])
+    assert mod._client_ip(req) == "1.1.1.1"
+
+
+def test_repeated_single_value_fields_fall_back(trusted):
+    trusted("10.0.0.0/8", header="CF-Connecting-IP")
+    req = _req("10.0.0.5", [("CF-Connecting-IP", "6.6.6.6"), ("CF-Connecting-IP", "1.1.1.1")])
+    assert mod._client_ip(req) == "10.0.0.5"
+
+
 def test_xff_header_name_case_insensitive(trusted):
     trusted("10.0.0.0/8", header="x-forwarded-for")
     req = _req("10.0.0.5", {"x-forwarded-for": "1.1.1.1, 10.0.0.7"})
@@ -724,14 +742,17 @@ def _client_ip(request: web.Request) -> str:
     peer = _parse_ip(remote)
     if peer is None or not _is_trusted(peer):
         return remote
-    value = request.headers.get(CLIENT_IP_HEADER, "")
+    values = request.headers.getall(CLIENT_IP_HEADER, [])
     if CLIENT_IP_HEADER.lower() == "x-forwarded-for":
-        for entry in reversed(value.split(",")):
+        # Repeated fields are one list in order (RFC 9110); .get() would return the client's own first field
+        for entry in reversed(",".join(values).split(",")):
             ip = _parse_ip(entry)
             if ip is not None and not _is_trusted(ip):
                 return str(ip)
         return remote
-    ip = _parse_ip(value)
+    if len(values) != 1:
+        return remote  # a proxy that overwrites leaves exactly one field
+    ip = _parse_ip(values[0])
     return str(ip) if ip is not None else remote
 ```
 
