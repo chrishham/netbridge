@@ -22,16 +22,13 @@ import aiohttp
 from .config import redact_proxy_url
 from shared_auth.connect_errors import (
     CAPACITY,
-    DNS_FAILED,
     GENERAL,
     INVALID_REQUEST,
     NOT_ALLOWED,
     TIMEOUT,
 )
 from .agent import (
-    DnsError,
     decode_tcp_payload,
-    resolve_destination,
     valid_connect_fields,
     valid_stream_id,
     validate_destination,
@@ -366,26 +363,10 @@ async def handle_tcp_connect(ws, request: dict) -> None:
         })
         return
 
-    # Validate destination against private ranges
-    # Resolve once up front: validate_destination swallows DnsError and an
-    # empty list passes policy, so a doomed name would otherwise be dialed.
-    try:
-        resolved = await resolve_destination(host, port)
-        dns_err = "" if resolved else "no usable addresses"
-    except DnsError as e:
-        dns_err = str(e)
-    if dns_err:
-        print(f"[{ts()}] [TCP] DNS failed: {stream_id} -> {host}:{port}: {dns_err} [{DNS_FAILED}]")
-        await send_to_relay(ws, {
-            "type": "tcp_connect_result",
-            "stream_id": stream_id,
-            "success": False,
-            "error": f"Could not resolve {host}",
-            "error_code": DNS_FAILED,
-        })
-        return
-
-    dest_allowed, dest_reason = await validate_destination(host, port, resolved=resolved)
+    # Validate destination against private ranges. A local DNS failure is
+    # not final here: the dial may go through a passthrough proxy that
+    # resolves names this machine cannot.
+    dest_allowed, dest_reason = await validate_destination(host, port)
     if not dest_allowed:
         print(f"[{ts()}] [TCP] Destination denied: {stream_id} -> {host}:{port}: {dest_reason} [{NOT_ALLOWED}]")
         await send_to_relay(ws, {

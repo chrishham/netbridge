@@ -174,20 +174,14 @@ still match. Denied destinations log
 
 The same applies to its field, cap and denial replies.
 
-Legacy DNS: today `handle_tcp_connect` calls `validate_destination(host,
-port)`, which swallows `DnsError` (resolved = `[]`, and an empty list passes
-policy). The dial then resolves the name again, so a resolver failure could
-show up as `timeout`, or as `general` on a slow name. Legacy now calls
-`resolve_destination` itself first:
-- `DnsError`, or an empty result → reply `dns_failed` and log
-  `[TCP] DNS failed: ...`
-- otherwise pass `resolved=` into `validate_destination`, so the policy is
-  judged on the same answer
-
-The dial still uses the hostname. Porting the single-resolution dial to
-legacy stays out of scope, per spec D decision 30. The only behaviour change
-is that an unresolvable name now fails fast with a code instead of going
-through a doomed dial. The legacy path is deprecated, but it is cheap
+Legacy DNS: `handle_tcp_connect` keeps calling `validate_destination(host,
+port)`, which tolerates a local DNS failure. This is deliberate, and an
+up-front `dns_failed` would be wrong. On Windows the legacy dial may go
+through a passthrough proxy that resolves names this machine cannot (code
+review round 1). A name that fails everywhere surfaces from the dial as
+`socket.gaierror`, which maps to `dns_failed`. Known limitation of the
+deprecated path: a resolver that hangs until the 30 s dial timeout reports
+`timeout`. The legacy path is deprecated, but it is cheap
 to keep it consistent, so every producer stays honest.
 
 ## Relay

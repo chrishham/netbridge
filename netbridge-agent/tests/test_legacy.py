@@ -4,6 +4,7 @@ import asyncio
 import base64
 import ipaddress
 import json
+import socket
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -330,8 +331,6 @@ def legacy_dial(monkeypatch):
         await release.wait()
         raise OSError("refused")
 
-    monkeypatch.setattr(legacy, "resolve_destination",
-                        AsyncMock(return_value=[ipaddress.ip_address("93.184.216.34")]))
     monkeypatch.setattr(legacy, "validate_destination", AsyncMock(return_value=(True, "")))
     monkeypatch.setattr(legacy, "open_tcp_connection", slow_dial)
     monkeypatch.setattr(legacy, "pending_connections", {})
@@ -459,42 +458,37 @@ async def _connect_and_wait(legacy, ws, request=None):
         await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest.mark.parametrize("message", ["no such host", "DNS resolution timed out for example.com"])
-async def test_legacy_dns_error_is_dns_failed_without_dialing(legacy_dial, monkeypatch, message):
+async def test_legacy_local_dns_failure_still_dials(monkeypatch):
+    # the passthrough proxy may resolve names the agent cannot, so a local
+    # resolver failure must not stop the dial
+    from netbridge_agent import legacy
     from netbridge_agent.agent import DnsError
+    dials = []
+
+    async def dial(host, port, timeout, proxy_auth=None):
+        dials.append((host, port))
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr("netbridge_agent.agent.resolve_destination",
+                        AsyncMock(side_effect=DnsError("no such host")))
+    monkeypatch.setattr(legacy, "open_tcp_connection", dial)
+    monkeypatch.setattr(legacy, "pending_connections", {})
+    monkeypatch.setattr(legacy, "active_streams", {})
+    ws = _ws()
+    await _connect_and_wait(legacy, ws)
+    assert dials == [("example.com", 80)]
+    (sent,) = _results(ws)
+    assert sent["error_code"] == "refused"
+
+
+async def test_legacy_dial_dns_failure_is_dns_failed(legacy_dial, monkeypatch):
     legacy, release, dials = legacy_dial
-    monkeypatch.setattr(legacy, "resolve_destination", AsyncMock(side_effect=DnsError(message)))
+    monkeypatch.setattr(legacy, "open_tcp_connection",
+                        AsyncMock(side_effect=socket.gaierror(-2, "Name or service not known")))
     ws = _ws()
     await _connect_and_wait(legacy, ws)
     (sent,) = _results(ws)
     assert sent["success"] is False and sent["error_code"] == "dns_failed"
-    assert dials == []
-    assert legacy.pending_connections == {}
-
-
-async def test_legacy_empty_resolution_is_dns_failed_without_dialing(legacy_dial, monkeypatch):
-    legacy, release, dials = legacy_dial
-    monkeypatch.setattr(legacy, "resolve_destination", AsyncMock(return_value=[]))
-    ws = _ws()
-    await _connect_and_wait(legacy, ws)
-    (sent,) = _results(ws)
-    assert sent["error_code"] == "dns_failed"
-    assert dials == []
-
-
-async def test_legacy_policy_denial_is_judged_on_the_resolved_list(legacy_dial, monkeypatch):
-    legacy, release, dials = legacy_dial
-    private = [ipaddress.ip_address("127.0.0.1")]
-    from netbridge_agent.agent import validate_destination as real_validate
-    spy = AsyncMock(wraps=real_validate)
-    monkeypatch.setattr(legacy, "resolve_destination", AsyncMock(return_value=private))
-    monkeypatch.setattr(legacy, "validate_destination", spy)
-    ws = _ws()
-    await legacy.handle_tcp_connect(ws, _connect())
-    (sent,) = _results(ws)
-    assert sent["error_code"] == "not_allowed"
-    assert spy.call_args.kwargs["resolved"] == private
-    assert legacy.pending_connections == {}
 
 
 @pytest.mark.parametrize("status,code", [(403, "not_allowed"), (502, "host_unreachable"), (504, "timeout")])
