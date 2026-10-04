@@ -151,7 +151,7 @@ MAX_ACTIVE_STREAMS = _get_int_env("RELAY_MAX_ACTIVE_STREAMS", 500)
 # Maximum WebSocket message size (1MB default)
 MAX_MESSAGE_SIZE = _get_int_env("RELAY_MAX_MESSAGE_SIZE", 1 * 1024 * 1024)
 
-# Per-IP connection rate limiting (pre-auth, before user identity is known)
+# Per-IP limit on failed authentication attempts (valid tokens never count against it)
 RATE_LIMIT_IP_PER_MIN = _get_int_env("RELAY_RATE_IP_CONNECTIONS_PER_MIN", 30)
 
 # Client IP behind reverse proxies (opt-in). Only enable when the proxy chain
@@ -336,12 +336,18 @@ def _get_stream_limiter(user_email: str) -> AsyncLimiter:
     return entry.limiter
 
 
-# Per-IP rate limiting (applied before authentication)
+# Per-IP limiting of failed authentication attempts
+IP_THROTTLE_REPORT_INTERVAL = 60  # seconds between "limit exceeded" log lines per IP
+_now = time.monotonic  # report clock, patched by tests without touching aiolimiter's clock
+
+
 @dataclass
 class _TimedLimiter:
     """Rate limiter with last-used timestamp for cleanup."""
     limiter: AsyncLimiter
     last_used: float = field(default_factory=time.monotonic)
+    last_report: float = float("-inf")  # last "limit exceeded" log line (per-IP limiters only)
+    suppressed: int = 0                  # throttled requests not logged since then
 
 
 _ip_limiters: dict[str, _TimedLimiter] = {}
@@ -639,23 +645,36 @@ async def _cleanup_agent(ws: web.WebSocketResponse, user_email: str) -> None:
         }), silent=True)
 
 
-async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
-    """Handle WebSocket connection from bridge agent."""
-    # Per-IP rate limit (before authentication to block floods early)
-    client_ip = request.remote or "unknown"
+async def _authenticate_upgrade(request: web.Request, kind: str) -> tuple[str | None, web.Response | None]:
+    """Authenticate first; only failures are charged to the per-IP bucket.
+
+    Behind a reverse proxy or NAT many users share one address, so a pre-auth
+    per-IP limit would let unauthenticated traffic lock out valid users.
+    """
+    client_ip = _client_ip(request)
+    success, result = await authenticate_request(request)
+    if success:
+        return result, None
     ip_entry = _get_ip_limiter(client_ip)
     if not ip_entry.limiter.has_capacity():
-        logger.warning(f"Per-IP rate limit exceeded for {client_ip}")
-        return web.Response(status=429, text="Too many requests from this IP")
+        now = _now()
+        if now - ip_entry.last_report >= IP_THROTTLE_REPORT_INTERVAL:
+            logger.warning(f"Per-IP auth-failure limit exceeded for {client_ip} "
+                           f"({ip_entry.suppressed} more since last report)")
+            ip_entry.last_report, ip_entry.suppressed = now, 0
+        else:
+            ip_entry.suppressed += 1
+        return None, web.Response(status=429, text="Too many failed attempts from this IP")
     await ip_entry.limiter.acquire()
+    logger.warning(f"{kind} auth rejected for {client_ip}: {result}")
+    return None, web.Response(status=401, text=result)
 
-    # Authenticate first
-    success, result = await authenticate_request(request)
-    if not success:
-        logger.warning(f"Agent auth rejected for {client_ip}: {result}")
-        return web.Response(status=401, text=result)
 
-    user_email = result
+async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
+    """Handle WebSocket connection from bridge agent."""
+    user_email, rejection = await _authenticate_upgrade(request, "Agent")
+    if rejection is not None:
+        return rejection
 
     # Rate limit connections (non-blocking check)
     limiter = _get_connection_limiter(user_email)
@@ -995,21 +1014,9 @@ async def _handle_tcp_close(data: dict, tunnel_key: str, raw_msg: str) -> None:
 
 async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
     """Handle WebSocket from SOCKS5 proxy for TCP tunneling."""
-    # Per-IP rate limit (before authentication to block floods early)
-    client_ip = request.remote or "unknown"
-    ip_entry = _get_ip_limiter(client_ip)
-    if not ip_entry.limiter.has_capacity():
-        logger.warning(f"Per-IP rate limit exceeded for {client_ip}")
-        return web.Response(status=429, text="Too many requests from this IP")
-    await ip_entry.limiter.acquire()
-
-    # Authenticate first
-    success, result = await authenticate_request(request)
-    if not success:
-        logger.warning(f"Tunnel auth rejected for {client_ip}: {result}")
-        return web.Response(status=401, text=result)
-
-    user_email = result
+    user_email, rejection = await _authenticate_upgrade(request, "Tunnel")
+    if rejection is not None:
+        return rejection
 
     # Rate limit connections (non-blocking check)
     limiter = _get_connection_limiter(user_email)

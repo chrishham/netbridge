@@ -41,35 +41,109 @@ async def client():
         yield c
 
 
-@pytest.mark.asyncio
-async def test_per_ip_limit_rejects_third_request(client, monkeypatch):
-    """Per-IP limit (patched to 2) should reject third upgrade with 429."""
-    # Patch the per-IP limit to 2
-    monkeypatch.setattr(mod, "RATE_LIMIT_IP_PER_MIN", 2)
-
-    # Mock authenticate to always succeed
-    async def mock_auth(request):
+async def _auth_by_header(request):
+    """Valid iff the bearer token is 'good'."""
+    if request.headers.get("Authorization") == "Bearer good":
         return True, USER
+    return False, "Invalid JWT format"
 
-    with patch("relay.__main__.authenticate_request", side_effect=mock_auth):
-        # First two connections should succeed (and get registered)
-        resp1 = await client.ws_connect("/ws")
-        msg1 = await resp1.receive_json()
-        assert msg1["type"] == "registered"
 
-        resp2 = await client.ws_connect("/ws")
-        msg2 = await resp2.receive_json()
-        assert msg2["type"] == "registered"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/ws", "/tunnel"])
+async def test_failed_auth_exhausts_ip_bucket_but_valid_token_passes(client, monkeypatch, path):
+    monkeypatch.setattr(mod, "RATE_LIMIT_IP_PER_MIN", 2)
+    bad = {"Authorization": "Bearer bad"}
+    with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
+        for _ in range(2):
+            resp = await client.get(path, headers=bad)
+            assert resp.status == 401
+            assert "Invalid JWT format" in await resp.text()
+        resp = await client.get(path, headers=bad)
+        assert resp.status == 429
+        assert "Too many failed attempts from this IP" in await resp.text()
 
-        # Third connection should be rejected with 429 before auth
-        resp3 = await client.get("/ws")
-        assert resp3.status == 429
-        text = await resp3.text()
-        assert "Too many requests from this IP" in text
+        ws = await client.ws_connect(path, headers={"Authorization": "Bearer good"})
+        try:
+            if path == "/ws":
+                assert (await ws.receive_json())["type"] == "registered"
+            else:
+                assert not ws.closed
+        finally:
+            await ws.close()
 
-        # Clean up
-        await resp1.close()
-        await resp2.close()
+
+@pytest.mark.asyncio
+async def test_valid_tokens_never_consume_ip_bucket(client, monkeypatch):
+    monkeypatch.setattr(mod, "RATE_LIMIT_IP_PER_MIN", 2)
+    monkeypatch.setattr(mod, "RATE_LIMIT_CONNECTIONS_PER_MIN", 100)
+    good = {"Authorization": "Bearer good"}
+    with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
+        sockets = [await client.ws_connect("/tunnel", headers=good) for _ in range(3)]
+        try:
+            assert all(not ws.closed for ws in sockets)
+            resp = await client.get("/tunnel", headers={"Authorization": "Bearer bad"})
+            assert resp.status == 401  # bucket untouched by the three valid upgrades
+        finally:
+            for ws in sockets:
+                await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_per_user_limit_still_applies_when_ip_bucket_empty(client, monkeypatch):
+    monkeypatch.setattr(mod, "RATE_LIMIT_IP_PER_MIN", 1)
+    monkeypatch.setattr(mod, "RATE_LIMIT_CONNECTIONS_PER_MIN", 1)
+    with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
+        assert (await client.get("/tunnel", headers={"Authorization": "Bearer bad"})).status == 401
+        assert (await client.get("/tunnel", headers={"Authorization": "Bearer bad"})).status == 429
+        ws = await client.ws_connect("/tunnel", headers={"Authorization": "Bearer good"})
+        try:
+            resp = await client.get("/tunnel", headers={"Authorization": "Bearer good"})
+            assert resp.status == 429
+            assert "Too many connection attempts" in await resp.text()
+        finally:
+            await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_rapid_valid_connections_hit_per_user_limit_with_defaults(client):
+    """Mirrors pentest rapid_connection_dos: 35 valid /tunnel upgrades from one IP, default limits."""
+    good = {"Authorization": "Bearer good"}
+    with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
+        for i in range(35):
+            resp = await client.get("/tunnel", headers=good)  # plain GET: auth and limits run before the upgrade
+            if resp.status == 429:
+                assert "Too many connection attempts" in await resp.text()
+                assert i <= mod.RATE_LIMIT_CONNECTIONS_PER_MIN
+                break
+        else:
+            pytest.fail("no 429 within 35 valid connections")
+
+
+@pytest.mark.asyncio
+async def test_failed_auth_logs_keep_their_text(client, monkeypatch, caplog):
+    monkeypatch.setattr(mod, "RATE_LIMIT_IP_PER_MIN", 1)
+    bad = {"Authorization": "Bearer bad"}
+    with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
+        await client.get("/ws", headers=bad)
+        await client.get("/ws", headers=bad)
+    text = caplog.text
+    assert "Agent auth rejected for 127.0.0.1: Invalid JWT format" in text
+    assert "Per-IP auth-failure limit exceeded for 127.0.0.1 (0 more since last report)" in text
+
+
+@pytest.mark.asyncio
+async def test_throttle_warning_is_logged_once_per_window(client, monkeypatch, caplog):
+    monkeypatch.setattr(mod, "RATE_LIMIT_IP_PER_MIN", 1)
+    clock = [1000.0]
+    monkeypatch.setattr(mod, "_now", lambda: clock[0])  # report clock only; aiolimiter keeps the real one
+    bad = {"Authorization": "Bearer bad"}
+    with patch("relay.__main__.authenticate_request", side_effect=_auth_by_header):
+        for _ in range(6):  # 1 x 401, then 5 x 429
+            await client.get("/ws", headers=bad)
+        assert caplog.text.count("Per-IP auth-failure limit exceeded") == 1
+        clock[0] += mod.IP_THROTTLE_REPORT_INTERVAL + 1
+        await client.get("/ws", headers=bad)
+    assert "(4 more since last report)" in caplog.text
 
 
 @pytest.mark.asyncio
