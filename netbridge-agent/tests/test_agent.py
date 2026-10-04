@@ -638,6 +638,7 @@ class TestMagicHostUnavailable:
         sent = await self._connect(state)
         assert sent["success"] is False
         assert sent["error"] == "Service netbridge-exec is not available"
+        assert sent["error_code"] == "unavailable"
 
     async def test_intercept_not_configured(self):
         state = AgentState()
@@ -645,6 +646,7 @@ class TestMagicHostUnavailable:
         sent = await self._connect(state)
         assert sent["success"] is False
         assert sent["error"] == "Intercept server is not configured"
+        assert sent["error_code"] == "unavailable"
 
     async def test_intercept_not_running(self):
         state = AgentState()
@@ -652,3 +654,99 @@ class TestMagicHostUnavailable:
         sent = await self._connect(state)
         assert sent["success"] is False
         assert sent["error"] == "Intercept server is not running"
+        assert sent["error_code"] == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# error_code on failed tcp_connect_result
+# ---------------------------------------------------------------------------
+
+
+class TestConnectErrorCodes:
+    @staticmethod
+    async def _connect(state, host="example.com", port=80):
+        ws = MagicMock()
+        ws.closed = False
+        ws.send_str = AsyncMock()
+        msg = json.dumps({"type": "tcp_connect", "stream_id": "s1", "host": host, "port": port})
+        await handle_message(state, ws, msg)
+        task = state.pending_connections.get("s1")
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        return json.loads(ws.send_str.call_args.args[0])
+
+    async def test_pending_cap_is_capacity(self, monkeypatch):
+        from netbridge_agent import agent
+        monkeypatch.setattr(agent, "MAX_CONCURRENT_CONNECTIONS", 0)
+        sent = await self._connect(AgentState())
+        assert sent["error"] == "Too many pending connections"
+        assert sent["error_code"] == "capacity"
+
+    async def test_active_cap_is_capacity(self, monkeypatch):
+        from netbridge_agent import agent
+        monkeypatch.setattr(agent, "MAX_ACTIVE_STREAMS", 0)
+        sent = await self._connect(AgentState())
+        assert sent["error"] == "Too many active streams"
+        assert sent["error_code"] == "capacity"
+
+    async def test_denied_destination_is_not_allowed_and_logged(self, caplog):
+        state = AgentState()
+        with caplog.at_level("WARNING"):
+            sent = await self._connect(state, host="127.0.0.1")
+        assert sent["success"] is False
+        assert sent["error_code"] == "not_allowed"
+        assert any(r.getMessage().startswith("Destination denied: s1 -> 127.0.0.1:80: ")
+                   and r.getMessage().endswith(" [not_allowed]") for r in caplog.records)
+
+    async def test_empty_resolution_is_dns_failed(self, monkeypatch, caplog):
+        from netbridge_agent import agent
+        monkeypatch.setattr(agent, "resolve_destination", AsyncMock(return_value=[]))
+        with caplog.at_level("WARNING"):
+            sent = await self._connect(AgentState())
+        assert sent["error_code"] == "dns_failed"
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(m.startswith("DNS returned no usable addresses: s1 -> example.com:80")
+                   and m.endswith(" [dns_failed]") for m in msgs)
+        assert not any(m.startswith("Destination denied") for m in msgs)
+
+    async def test_empty_resolution_with_cidr_allowlist_is_still_dns_failed(self, monkeypatch):
+        from netbridge_agent import agent
+        monkeypatch.setattr(agent, "resolve_destination", AsyncMock(return_value=[]))
+        state = AgentState()
+        state.allowed_destinations = ["203.0.113.0/24"]
+        sent = await self._connect(state)
+        assert sent["error_code"] == "dns_failed"
+
+    async def test_refused(self, monkeypatch, caplog):
+        from netbridge_agent import agent
+        import ipaddress
+        monkeypatch.setattr(agent, "resolve_destination",
+                            AsyncMock(return_value=[ipaddress.ip_address("93.184.216.34")]))
+        monkeypatch.setattr(agent, "open_tcp_connection",
+                            AsyncMock(side_effect=ConnectionRefusedError("refused")))
+        with caplog.at_level("WARNING"):
+            sent = await self._connect(AgentState())
+        assert sent["error_code"] == "refused"
+        assert any(r.getMessage().startswith("Failed: s1 -> example.com:80: ConnectionRefusedError: ")
+                   and r.getMessage().endswith(" [refused]") for r in caplog.records)
+
+    async def test_dns_error_from_resolution(self, monkeypatch, caplog):
+        from netbridge_agent import agent
+        monkeypatch.setattr(agent, "resolve_destination",
+                            AsyncMock(side_effect=agent.DnsError("no such host")))
+        with caplog.at_level("WARNING"):
+            sent = await self._connect(AgentState())
+        assert sent["error_code"] == "dns_failed"
+        assert any(r.getMessage().startswith("Failed: s1 -> example.com:80: DnsError: no such host")
+                   and r.getMessage().endswith(" [dns_failed]") for r in caplog.records)
+
+    async def test_proxy_auth_rejected_is_upstream_proxy(self, monkeypatch):
+        from netbridge_agent import agent
+        from netbridge_agent.tunnel import ProxyAuthRejected
+        import ipaddress
+        monkeypatch.setattr(agent, "resolve_destination",
+                            AsyncMock(return_value=[ipaddress.ip_address("93.184.216.34")]))
+        monkeypatch.setattr(agent, "open_tcp_connection",
+                            AsyncMock(side_effect=ProxyAuthRejected("rejected", 407)))
+        sent = await self._connect(AgentState())
+        assert sent["error_code"] == "upstream_proxy"
