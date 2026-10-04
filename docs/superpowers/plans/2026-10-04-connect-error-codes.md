@@ -51,6 +51,8 @@ for field errors), `tests/test_legacy.py`.
      `OSError(errno.ETIMEDOUT)`
    - an `OSError` with only `winerror=10061/10065/10051/10060` set: build it,
      then set the attribute
+   - an `OSError(10065, "...")` etc. carrying the Winsock value in `errno`
+     with no `winerror`
    - an unrelated `OSError`
    - `ValueError` → `general`
 
@@ -75,7 +77,9 @@ for field errors), `tests/test_legacy.py`.
    - denied destination (policy reason) → `not_allowed`
    - `resolve_destination` returning `[]` (monkeypatch `getaddrinfo` to
      return only unparsable sockaddrs, or patch `resolve_destination`) →
-     `dns_failed`, with the new `DNS returned no usable addresses` log line
+     `dns_failed`, with the new `DNS returned no usable addresses` log line;
+     also with a CIDR allowlist configured (which would otherwise produce an
+     allowlist denial reason) it must still be `dns_failed`
    - refused (a closed local port, or monkeypatched `open_tcp_connection`
      raising `ConnectionRefusedError`)
    - `DnsError`
@@ -85,7 +89,11 @@ for field errors), `tests/test_legacy.py`.
    which must therefore use `connect_error_code(e)`. The pending-cancel
    reply gets `general`; the existing test around `test_legacy.py:423`
    should assert it. Legacy DNS: per the spec's "Legacy DNS" paragraph,
-   resolve first via `resolve_destination`. Tests through the legacy
+   resolve first via `resolve_destination`. The existing legacy dial fixture
+   (around `test_legacy.py:321`) mocks only `validate_destination` and uses
+   `example.com`. It must also mock `legacy.resolve_destination` to return a
+   public address, otherwise its dependent tests hit real DNS (the
+   pytest-socket guard would fail them). Tests through the legacy
    `handle_tcp_connect`: `DnsError` (failure and timeout) → `dns_failed`,
    with no dial attempted (assert `open_tcp_connection` is not called);
    empty result → `dns_failed`; a resolved private address still denied →
@@ -137,7 +145,7 @@ Files: `src/socks_proxy/tunnel.py`, `socks5.py`, `http_proxy.py`; tests in
    `except ConnectionError` and send `socks5_reply_for(e.error_code)`. Log
    the code. Tests, one per spec row (parametrize):
    - `refused` → 0x05, `not_allowed` → 0x02, `timeout` → 0x06,
-     `network_unreachable` → 0x03, `no_agent` → 0x01
+     `network_unreachable` → 0x03, `no_agent` → 0x04, `capacity` → 0x01
    - absent code → 0x04
    - plain `ConnectionError` → 0x04 (unchanged)
 3. `http_proxy.py`: in the CONNECT and forward paths, catch
@@ -162,7 +170,10 @@ if it unit-tests the step helpers.
    `DnsError: .*\[dns_failed\]`, `Destination denied: ... \[not_allowed\]`.
    Check how `_error_case` compares HTTP statuses and update it if it
    hard-codes 502. Update the comment in `healthy()`.
-2. `_filter.blocked`: expect `0x02` and update the message.
+2. `_filter.blocked`: expect `0x02` and update the message. The fault
+   journey's `agent_down_fails_fast` (relay `no_agent`) and
+   relay-unreachable cases keep expecting 0x04 unchanged, because
+   `no_agent` maps to 0x04. Verify they still pass.
 3. `_user_isolation` (it uses the raw `/tunnel` helper `_tunnel_connect`):
    add `and other.get("error_code") == "no_agent"` to `isolated`. The detail
    string already dumps the full reply.

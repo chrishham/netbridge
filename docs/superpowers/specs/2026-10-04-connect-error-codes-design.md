@@ -100,7 +100,7 @@ test. The relay and agent import only the constants and the validator.
 | `network_unreachable` | 0x03 network unreachable | 502 |
 | `timeout` | 0x06 TTL expired (matches today's local-timeout reply) | 504 |
 | `not_allowed` | 0x02 not allowed by ruleset | 403 |
-| `no_agent` | 0x01 general failure | 503 |
+| `no_agent` | 0x04 host unreachable (unchanged from today) | 503 |
 | `capacity` | 0x01 | 503 |
 | `invalid_request` | 0x01 | 400 |
 | `unavailable` | 0x01 | 502 |
@@ -150,8 +150,10 @@ message:
 - intercept branches → `unavailable`
 - destination denied with a policy reason (`dest_reason` non-empty) →
   `not_allowed`
-- resolution returned no usable addresses (`dest_reason` empty and
-  `addresses` empty; `getaddrinfo` returned nothing usable) → `dns_failed`.
+- resolution returned no usable addresses: check `resolved` for emptiness
+  right after `resolve_destination`, before `select_destinations`, because
+  with a CIDR allowlist an empty list would otherwise produce an allowlist
+  denial reason. → `dns_failed`.
   The log line becomes `DNS returned no usable addresses: ... [dns_failed]`
   instead of `Destination denied`.
 - the two `except` handlers → `connect_error_code(e)`. A `DnsError` from
@@ -271,4 +273,5 @@ TDD per component. Each test must fail without its change.
 | 8 | `classify_connect_error` unchanged | switch to codes | Out of scope; would change health logic and needs a text fallback for old relays anyway |
 | 9 | Legacy agent gets codes too | leave legacy | Cheap with the shared classifier; keeps all producers consistent |
 | 10 | Upstream proxy statuses map 403/502/504 to semantic codes, the rest to `upstream_proxy` | everything `upstream_proxy` | The corporate proxy's 403/504 mean the same thing to the user as a direct deny or timeout |
+| 12 | `no_agent` → SOCKS5 0x04 | 0x01, 0x03 | Keeps the client-visible "agent down" reply exactly as today. The fault journey's `agent_down_fails_fast` pins 0x04, and clients already treat it as retryable. HTTP still gets the more precise 503 |
 | 11 | Agent log lines gain a ` [code]` suffix | separate field / no change | Journey can pin the code from logs too; prefix stays stable for existing regexes |
