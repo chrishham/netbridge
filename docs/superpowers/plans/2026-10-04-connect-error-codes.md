@@ -72,7 +72,10 @@ for field errors), `tests/test_legacy.py`.
    - invalid fields
    - pending cap, active cap
    - the three intercept branches
-   - denied destination
+   - denied destination (policy reason) → `not_allowed`
+   - `resolve_destination` returning `[]` (monkeypatch `getaddrinfo` to
+     return only unparsable sockaddrs, or patch `resolve_destination`) →
+     `dns_failed`, with the new `DNS returned no usable addresses` log line
    - refused (a closed local port, or monkeypatched `open_tcp_connection`
      raising `ConnectionRefusedError`)
    - `DnsError`
@@ -81,7 +84,12 @@ for field errors), `tests/test_legacy.py`.
    `ProxyConnectionError` reaches the generic `except Exception` handler,
    which must therefore use `connect_error_code(e)`. The pending-cancel
    reply gets `general`; the existing test around `test_legacy.py:423`
-   should assert it. Tests in
+   should assert it. Legacy DNS: per the spec's "Legacy DNS" paragraph,
+   resolve first via `resolve_destination`. Tests through the legacy
+   `handle_tcp_connect`: `DnsError` (failure and timeout) → `dns_failed`,
+   with no dial attempted (assert `open_tcp_connection` is not called);
+   empty result → `dns_failed`; a resolved private address still denied →
+   `not_allowed`, judged on the passed `resolved=` list. Tests in
    `test_legacy.py` follow the file's existing style.
 4. `uv sync --group dev && uv run pytest` green with floor 54. Commit.
 

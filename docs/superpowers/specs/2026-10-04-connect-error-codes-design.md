@@ -146,8 +146,14 @@ message:
   id sends nothing today and stays silent)
 - pending/active caps → `capacity`
 - intercept branches → `unavailable`
-- destination denied → `not_allowed`
-- the two `except` handlers → `connect_error_code(e)`
+- destination denied with a policy reason (`dest_reason` non-empty) →
+  `not_allowed`
+- resolution returned no usable addresses (`dest_reason` empty and
+  `addresses` empty; `getaddrinfo` returned nothing usable) → `dns_failed`.
+  The log line becomes `DNS returned no usable addresses: ... [dns_failed]`
+  instead of `Destination denied`.
+- the two `except` handlers → `connect_error_code(e)`. A `DnsError` from
+  `resolve_destination` lands there and maps to `dns_failed`.
 
 The log line `Failed: <id> -> host:port: <Type>: <text>` gains a
 ` [<code>]` suffix. Existing journey regexes anchor on the prefix, so they
@@ -162,7 +168,22 @@ still match. Denied destinations log
   `ProxyConnectionError` is not an `OSError`, so it lands in the generic
   handler and still has to get its semantic code.
 
-The same applies to its field, cap and denial replies. The legacy path is deprecated, but it is cheap
+The same applies to its field, cap and denial replies.
+
+Legacy DNS: today `handle_tcp_connect` calls `validate_destination(host,
+port)`, which swallows `DnsError` (resolved = `[]`, and an empty list passes
+policy). The dial then resolves the name again, so a resolver failure could
+show up as `timeout`, or as `general` on a slow name. Legacy now calls
+`resolve_destination` itself first:
+- `DnsError`, or an empty result → reply `dns_failed` and log
+  `[TCP] DNS failed: ...`
+- otherwise pass `resolved=` into `validate_destination`, so the policy is
+  judged on the same answer
+
+The dial still uses the hostname. Porting the single-resolution dial to
+legacy stays out of scope, per spec D decision 30. The only behaviour change
+is that an unresolvable name now fails fast with a code instead of going
+through a doomed dial. The legacy path is deprecated, but it is cheap
 to keep it consistent, so every producer stays honest.
 
 ## Relay
