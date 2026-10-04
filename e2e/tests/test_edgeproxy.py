@@ -359,7 +359,10 @@ def test_upstream_down_answers_502(tmp_path):
 def test_failed_handshake_does_not_stop_the_edge(edge):
     with socket.create_connection(("127.0.0.1", edge.port), timeout=5) as raw:
         raw.sendall(b"not tls at all\r\n\r\n")
-        raw.recv(1024)
+        try:
+            raw.recv(1024)
+        except ConnectionResetError:  # Windows resets a socket closed with unread input; POSIX sends EOF
+            pass
     with tls(edge) as s:
         s.sendall(get())
         assert read_until(s, b"\r\n\r\n").startswith(b"HTTP/1.1 101")
