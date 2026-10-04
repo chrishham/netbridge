@@ -20,12 +20,20 @@ from typing import Optional
 import aiohttp
 
 from .config import redact_proxy_url
+from shared_auth.connect_errors import (
+    CAPACITY,
+    GENERAL,
+    INVALID_REQUEST,
+    NOT_ALLOWED,
+    TIMEOUT,
+)
 from .agent import (
     decode_tcp_payload,
     valid_connect_fields,
     valid_stream_id,
     validate_destination,
 )
+from .tunnel import connect_error_code
 from .auth import (
     get_arm_token,
     check_az_login,
@@ -255,6 +263,7 @@ async def _do_tcp_connect(ws, stream_id: str, host: str, port: int) -> None:
                 "stream_id": stream_id,
                 "success": False,
                 "error": "Connection cancelled",
+                "error_code": GENERAL,
             }, silent=True)
         raise
 
@@ -264,26 +273,31 @@ async def _do_tcp_connect(ws, stream_id: str, host: str, port: int) -> None:
             "stream_id": stream_id,
             "success": False,
             "error": f"Connection to {host}:{port} timed out",
+            "error_code": TIMEOUT,
         })
         print(f"[{ts()}] [TCP] Timeout: {stream_id} -> {host}:{port}")
 
     except OSError as e:
+        code = connect_error_code(e)
         await send_to_relay(ws, {
             "type": "tcp_connect_result",
             "stream_id": stream_id,
             "success": False,
             "error": f"Connection failed: {e}",
+            "error_code": code,
         })
-        print(f"[{ts()}] [TCP] Failed: {stream_id} -> {host}:{port}: {e}")
+        print(f"[{ts()}] [TCP] Failed: {stream_id} -> {host}:{port}: {e} [{code}]")
 
     except Exception as e:
+        code = connect_error_code(e)
         await send_to_relay(ws, {
             "type": "tcp_connect_result",
             "stream_id": stream_id,
             "success": False,
             "error": f"Unexpected error: {type(e).__name__}: {e}",
+            "error_code": code,
         })
-        print(f"[{ts()}] [TCP] Error: {stream_id} -> {host}:{port}: {e}")
+        print(f"[{ts()}] [TCP] Error: {stream_id} -> {host}:{port}: {e} [{code}]")
 
     finally:
         async with lock:
@@ -319,6 +333,7 @@ async def handle_tcp_connect(ws, request: dict) -> None:
             "stream_id": stream_id,
             "success": False,
             "error": err,
+            "error_code": INVALID_REQUEST,
         })
         return
 
@@ -333,6 +348,7 @@ async def handle_tcp_connect(ws, request: dict) -> None:
             "stream_id": stream_id,
             "success": False,
             "error": "Too many pending connections",
+            "error_code": CAPACITY,
         })
         return
 
@@ -343,18 +359,22 @@ async def handle_tcp_connect(ws, request: dict) -> None:
             "stream_id": stream_id,
             "success": False,
             "error": "Too many active streams",
+            "error_code": CAPACITY,
         })
         return
 
-    # Validate destination against private ranges
+    # Validate destination against private ranges. A local DNS failure is
+    # not final here: the dial may go through a passthrough proxy that
+    # resolves names this machine cannot.
     dest_allowed, dest_reason = await validate_destination(host, port)
     if not dest_allowed:
-        print(f"[{ts()}] [TCP] Destination denied: {stream_id} -> {host}:{port}: {dest_reason}")
+        print(f"[{ts()}] [TCP] Destination denied: {stream_id} -> {host}:{port}: {dest_reason} [{NOT_ALLOWED}]")
         await send_to_relay(ws, {
             "type": "tcp_connect_result",
             "stream_id": stream_id,
             "success": False,
             "error": f"Destination {host}:{port} is not allowed",
+            "error_code": NOT_ALLOWED,
         })
         return
 

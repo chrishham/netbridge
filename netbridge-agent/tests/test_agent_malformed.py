@@ -31,7 +31,7 @@ async def test_tcp_connect_with_bad_host_or_port_is_answered_not_crashed(host, p
         {"type": "tcp_connect", "stream_id": "s1", "host": host, "port": port}))
     (res,) = _sent(ws)
     assert res == {"type": "tcp_connect_result", "stream_id": "s1", "success": False,
-                   "error": "Invalid host or port"}
+                   "error": "Invalid host or port", "error_code": "invalid_request"}
 
 
 @pytest.mark.parametrize("sid", [None, [1], "", "x" * 129, 5])

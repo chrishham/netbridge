@@ -11,9 +11,22 @@ as well as Basic auth fallback.
 
 import asyncio
 import base64
+import errno
 import logging
+import socket
 import sys
 from typing import Optional
+
+from shared_auth.connect_errors import (
+    DNS_FAILED,
+    GENERAL,
+    HOST_UNREACHABLE,
+    NETWORK_UNREACHABLE,
+    NOT_ALLOWED,
+    REFUSED,
+    TIMEOUT,
+    UPSTREAM_PROXY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +45,40 @@ class ProxyAuthRejected(ProxyConnectionError):
     Distinct from generic 407 so callers can disable the cached credentials
     after a single failure to avoid AD account lockout from repeated retries.
     """
+
+
+class DnsError(OSError):
+    """Hostname resolution failed or timed out."""
+
+
+# POSIX and Winsock values, since errno or winerror may carry either form
+_OS_CODES = (
+    ({errno.ECONNREFUSED, 10061}, REFUSED),
+    ({errno.EHOSTUNREACH, 10065}, HOST_UNREACHABLE),
+    ({errno.ENETUNREACH, 10051}, NETWORK_UNREACHABLE),
+    ({errno.ETIMEDOUT, 10060}, TIMEOUT),
+)
+
+
+def connect_error_code(exc: BaseException) -> str:
+    """Map a connect failure to a machine-readable tcp_connect_result error_code."""
+    if isinstance(exc, ProxyAuthRejected):
+        return UPSTREAM_PROXY
+    if isinstance(exc, ProxyConnectionError):
+        return {403: NOT_ALLOWED, 504: TIMEOUT, 502: HOST_UNREACHABLE}.get(
+            exc.status_code, UPSTREAM_PROXY)
+    if isinstance(exc, (DnsError, socket.gaierror)):
+        return DNS_FAILED
+    if isinstance(exc, ConnectionRefusedError):
+        return REFUSED
+    if isinstance(exc, TimeoutError):
+        return TIMEOUT
+    if isinstance(exc, OSError):
+        for value in (exc.errno, getattr(exc, "winerror", None)):
+            for numbers, code in _OS_CODES:
+                if value in numbers:
+                    return code
+    return GENERAL
 
 
 def parse_proxy_address(proxy: str) -> tuple[str, int]:

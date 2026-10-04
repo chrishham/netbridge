@@ -758,3 +758,95 @@ class TestSSPIHandshake:
                 )
 
         mock_auth.close.assert_called_once()
+
+
+class TestConnectErrorCode:
+    @staticmethod
+    def code(exc):
+        from netbridge_agent.tunnel import connect_error_code
+        return connect_error_code(exc)
+
+    def test_proxy_auth_rejected(self):
+        from netbridge_agent.tunnel import ProxyAuthRejected
+        assert self.code(ProxyAuthRejected("bad creds", 407)) == "upstream_proxy"
+
+    @pytest.mark.parametrize("status,expected", [
+        (403, "not_allowed"), (502, "host_unreachable"), (504, "timeout"),
+        (407, "upstream_proxy"), (None, "upstream_proxy"),
+    ])
+    def test_proxy_connection_error_status(self, status, expected):
+        assert self.code(ProxyConnectionError("x", status)) == expected
+
+    def test_dns_error(self):
+        from netbridge_agent.tunnel import DnsError
+        assert self.code(DnsError("no such host")) == "dns_failed"
+
+    def test_gaierror(self):
+        import socket
+        assert self.code(socket.gaierror(-2, "Name or service not known")) == "dns_failed"
+
+    def test_connection_refused(self):
+        assert self.code(ConnectionRefusedError()) == "refused"
+
+    def test_timeout_errors(self):
+        assert self.code(TimeoutError()) == "timeout"
+        assert self.code(asyncio.TimeoutError()) == "timeout"
+
+    @pytest.mark.parametrize("num,expected", [
+        ("EHOSTUNREACH", "host_unreachable"),
+        ("ENETUNREACH", "network_unreachable"),
+        ("ETIMEDOUT", "timeout"),
+        ("ECONNREFUSED", "refused"),
+    ])
+    def test_posix_errno(self, num, expected):
+        import errno
+        assert self.code(OSError(getattr(errno, num), "x")) == expected
+
+    @pytest.mark.parametrize("num,expected", [
+        (10061, "refused"), (10065, "host_unreachable"),
+        (10051, "network_unreachable"), (10060, "timeout"),
+    ])
+    def test_winerror_attribute_only(self, num, expected):
+        exc = OSError("x")
+        exc.winerror = num
+        assert self.code(exc) == expected
+
+    @pytest.mark.parametrize("num,expected", [
+        (10061, "refused"), (10065, "host_unreachable"),
+        (10051, "network_unreachable"), (10060, "timeout"),
+    ])
+    def test_winsock_value_in_errno(self, num, expected):
+        assert self.code(OSError(num, "x")) == expected
+
+    def test_posix_value_in_winerror(self):
+        import errno
+        exc = OSError("x")
+        exc.winerror = errno.EHOSTUNREACH
+        assert self.code(exc) == "host_unreachable"
+
+    def test_unrelated_oserror(self):
+        assert self.code(OSError("boom")) == "general"
+
+    def test_other_exception(self):
+        assert self.code(ValueError("x")) == "general"
+
+    async def test_resolve_destination_failures_map_to_dns_failed(self):
+        import socket
+        from netbridge_agent import agent
+
+        async def fail(*a, **k):
+            raise socket.gaierror(-2, "Name or service not known")
+
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "getaddrinfo", fail):
+            with pytest.raises(OSError) as ei:
+                await agent.resolve_destination("nx.invalid", 80)
+        assert self.code(ei.value) == "dns_failed"
+
+        async def hang(*a, **k):
+            await asyncio.sleep(5)
+
+        with patch.object(loop, "getaddrinfo", hang):
+            with pytest.raises(OSError) as ei:
+                await agent.resolve_destination("slow.invalid", 80, timeout=0.01)
+        assert self.code(ei.value) == "dns_failed"

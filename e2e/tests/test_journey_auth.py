@@ -209,7 +209,8 @@ class FakeWs:
         sid = self.sent[-1]["stream_id"]
         if f"('upn', '{journey.OTHER_USER}')" not in self.token:
             return {"type": "tcp_connect_result", "stream_id": sid, "success": True}
-        return {"type": "tcp_connect_result", "stream_id": sid, "success": False, "error": journey.NO_AGENT}
+        return {"type": "tcp_connect_result", "stream_id": sid, "success": False, "error": journey.NO_AGENT,
+                "error_code": "no_agent"}
 
     def close(self):
         self.closed = True
@@ -242,6 +243,20 @@ def test_user_isolation_passes(j, tunnel):
     assert mine.sent[1] == {"type": "tcp_close", "stream_id": mine.sent[0]["stream_id"]}
     assert other.closed and mine.closed and tunnel.closed
     assert journey.NO_AGENT in detail and "before and after: True" in detail
+
+
+def test_user_isolation_fails_without_the_no_agent_error_code(j, tunnel, monkeypatch):
+    real = tunnel
+    orig = j._tunnel_connect
+
+    def no_code(*a, **k):
+        r = dict(orig(*a, **k))
+        r.pop("error_code", None)
+        return r
+
+    monkeypatch.setattr(j, "_tunnel_connect", no_code)
+    ok, _ = j._user_isolation(FakeRelay(), FakeStub(), IP, TARGETS)
+    assert not ok
 
 
 def test_user_isolation_fails_when_other_user_reaches_an_agent(j, tunnel, monkeypatch):

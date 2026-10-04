@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+import ipaddress
 import json
+import socket
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -429,7 +431,7 @@ async def test_legacy_dial_cancelled_while_still_pending_reports_it(legacy_dial)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     sent = [json.loads(c.args[0]) for c in ws.send_str.call_args_list]
-    assert sent == [{"type": "tcp_connect_result", "stream_id": "s1", "success": False, "error": "Connection cancelled"}]
+    assert sent == [{"type": "tcp_connect_result", "stream_id": "s1", "success": False, "error": "Connection cancelled", "error_code": "general"}]
 
 
 async def test_legacy_malformed_connect_reusing_a_live_id_gets_no_rejection(legacy_dial, mock_reader, mock_writer):
@@ -439,3 +441,90 @@ async def test_legacy_malformed_connect_reusing_a_live_id_gets_no_rejection(lega
     await legacy.handle_tcp_connect(ws, {"type": "tcp_connect", "stream_id": "s1", "host": None, "port": 80})
     ws.send_str.assert_not_called()
     assert "s1" in legacy.active_streams
+
+
+def _ws():
+    return MagicMock(closed=False, send_str=AsyncMock())
+
+
+def _results(ws):
+    return [json.loads(c.args[0]) for c in ws.send_str.call_args_list]
+
+
+async def _connect_and_wait(legacy, ws, request=None):
+    await legacy.handle_tcp_connect(ws, request or _connect())
+    task = legacy.pending_connections.get("s1")
+    if task is not None:
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_legacy_local_dns_failure_still_dials(monkeypatch):
+    # the passthrough proxy may resolve names the agent cannot, so a local
+    # resolver failure must not stop the dial
+    from netbridge_agent import legacy
+    from netbridge_agent.agent import DnsError
+    dials = []
+
+    async def dial(host, port, timeout, proxy_auth=None):
+        dials.append((host, port))
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr("netbridge_agent.agent.resolve_destination",
+                        AsyncMock(side_effect=DnsError("no such host")))
+    monkeypatch.setattr(legacy, "open_tcp_connection", dial)
+    monkeypatch.setattr(legacy, "pending_connections", {})
+    monkeypatch.setattr(legacy, "active_streams", {})
+    ws = _ws()
+    await _connect_and_wait(legacy, ws)
+    assert dials == [("example.com", 80)]
+    (sent,) = _results(ws)
+    assert sent["error_code"] == "refused"
+
+
+async def test_legacy_dial_dns_failure_is_dns_failed(legacy_dial, monkeypatch):
+    legacy, release, dials = legacy_dial
+    monkeypatch.setattr(legacy, "open_tcp_connection",
+                        AsyncMock(side_effect=socket.gaierror(-2, "Name or service not known")))
+    ws = _ws()
+    await _connect_and_wait(legacy, ws)
+    (sent,) = _results(ws)
+    assert sent["success"] is False and sent["error_code"] == "dns_failed"
+
+
+@pytest.mark.parametrize("status,code", [(403, "not_allowed"), (502, "host_unreachable"), (504, "timeout")])
+async def test_legacy_upstream_proxy_status_maps_to_code(legacy_dial, monkeypatch, status, code):
+    from netbridge_agent.tunnel import ProxyConnectionError
+    legacy, release, dials = legacy_dial
+    monkeypatch.setattr(legacy, "open_tcp_connection",
+                        AsyncMock(side_effect=ProxyConnectionError("upstream", status)))
+    ws = _ws()
+    await _connect_and_wait(legacy, ws)
+    (sent,) = _results(ws)
+    assert sent["success"] is False and sent["error_code"] == code
+
+
+@pytest.mark.parametrize("exc,code", [
+    (asyncio.TimeoutError(), "timeout"),
+    (ConnectionRefusedError("refused"), "refused"),
+    (OSError("boom"), "general"),
+    (ValueError("odd"), "general"),
+])
+async def test_legacy_dial_failures_carry_codes(legacy_dial, monkeypatch, exc, code):
+    legacy, release, dials = legacy_dial
+    monkeypatch.setattr(legacy, "open_tcp_connection", AsyncMock(side_effect=exc))
+    ws = _ws()
+    await _connect_and_wait(legacy, ws)
+    (sent,) = _results(ws)
+    assert sent["error_code"] == code
+
+
+async def test_legacy_field_and_cap_rejections_carry_codes(legacy_dial, monkeypatch):
+    legacy, release, dials = legacy_dial
+    ws = _ws()
+    await legacy.handle_tcp_connect(ws, {"type": "tcp_connect", "stream_id": "s1", "host": "", "port": 80})
+    monkeypatch.setattr(legacy, "MAX_CONCURRENT_CONNECTIONS", 0)
+    await legacy.handle_tcp_connect(ws, _connect("s2"))
+    monkeypatch.setattr(legacy, "MAX_CONCURRENT_CONNECTIONS", 50)
+    monkeypatch.setattr(legacy, "MAX_ACTIVE_STREAMS", 0)
+    await legacy.handle_tcp_connect(ws, _connect("s3"))
+    assert [r["error_code"] for r in _results(ws)] == ["invalid_request", "capacity", "capacity"]

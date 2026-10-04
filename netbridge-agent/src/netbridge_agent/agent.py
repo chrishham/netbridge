@@ -22,7 +22,14 @@ from urllib.parse import urlparse
 import aiohttp
 
 from .config import Config, normalize_relay_url, redact_proxy_url
-from .tunnel import ProxyAuthRejected
+from shared_auth.connect_errors import (
+    CAPACITY,
+    DNS_FAILED,
+    INVALID_REQUEST,
+    NOT_ALLOWED,
+    UNAVAILABLE,
+)
+from .tunnel import DnsError, ProxyAuthRejected, connect_error_code
 from .auth import (
     get_arm_token,
     check_az_login,
@@ -157,10 +164,6 @@ def _normalize_network(net):
 
 
 DNS_TIMEOUT = 10.0
-
-
-class DnsError(OSError):
-    """Hostname resolution failed or timed out."""
 
 
 async def resolve_destination(
@@ -585,6 +588,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             "stream_id": stream_id,
             "success": False,
             "error": err,
+            "error_code": INVALID_REQUEST,
         })
         return
 
@@ -599,6 +603,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             "stream_id": stream_id,
             "success": False,
             "error": "Too many pending connections",
+            "error_code": CAPACITY,
         })
         return
 
@@ -608,6 +613,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             "stream_id": stream_id,
             "success": False,
             "error": "Too many active streams",
+            "error_code": CAPACITY,
         })
         return
 
@@ -621,6 +627,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "stream_id": stream_id,
                 "success": False,
                 "error": "Intercept server is not configured",
+                "error_code": UNAVAILABLE,
             })
             return
         server = state.get_intercept_server()
@@ -630,6 +637,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "stream_id": stream_id,
                 "success": False,
                 "error": "Intercept server is not running",
+                "error_code": UNAVAILABLE,
             })
             return
         intercept_port = server.port_for(host)
@@ -639,6 +647,7 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 "stream_id": stream_id,
                 "success": False,
                 "error": f"Service {host} is not available",
+                "error_code": UNAVAILABLE,
             })
             return
         port = intercept_port
@@ -661,6 +670,18 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
             # so they skip resolution and validation.
             if not intercepted:
                 resolved = await resolve_destination(host, port)
+                if not resolved:
+                    logger.warning(
+                        f"DNS returned no usable addresses: {stream_id[:8]} -> "
+                        f"{host}:{port} [{DNS_FAILED}]")
+                    await send_to_relay(ws, {
+                        "type": "tcp_connect_result",
+                        "stream_id": stream_id,
+                        "success": False,
+                        "error": f"Could not resolve {host}",
+                        "error_code": DNS_FAILED,
+                    })
+                    return
                 addresses, dest_reason = await select_destinations(
                     host, port,
                     allowed_destinations=state.allowed_destinations,
@@ -672,12 +693,13 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                 if dest_reason or not addresses:
                     logger.warning(
                         f"Destination denied: {stream_id[:8]} -> {host}:{port}: "
-                        f"{dest_reason or 'no usable addresses'}")
+                        f"{dest_reason or 'no usable addresses'} [{NOT_ALLOWED}]")
                     await send_to_relay(ws, {
                         "type": "tcp_connect_result",
                         "stream_id": stream_id,
                         "success": False,
                         "error": f"Destination {host}:{port} is not allowed",
+                        "error_code": NOT_ALLOWED,
                     })
                     return
             # Skip Basic auth if creds were already rejected this run, to
@@ -741,21 +763,25 @@ async def handle_tcp_connect(state: AgentState, ws, request: dict) -> None:
                         state.on_proxy_auth_rejected()
                     except Exception:
                         logger.exception("on_proxy_auth_rejected callback failed")
+            code = connect_error_code(e)
             await send_to_relay(ws, {
                 "type": "tcp_connect_result",
                 "stream_id": stream_id,
                 "success": False,
                 "error": str(e),
+                "error_code": code,
             }, silent=True)
-            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {type(e).__name__}: {e}")
+            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {type(e).__name__}: {e} [{code}]")
         except Exception as e:
+            code = connect_error_code(e)
             await send_to_relay(ws, {
                 "type": "tcp_connect_result",
                 "stream_id": stream_id,
                 "success": False,
                 "error": str(e) or type(e).__name__,
+                "error_code": code,
             }, silent=True)
-            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {type(e).__name__}: {e}")
+            logger.warning(f"Failed: {stream_id[:8]} -> {host}:{port}: {type(e).__name__}: {e} [{code}]")
 
     # No await between this check and the registration below, so it is atomic
     # on the loop; a reused id would orphan the first task and its socket.

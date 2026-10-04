@@ -201,6 +201,14 @@ class TestConnectFailureReplyMapping:
 
     @pytest.mark.parametrize("exc, code", [
         (TunnelConnectError("x"), 0x04),
+        (TunnelConnectError("x", "refused"), 0x05),
+        (TunnelConnectError("x", "not_allowed"), 0x02),
+        (TunnelConnectError("x", "timeout"), 0x06),
+        (TunnelConnectError("x", "network_unreachable"), 0x03),
+        (TunnelConnectError("x", "no_agent"), 0x04),
+        (TunnelConnectError("x", "capacity"), 0x01),
+        (TunnelConnectError("x", "future_code"), 0x04),
+        (ConnectionError("x"), 0x04),
         (asyncio.TimeoutError(), 0x06),
         (RuntimeError("boom"), 0x01),
     ])
