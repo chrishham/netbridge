@@ -70,7 +70,7 @@ def _poll(predicate, timeout: float, alive=None, interval: float = 0.5):
 
 class Relay:
     def __init__(self, logs_dir: Path, port: int, blocked_port: int, env: dict, image: str | None = None, cov=None,
-                 auth: "AuthStub | None" = None):
+                 auth: "AuthStub | None" = None, extra_env: dict[str, str] | None = None):
         self.port = port
         self.image = image
         self.auth = auth
@@ -82,7 +82,7 @@ class Relay:
             auth_env = dict(NETBRIDGE_ALLOWED_TENANTS=auth.tenant, NETBRIDGE_E2E_JWKS_URL=auth.jwks_url)
         else:
             auth_env = dict(NETBRIDGE_ALLOW_NO_AUTH="true", NETBRIDGE_ALLOWED_TENANTS=TEST_TENANT)
-        self._relay_env = dict(auth_env, RELAY_BLOCKED_PORTS=str(blocked_port), **FAULT_TUNING)
+        self._relay_env = dict(auth_env, RELAY_BLOCKED_PORTS=str(blocked_port), **FAULT_TUNING, **(extra_env or {}))
         self._env = {k: v for k, v in env.items() if k != "NETBRIDGE_ALLOW_NO_AUTH"} if auth else dict(env)
         self._env.update(self._relay_env)
         if auth:

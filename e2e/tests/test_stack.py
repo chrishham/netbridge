@@ -399,3 +399,19 @@ def test_exe_add_plugins_installs_under_the_install_dir(tmp_path, monkeypatch):
     dirs = comp.add_plugins("n1")
     assert [d.parent for d in dirs] == [comp.install_dir / "plugins"] * 2
     assert "n1" in (comp.install_dir / "plugins" / "probe" / "plugin.py").read_text()
+
+
+def test_relay_extra_env_reaches_process_and_container(tmp_path, monkeypatch):
+    extra = {"RELAY_TRUSTED_PROXIES": "127.0.0.1/32", "RELAY_CLIENT_IP_HEADER": "X-Forwarded-For"}
+    seen = captured_argv(monkeypatch)
+    r = stack.Relay(tmp_path, 1, blocked_port=2, env={}, extra_env=extra)
+    assert extra.items() <= r._env.items()
+    monkeypatch.setattr(stack.Relay, "_remove_container", lambda self: None)
+    stack.Relay(tmp_path, 1, blocked_port=2, env={}, image="img", extra_env=extra).start()
+    assert "RELAY_TRUSTED_PROXIES=127.0.0.1/32" in seen["relay"]
+    assert "RELAY_CLIENT_IP_HEADER=X-Forwarded-For" in seen["relay"]
+
+
+def test_relay_without_extra_env_trusts_no_proxy(tmp_path):
+    r = stack.Relay(tmp_path, 1, blocked_port=2, env={})
+    assert "RELAY_TRUSTED_PROXIES" not in r._env

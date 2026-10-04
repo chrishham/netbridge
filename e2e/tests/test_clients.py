@@ -1,4 +1,5 @@
 import socket
+import ssl
 import struct
 import sys
 import threading
@@ -621,3 +622,60 @@ def test_socks5_connect_deadline_bounds_a_trickled_reply():
         stop.set()
         t.join(2)
         srv.close()
+
+
+# TLS through the e2e edge
+
+@pytest.fixture
+def ws_edge(tmp_path):
+    from netbridge_e2e.edgeproxy import PROFILES, EdgeProxy
+    seen = []
+
+    def handler(client):
+        req = bytearray()
+        while not req.endswith(b"\r\n\r\n"):
+            req += client.recv(1)
+        seen.append(bytes(req))
+        if b"GET /status" in req:
+            body = b'{"status": "ok"}'
+            client.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            client.recv(1)  # keep-alive: wait for the peer to go away
+            return
+        client.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 4\r\n\r\nnope")
+
+    server = _WsServer(handler)
+    edge = EdgeProxy(server.address, tmp_path / "edge", PROFILES["traefik"], 5.0).start()
+    yield edge, seen
+    edge.close()
+    server.close()
+
+
+def test_ws_upgrade_over_tls_with_extra_headers(ws_edge):
+    edge, seen = ws_edge
+    status, body = clients.ws_upgrade("127.0.0.1", edge.port, "/tunnel", "tok", ssl_context=edge.client_context(),
+                                      extra_headers={"X-Forwarded-For": "198.51.100.7"})
+    assert (status, body) == (401, "nope")
+    assert b"X-Forwarded-For: 198.51.100.7, 127.0.0.1\r\n" in seen[0]
+    assert b"Authorization: Bearer tok\r\n" in seen[0]
+
+
+def test_tls_connect_refuses_an_untrusted_edge(ws_edge):
+    edge, _ = ws_edge
+    with pytest.raises(ssl.SSLCertVerificationError):
+        clients.tls_connect("127.0.0.1", edge.port, ssl.create_default_context())
+
+
+def test_tls_connect_verifies_the_given_server_hostname(ws_edge):
+    edge, _ = ws_edge
+    with pytest.raises(ssl.SSLCertVerificationError):  # not a SAN of the edge's cert
+        clients.tls_connect("127.0.0.1", edge.port, edge.client_context(), server_hostname="example.test")
+    clients.tls_connect("127.0.0.1", edge.port, edge.client_context(), server_hostname="localhost").close()
+
+
+def test_http_get_keep_alive_leaves_the_connection_open(ws_edge):
+    edge, seen = ws_edge
+    with clients.tls_connect("127.0.0.1", edge.port, edge.client_context()) as s:
+        status, body = clients.http_get(s, f"127.0.0.1:{edge.port}", "/status", keep_alive=True)
+        assert (status, body) == (200, b'{"status": "ok"}')
+        assert not clients.wait_closed(s, 0.5)
+    assert b"Connection: keep-alive\r\n" in seen[0]

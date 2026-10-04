@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -46,6 +47,17 @@ def recv_exact(sock: socket.socket, n: int, deadline: float | None = None) -> by
             raise ConnectionError(f"connection closed after {len(buf)}/{n} bytes")
         buf += chunk
     return bytes(buf)
+
+
+def tls_connect(host: str, port: int, ssl_context: ssl.SSLContext, timeout: float = 10.0,
+                server_hostname: str | None = None) -> ssl.SSLSocket:
+    """TCP + TLS handshake, verifying the peer for server_hostname (default: host) with ssl_context."""
+    raw = socket.create_connection((host, port), timeout=timeout)
+    try:
+        return ssl_context.wrap_socket(raw, server_hostname=server_hostname or host)
+    except BaseException:
+        raw.close()
+        raise
 
 
 def socks5_connect(proxy: Address, dest_host: str, dest_port: int, timeout: float = 15.0) -> socket.socket:
@@ -121,9 +133,11 @@ def http_connect(proxy: Address, dest_host: str, dest_port: int, timeout: float 
         raise
 
 
-def http_get(sock: socket.socket, host_header: str, path: str = "/", timeout: float = 15.0) -> tuple[int, bytes]:
-    """GET over an already-established tunnel."""
-    sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n".encode())
+def http_get(sock: socket.socket, host_header: str, path: str = "/", timeout: float = 15.0,
+             keep_alive: bool = False) -> tuple[int, bytes]:
+    """GET over an already-established tunnel (keep_alive: the server may hold the connection open)."""
+    conn = "keep-alive" if keep_alive else "close"
+    sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: {conn}\r\n\r\n".encode())
     return _read_response(sock, timeout)
 
 
@@ -159,10 +173,16 @@ def wait_closed(sock: socket.socket, timeout: float) -> bool:
     return False
 
 
-def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: float = 10) -> tuple[int, str]:
-    """WebSocket upgrade with `Authorization: Bearer <token>` (none if token is None). Returns (status, body up to 4 KiB); closes the connection."""
+def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: float = 10, *,
+               ssl_context: ssl.SSLContext | None = None, server_hostname: str | None = None,
+               extra_headers: dict[str, str] | None = None) -> tuple[int, str]:
+    """WebSocket upgrade with `Authorization: Bearer <token>` (none if token is None), over TLS if
+    ssl_context is given. Returns (status, body up to 4 KiB); closes the connection."""
     deadline = time.monotonic() + timeout
-    sock = socket.create_connection((host, port), timeout=timeout)
+    if ssl_context is not None:
+        sock = tls_connect(host, port, ssl_context, timeout, server_hostname)
+    else:
+        sock = socket.create_connection((host, port), timeout=timeout)
     try:
         # Generate WebSocket key
         ws_key = base64.b64encode(os.urandom(16)).decode()
@@ -178,6 +198,7 @@ def ws_upgrade(host: str, port: int, path: str, token: str | None, timeout: floa
         ]
         if token:
             headers.append(f"Authorization: Bearer {token}")
+        headers.extend(f"{k}: {v}" for k, v in (extra_headers or {}).items())
         headers.append("")
         headers.append("")
 
