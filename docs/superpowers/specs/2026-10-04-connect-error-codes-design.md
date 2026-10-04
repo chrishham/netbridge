@@ -127,7 +127,9 @@ logged type name (`DnsError`) stay unchanged. New function in `tunnel.py`:
 4. `socket.gaierror` → `dns_failed`
 5. `ConnectionRefusedError` → `refused`
 6. `TimeoutError` (includes `asyncio.TimeoutError`) → `timeout`
-7. other `OSError`: the errno is checked first, then `winerror`
+7. other `OSError`: check `errno`, then `winerror`, each against both the
+   POSIX constant and the Winsock value, since either attribute may carry
+   either form
    - ECONNREFUSED / 10061 → `refused`
    - EHOSTUNREACH / 10065 → `host_unreachable`
    - ENETUNREACH / 10051 → `network_unreachable`
