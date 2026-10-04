@@ -108,6 +108,10 @@ def reset_caches(monkeypatch):
     monkeypatch.setattr(mod, "_allowed_users_cache", None)
     monkeypatch.setattr(mod, "_allowed_groups_cache", None)
     monkeypatch.setattr(mod, "_jwks_cache", {})
+    monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
+    monkeypatch.setattr(mod, "_jwks_failed_at", {})
+    monkeypatch.setattr(mod, "_jwks_locks", {})
+    monkeypatch.setattr(mod, "_jwks_refreshes", {})
     monkeypatch.setenv("NETBRIDGE_ALLOWED_TENANTS", VALID_TENANT)
 
 
@@ -165,7 +169,7 @@ async def test_unknown_kid_refetches_once(reset_caches):
 
     fetch_count = [0]
 
-    async def fake_get_jwks(tenant_id):
+    async def fake_get_jwks(tenant_id, force=False):
         fetch_count[0] += 1
         if fetch_count[0] == 1:
             # First fetch: return empty keys (simulate cache miss)
@@ -257,10 +261,18 @@ async def test_key_rotation_via_real_get_jwks(reset_caches):
             assert user_b == "user-b@example.com"
             assert len(requests) == 2  # Initial fetch + refetch on unknown kid
 
-            # Token A should now fail (key no longer served)
+            # Token A should now fail (key no longer served). The forced refresh for
+            # kid B started the cooldown, so this unknown kid does not fetch again.
             with pytest.raises(TokenValidationError, match="Signing key not found"):
                 await validate_arm_token(token_a)
-            assert len(requests) == 3  # one refetch for the unknown kid, then give up
+            assert len(requests) == 2
+
+            # After the cooldown an unknown kid may force one more refresh
+            import shared_auth.validate as mod  # the module only imports it inside reset_caches
+            mod._jwks_forced_refresh[VALID_TENANT] -= mod.JWKS_FORCED_REFRESH_COOLDOWN + 1
+            with pytest.raises(TokenValidationError, match="Signing key not found"):
+                await validate_arm_token(token_a)
+            assert len(requests) == 3
 
     finally:
         server.shutdown()
@@ -331,6 +343,10 @@ async def test_allowed_users_by_upn(reset_caches, monkeypatch):
     # Reset cache after setting env var
     import shared_auth.validate as mod
     monkeypatch.setattr(mod, "_jwks_cache", {})
+    monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
+    monkeypatch.setattr(mod, "_jwks_failed_at", {})
+    monkeypatch.setattr(mod, "_jwks_locks", {})
+    monkeypatch.setattr(mod, "_jwks_refreshes", {})
 
     with patch("shared_auth.validate._get_jwks", return_value=jwks):
         with pytest.raises(TokenValidationError, match="not in the allowed users list"):
@@ -398,6 +414,10 @@ async def test_allowed_groups_deny(reset_caches, monkeypatch):
     # Reset cache
     import shared_auth.validate as mod
     monkeypatch.setattr(mod, "_jwks_cache", {})
+    monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
+    monkeypatch.setattr(mod, "_jwks_failed_at", {})
+    monkeypatch.setattr(mod, "_jwks_locks", {})
+    monkeypatch.setattr(mod, "_jwks_refreshes", {})
 
     jwks = {"keys": [jwk]}
     with patch("shared_auth.validate._get_jwks", return_value=jwks):

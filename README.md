@@ -158,9 +158,13 @@ The relay is configured entirely through environment variables.
 | `RELAY_RATE_CONNECTIONS_PER_MIN` | Max WebSocket connections per user per minute | `10` |
 | `RELAY_RATE_MESSAGES_PER_SEC` | Max messages per user per second | `500` |
 | `RELAY_RATE_STREAMS_PER_MIN` | Max new TCP streams per user per minute | `300` |
-| `RELAY_RATE_IP_CONNECTIONS_PER_MIN` | Max connections per IP per minute (pre-auth) | `30` |
+| `RELAY_RATE_IP_CONNECTIONS_PER_MIN` | Max failed authentication attempts per client IP per minute (valid tokens never count) | `30` |
+| `RELAY_TRUSTED_PROXIES` | Comma-separated CIDRs of reverse proxies whose client-IP header is trusted. Only set when clients cannot bypass the proxy. | (empty: use the peer address) |
+| `RELAY_CLIENT_IP_HEADER` | Header carrying the client IP from a trusted proxy; `X-Forwarded-For` is parsed right to left, any other header must hold one IP | `X-Forwarded-For` |
 | `RELAY_MAX_ACTIVE_STREAMS` | Global maximum concurrent TCP streams | `500` |
 | `RELAY_GLOBAL_BANDWIDTH_LIMIT_MBPS` | Global bandwidth cap in Mbps (`0` = unlimited) | `0` |
+
+**Client IP behind a reverse proxy.** By default the relay keys the failed-auth limit on the TCP peer. Behind a proxy that is the proxy's address, which is safe: valid tokens never count against the limit. To key on the real client, set `RELAY_TRUSTED_PROXIES`, but only if clients cannot reach the relay except through those proxies, and list only the proxies' own addresses: a client whose address falls inside a trusted range is skipped as if it were a proxy, and a forged `X-Forwarded-For` prefix then picks its bucket. In `X-Forwarded-For` mode, every trusted proxy must append its peer to the header, which is the default for nginx (`$proxy_add_x_forwarded_for`), Traefik, Envoy and cloud load balancers. With a single-value header (`X-Real-IP`, `CF-Connecting-IP`, ...), the outermost trusted proxy must overwrite it.
 
 **Destination Filtering:**
 

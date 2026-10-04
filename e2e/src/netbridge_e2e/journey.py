@@ -32,7 +32,7 @@ from .cov import E2ECoverage
 from .faultproxy import FaultProxy
 from .jwtmint import ISSUER_V2
 from .procs import IS_WINDOWS
-from .stack import CLIENT_TUNING, CONNECTED, PROXY_READY, REDIRECTED, RELAY_SESSION, REPO, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
+from .stack import CLIENT_TUNING, CONNECTED, FAULT_TUNING, PROXY_READY, REDIRECTED, RELAY_SESSION, REPO, Relay, SourceAgent, SourceProxy, make_exe_agent, make_exe_proxy
 from .targets import PAGE, PAYLOAD_SHA256, Targets
 
 
@@ -40,6 +40,7 @@ OTHER_TENANT = "22222222-2222-2222-2222-222222222222"
 OTHER_USER = "other@netbridge.test"
 NO_AGENT = "No bridge agent available"
 PENTEST_USER = "pentest@netbridge.test"
+FLOOD_AGENT_USER = "flood-agent@netbridge.test"
 NXDOMAIN = "netbridge-e2e-nxdomain.invalid"
 LINK_LOCAL = "169.254.169.254"
 # not observable here: rate limits are raised on purpose (FAULT_TUNING), session_hijack makes one
@@ -222,6 +223,7 @@ class Journey:
         self._errors(ip, targets, relay, agent)
         self.check("auth_user_isolation", lambda: self._user_isolation(relay, stub, ip, targets))
         self._pentest_step(relay, stub, env, logs)
+        self.check("auth_flood_spares_valid_users", lambda: self._auth_flood(relay, stub, ip, targets))
         self._reconnect(relay, agent, proxy, ip, targets)
         self._faults(relay, agent, proxy, ip, targets, agent_link, proxy_link)
 
@@ -529,6 +531,24 @@ class Journey:
         control = mine.get("type") == "tcp_connect_result" and mine.get("success") is True
         return isolated and control and echo_after, (f"{OTHER_USER}: {json.dumps(other)}; journey user: {json.dumps(mine)}; "
                                                      f"echo stream round-tripped before and after: {echo_after}")
+
+    def _auth_flood(self, relay: Relay, stub: AuthStub, ip: str, targets: Targets) -> tuple[bool, str]:
+        """Exhaust the per-IP failed-auth budget, then a valid user must still connect and tunnel."""
+        cap = int(FAULT_TUNING["RELAY_RATE_IP_CONNECTIONS_PER_MIN"]) + 10
+        throttled_at, last = None, None
+        for attempt in range(1, cap + 1):
+            last = clients.ws_upgrade("127.0.0.1", relay.port, "/tunnel", "not-a-jwt")
+            if last[0] == 429:
+                throttled_at = attempt
+                break
+        if throttled_at is None:
+            return False, f"no 429 within {cap} bad-token upgrades; last {last}"
+        agent_status, _ = clients.ws_upgrade("127.0.0.1", relay.port, "/ws", stub.mint(upn=FLOOD_AGENT_USER))
+        reply = self._tunnel_connect(relay, stub.mint(), ip, targets)
+        ok = (agent_status == 101 and reply.get("type") == "tcp_connect_result"
+              and reply.get("success") is True)
+        return ok, (f"429 after {throttled_at} bad-token upgrades; then valid /ws upgrade: HTTP {agent_status}, "
+                    f"valid /tunnel connect: {json.dumps(reply)}")
 
     def _pentest_step(self, relay: Relay, stub: AuthStub, env: dict, logs: Path) -> None:
         if self.args.mode != "source":

@@ -208,7 +208,7 @@ def test_relay_image_gets_fault_tuning(tmp_path, monkeypatch):
     pairs = [argv[i:i + 2] for i in range(len(argv) - 1)]
     assert ["-e", "RELAY_HEARTBEAT_INTERVAL=10"] in pairs
     assert ["-e", "RELAY_RATE_CONNECTIONS_PER_MIN=600"] in pairs
-    assert ["-e", "RELAY_RATE_IP_CONNECTIONS_PER_MIN=600"] in pairs
+    assert ["-e", "RELAY_RATE_IP_CONNECTIONS_PER_MIN=49"] in pairs
 
 
 def test_relay_source_env_gets_fault_tuning(tmp_path, monkeypatch):
@@ -226,7 +226,7 @@ def test_relay_source_env_gets_fault_tuning(tmp_path, monkeypatch):
     stack.Relay(tmp_path, 1, blocked_port=2, env={}).start()
     assert {k: envs["relay"][k] for k in stack.FAULT_TUNING} == {
         "RELAY_HEARTBEAT_INTERVAL": "10", "RELAY_RATE_CONNECTIONS_PER_MIN": "600",
-        "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "600"}
+        "RELAY_RATE_IP_CONNECTIONS_PER_MIN": "49"}
 
 
 class FakeStub:

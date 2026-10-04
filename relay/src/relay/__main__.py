@@ -151,8 +151,13 @@ MAX_ACTIVE_STREAMS = _get_int_env("RELAY_MAX_ACTIVE_STREAMS", 500)
 # Maximum WebSocket message size (1MB default)
 MAX_MESSAGE_SIZE = _get_int_env("RELAY_MAX_MESSAGE_SIZE", 1 * 1024 * 1024)
 
-# Per-IP connection rate limiting (pre-auth, before user identity is known)
+# Per-IP limit on failed authentication attempts (valid tokens never count against it)
 RATE_LIMIT_IP_PER_MIN = _get_int_env("RELAY_RATE_IP_CONNECTIONS_PER_MIN", 30)
+
+# Client IP behind reverse proxies (opt-in). Only enable when the proxy chain
+# cannot be bypassed: a client reaching the relay directly could forge the header.
+CLIENT_IP_HEADER = os.environ.get("RELAY_CLIENT_IP_HEADER", "").strip() or "X-Forwarded-For"
+_TRUSTED_PROXIES: tuple = ()  # parsed from RELAY_TRUSTED_PROXIES in main()
 
 # Global bandwidth limiter (0 = disabled)
 GLOBAL_BANDWIDTH_LIMIT_MBPS = _get_int_env("RELAY_GLOBAL_BANDWIDTH_LIMIT_MBPS", 0)
@@ -331,15 +336,85 @@ def _get_stream_limiter(user_email: str) -> AsyncLimiter:
     return entry.limiter
 
 
-# Per-IP rate limiting (applied before authentication)
+# Per-IP limiting of failed authentication attempts
+IP_THROTTLE_REPORT_INTERVAL = 60  # seconds between "limit exceeded" log lines per IP
+_now = time.monotonic  # report clock, patched by tests without touching aiolimiter's clock
+
+
 @dataclass
 class _TimedLimiter:
     """Rate limiter with last-used timestamp for cleanup."""
     limiter: AsyncLimiter
     last_used: float = field(default_factory=time.monotonic)
+    last_report: float = float("-inf")  # last "limit exceeded" log line (per-IP limiters only)
+    suppressed: int = 0                  # throttled requests not logged since then
 
 
 _ip_limiters: dict[str, _TimedLimiter] = {}
+
+
+def _parse_trusted_proxies(raw: str) -> tuple:
+    """Comma-separated CIDRs (bare IPs allowed); ValueError on an invalid entry."""
+    return tuple(_unmap(ipaddress.ip_network(part.strip(), strict=False)) for part in raw.split(",") if part.strip())
+
+
+_MAPPED_V4 = ipaddress.ip_network("::ffff:0:0/96")
+
+
+def _unmap(net):
+    """::ffff:10.0.0.0/104 is 10.0.0.0/8, so it matches peers _parse_ip has unmapped."""
+    if net.version == 6 and net.prefixlen >= 96 and net.subnet_of(_MAPPED_V4):
+        return ipaddress.ip_network(f"{net.network_address.ipv4_mapped}/{net.prefixlen - 96}")
+    return net
+
+
+def _parse_ip(value: str):
+    """An IP from a forwarded-header entry, tolerating a port (1.2.3.4:80, [v6]:80); None if unusable."""
+    value = value.strip()
+    if value.startswith("[") and "]" in value:
+        value = value[1:value.index("]")]
+    elif value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return getattr(ip, "ipv4_mapped", None) or ip  # ::ffff:1.2.3.4 is 1.2.3.4
+
+
+def _warn_client_ip_config(header_env: str, proxies) -> None:
+    """Warn about client-IP settings that are ignored or trust everything."""
+    if header_env.strip() and not proxies:
+        logger.warning("RELAY_CLIENT_IP_HEADER is set but RELAY_TRUSTED_PROXIES is empty: the header is ignored")
+    if any(net.prefixlen == 0 for net in proxies):
+        logger.warning("RELAY_TRUSTED_PROXIES contains a /0 range: every address is trusted, "
+                       "so any client can spoof its IP")
+
+
+def _is_trusted(ip) -> bool:
+    return any(ip in net for net in _TRUSTED_PROXIES)
+
+
+def _client_ip(request: web.Request) -> str:
+    """The peer address, or the client address from CLIENT_IP_HEADER when the peer is a trusted proxy."""
+    remote = request.remote or "unknown"
+    if not _TRUSTED_PROXIES:
+        return remote
+    peer = _parse_ip(remote)
+    if peer is None or not _is_trusted(peer):
+        return remote
+    values = request.headers.getall(CLIENT_IP_HEADER, [])
+    if CLIENT_IP_HEADER.lower() == "x-forwarded-for":
+        # Repeated fields are one list in order (RFC 9110); .get() would return the client's own first field
+        for entry in reversed(",".join(values).split(",")):
+            ip = _parse_ip(entry)
+            if ip is not None and not _is_trusted(ip):
+                return str(ip)
+        return remote
+    if len(values) != 1:
+        return remote  # a proxy that overwrites leaves exactly one field
+    ip = _parse_ip(values[0])
+    return str(ip) if ip is not None else remote
 
 
 def _get_ip_limiter(ip: str) -> _TimedLimiter:
@@ -590,23 +665,36 @@ async def _cleanup_agent(ws: web.WebSocketResponse, user_email: str) -> None:
         }), silent=True)
 
 
-async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
-    """Handle WebSocket connection from bridge agent."""
-    # Per-IP rate limit (before authentication to block floods early)
-    client_ip = request.remote or "unknown"
+async def _authenticate_upgrade(request: web.Request, kind: str) -> tuple[str | None, web.Response | None]:
+    """Authenticate first; only failures are charged to the per-IP bucket.
+
+    Behind a reverse proxy or NAT many users share one address, so a pre-auth
+    per-IP limit would let unauthenticated traffic lock out valid users.
+    """
+    client_ip = _client_ip(request)
+    success, result = await authenticate_request(request)
+    if success:
+        return result, None
     ip_entry = _get_ip_limiter(client_ip)
     if not ip_entry.limiter.has_capacity():
-        logger.warning(f"Per-IP rate limit exceeded for {client_ip}")
-        return web.Response(status=429, text="Too many requests from this IP")
+        now = _now()
+        if now - ip_entry.last_report >= IP_THROTTLE_REPORT_INTERVAL:
+            logger.warning(f"Per-IP auth-failure limit exceeded for {client_ip} "
+                           f"({ip_entry.suppressed} more since last report)")
+            ip_entry.last_report, ip_entry.suppressed = now, 0
+        else:
+            ip_entry.suppressed += 1
+        return None, web.Response(status=429, text="Too many failed attempts from this IP")
     await ip_entry.limiter.acquire()
+    logger.warning(f"{kind} auth rejected for {client_ip}: {result}")
+    return None, web.Response(status=401, text=result)
 
-    # Authenticate first
-    success, result = await authenticate_request(request)
-    if not success:
-        logger.warning(f"Agent auth rejected for {client_ip}: {result}")
-        return web.Response(status=401, text=result)
 
-    user_email = result
+async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
+    """Handle WebSocket connection from bridge agent."""
+    user_email, rejection = await _authenticate_upgrade(request, "Agent")
+    if rejection is not None:
+        return rejection
 
     # Rate limit connections (non-blocking check)
     limiter = _get_connection_limiter(user_email)
@@ -946,21 +1034,9 @@ async def _handle_tcp_close(data: dict, tunnel_key: str, raw_msg: str) -> None:
 
 async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
     """Handle WebSocket from SOCKS5 proxy for TCP tunneling."""
-    # Per-IP rate limit (before authentication to block floods early)
-    client_ip = request.remote or "unknown"
-    ip_entry = _get_ip_limiter(client_ip)
-    if not ip_entry.limiter.has_capacity():
-        logger.warning(f"Per-IP rate limit exceeded for {client_ip}")
-        return web.Response(status=429, text="Too many requests from this IP")
-    await ip_entry.limiter.acquire()
-
-    # Authenticate first
-    success, result = await authenticate_request(request)
-    if not success:
-        logger.warning(f"Tunnel auth rejected for {client_ip}: {result}")
-        return web.Response(status=401, text=result)
-
-    user_email = result
+    user_email, rejection = await _authenticate_upgrade(request, "Tunnel")
+    if rejection is not None:
+        return rejection
 
     # Rate limit connections (non-blocking check)
     limiter = _get_connection_limiter(user_email)
@@ -1099,7 +1175,7 @@ def create_app() -> web.Application:
 
 def main():
     """Entry point for the relay server."""
-    global REQUIRE_AUTH
+    global REQUIRE_AUTH, _TRUSTED_PROXIES
 
     import argparse
 
@@ -1162,6 +1238,15 @@ def main():
             logger.error(f"Configuration error: {e}")
             logger.error("Set NETBRIDGE_ALLOWED_TENANTS to a comma-separated list of Azure AD tenant IDs")
             sys.exit(1)
+
+    try:
+        _TRUSTED_PROXIES = _parse_trusted_proxies(os.environ.get("RELAY_TRUSTED_PROXIES", ""))
+    except ValueError as e:
+        logger.error(f"Configuration error: RELAY_TRUSTED_PROXIES: {e}")
+        sys.exit(1)
+    _warn_client_ip_config(os.environ.get("RELAY_CLIENT_IP_HEADER", ""), _TRUSTED_PROXIES)
+    if _TRUSTED_PROXIES:
+        logger.info(f"Client IP: {CLIENT_IP_HEADER} from {len(_TRUSTED_PROXIES)} trusted proxy range(s)")
 
     logger.info("Routing: all traffic via bridge agent")
 
