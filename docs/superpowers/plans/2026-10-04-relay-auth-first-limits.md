@@ -56,7 +56,8 @@ These are input classes the spec implies and the base design could miss. Each ha
 - Produces:
   - `async def _get_jwks(tenant_id: str, force: bool = False) -> dict`
   - constants `JWKS_FORCED_REFRESH_COOLDOWN = 60`, `JWKS_FETCH_BACKOFF = 10` and `JWKS_MAX_STALE = 86400`
-  - module state `_jwks_cache: dict[str, tuple[float, dict]]` (unchanged shape: `(time.time() at fetch, jwks)`), `_jwks_locks: dict[str, asyncio.Lock]`, `_jwks_failed_at: dict[str, float]` and `_jwks_forced_refresh: dict[str, float]`. The last two hold `time.monotonic()` values.
+  - module state `_jwks_cache: dict[str, tuple[float, dict]]` (unchanged shape: `(time.time() at fetch, jwks)`), `_jwks_locks: dict[str, asyncio.Lock]`, `_jwks_failed_at: dict[str, float]`, `_jwks_forced_refresh: dict[str, float]` (both hold `time.monotonic()` values) and `_jwks_refreshes: set[asyncio.Task]`
+  - helpers `_refresh_jwks(tenant_id, force=False) -> dict` (the locked fetch) and `_refresh_jwks_quietly(tenant_id) -> None` (background wrapper)
   - new error text: `Signing keys unavailable`
 - Keeps:
   - `_get_jwks_url(tenant_id)` as the only URL source. The e2e relaysite hook patches it.
@@ -70,6 +71,7 @@ In `shared/tests/test_validate_signatures.py`'s `reset_caches`, and next to the 
     monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
     monkeypatch.setattr(mod, "_jwks_failed_at", {})
     monkeypatch.setattr(mod, "_jwks_locks", {})
+    monkeypatch.setattr(mod, "_jwks_refreshes", set())
 ```
 
 Those existing tests patch `_get_jwks` with a one-argument fake. After this task, `validate_arm_token` calls `_get_jwks(tid, force=True)`, so update each such fake to accept `force=False` (`grep -n "def fake_get_jwks" shared/tests/*.py`). Fakes passed as `return_value=` need no change.
@@ -84,6 +86,7 @@ Those existing tests patch `_get_jwks` with a one-argument fake. After this task
             assert len(requests) == 2
 
             # After the cooldown an unknown kid may force one more refresh
+            import shared_auth.validate as mod  # the module only imports it inside reset_caches
             mod._jwks_forced_refresh[VALID_TENANT] -= mod.JWKS_FORCED_REFRESH_COOLDOWN + 1
             with pytest.raises(TokenValidationError, match="Signing key not found"):
                 await validate_arm_token(token_a)
@@ -100,6 +103,7 @@ Create `shared/tests/test_jwks_fetching.py`. These tests exercise the real `_get
 """JWKS fetching toward Microsoft is bounded: single flight, failure backoff, forced-refresh cooldown."""
 
 import asyncio
+import time
 from unittest.mock import patch
 
 import httpx
@@ -121,6 +125,7 @@ def fresh(monkeypatch):
     monkeypatch.setattr(mod, "_jwks_forced_refresh", {})
     monkeypatch.setattr(mod, "_jwks_failed_at", {})
     monkeypatch.setattr(mod, "_jwks_locks", {})
+    monkeypatch.setattr(mod, "_jwks_refreshes", set())
     monkeypatch.setenv("NETBRIDGE_ALLOWED_TENANTS", VALID_TENANT)
 
 
@@ -156,6 +161,17 @@ def _patched(ms):
     async def get(self, url, *args, **kwargs):
         return await ms.get(self, url, *args, **kwargs)
     return patch.object(httpx.AsyncClient, "get", get)
+
+
+async def _drain_refreshes():
+    """Let background refreshes started by expired-but-usable caches finish."""
+    while mod._jwks_refreshes:
+        await asyncio.gather(*list(mod._jwks_refreshes))
+
+
+def _expire(seconds_past_fetch):
+    fetched_at, jwks = mod._jwks_cache[VALID_TENANT]
+    mod._jwks_cache[VALID_TENANT] = (fetched_at - seconds_past_fetch, jwks)
 
 
 @pytest.mark.asyncio
@@ -255,8 +271,8 @@ async def test_failure_backoff_with_empty_cache(key, monkeypatch):
     ms = FakeMicrosoft([jwk])
     ms.fail = True
     with _patched(ms):
-        with pytest.raises(TokenValidationError):
-            await validate_arm_token(_token(private))
+        with pytest.raises(TokenValidationError, match="Signing keys unavailable"):
+            await validate_arm_token(_token(private))  # first failure: same text as during backoff
         calls = ms.calls
         with pytest.raises(TokenValidationError, match="Signing keys unavailable"):
             await validate_arm_token(_token(private))
@@ -267,18 +283,39 @@ async def test_failure_backoff_with_empty_cache(key, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_expired_cache_is_used_during_backoff(key, monkeypatch):
+async def test_expired_cache_is_used_during_backoff(key):
     private, jwk = key
     ms = FakeMicrosoft([jwk])
     with _patched(ms):
         await validate_arm_token(_token(private))
-        fetched_at, jwks = mod._jwks_cache[VALID_TENANT]
-        mod._jwks_cache[VALID_TENANT] = (fetched_at - mod.JWKS_CACHE_TTL - 1, jwks)  # expire it
+        _expire(mod.JWKS_CACHE_TTL + 1)
         ms.fail = True
-        assert await validate_arm_token(_token(private))  # fetch fails, expired keys used
+        assert await validate_arm_token(_token(private))  # expired keys used, refresh in background
+        await _drain_refreshes()
+        assert VALID_TENANT in mod._jwks_failed_at  # the background fetch failed
         calls = ms.calls
         assert await validate_arm_token(_token(private))
+        await _drain_refreshes()
         assert ms.calls == calls  # backoff: no second attempt
+
+
+@pytest.mark.asyncio
+async def test_expired_usable_cache_does_not_wait_for_slow_fetch(key):
+    private, jwk = key
+    ms = FakeMicrosoft([jwk])
+    with _patched(ms):
+        await validate_arm_token(_token(private))
+        _expire(mod.JWKS_CACHE_TTL + 1)
+        ms.gate = asyncio.Event()  # Microsoft hangs
+        users = await asyncio.wait_for(
+            asyncio.gather(*(validate_arm_token(_token(private)) for _ in range(5))), timeout=1)
+        assert len(users) == 5
+        await asyncio.sleep(0.05)  # let the background refresh reach the hanging fetch
+        assert ms.calls == 2  # the initial fetch plus one background refresh, still blocked
+        ms.gate.set()
+        await _drain_refreshes()
+        assert ms.calls == 2
+        assert mod._jwks_cache[VALID_TENANT][0] > time.time() - 5  # refreshed
 
 
 @pytest.mark.asyncio
@@ -290,7 +327,7 @@ async def test_keys_older_than_max_stale_are_not_served(key):
         fetched_at, jwks = mod._jwks_cache[VALID_TENANT]
         mod._jwks_cache[VALID_TENANT] = (fetched_at - mod.JWKS_MAX_STALE - 1, jwks)
         ms.fail = True
-        with pytest.raises(TokenValidationError):
+        with pytest.raises(TokenValidationError, match="Signing keys unavailable"):
             await validate_arm_token(_token(private))  # fetch fails, keys too old to serve
         with pytest.raises(TokenValidationError, match="Signing keys unavailable"):
             await validate_arm_token(_token(private))  # within backoff
@@ -325,6 +362,7 @@ JWKS_MAX_STALE = 86400  # seconds
 _jwks_locks: dict[str, asyncio.Lock] = {}
 _jwks_failed_at: dict[str, float] = {}
 _jwks_forced_refresh: dict[str, float] = {}
+_jwks_refreshes: set[asyncio.Task] = set()  # strong refs to background refreshes
 
 
 async def _fetch_jwks(tenant_id: str) -> dict:
@@ -345,8 +383,28 @@ async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
     force=True bypasses the TTL (unknown kid) and only replaces the cache on success.
     """
     cached = _jwks_cache.get(tenant_id)
-    if not force and cached is not None and (time.time() - cached[0]) < JWKS_CACHE_TTL:
-        return cached[1]  # fast path: a fetch in flight must not stall validations served from cache
+    if not force and cached is not None:
+        age = time.time() - cached[0]
+        if age < JWKS_CACHE_TTL:
+            return cached[1]  # fast path: a fetch in flight must not stall validations served from cache
+        if age < JWKS_MAX_STALE:
+            # Expired but usable: refresh in the background so no validation waits on Microsoft
+            if not _jwks_locks.setdefault(tenant_id, asyncio.Lock()).locked():
+                task = asyncio.create_task(_refresh_jwks_quietly(tenant_id))
+                _jwks_refreshes.add(task)
+                task.add_done_callback(_jwks_refreshes.discard)
+            return cached[1]
+    return await _refresh_jwks(tenant_id, force)
+
+
+async def _refresh_jwks_quietly(tenant_id: str) -> None:
+    try:
+        await _refresh_jwks(tenant_id)
+    except Exception:
+        pass  # recorded in _jwks_failed_at; callers keep the cached keys
+
+
+async def _refresh_jwks(tenant_id: str, force: bool = False) -> dict:
     lock = _jwks_locks.setdefault(tenant_id, asyncio.Lock())
     async with lock:
         cached = _jwks_cache.get(tenant_id)
@@ -361,11 +419,11 @@ async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
             raise TokenValidationError("Signing keys unavailable")
         try:
             jwks = await _fetch_jwks(tenant_id)
-        except Exception:
+        except Exception as e:
             _jwks_failed_at[tenant_id] = time.monotonic()
             if usable:
                 return cached[1]  # keep serving the previous keys
-            raise
+            raise TokenValidationError("Signing keys unavailable") from e
         _jwks_failed_at.pop(tenant_id, None)
         _jwks_cache[tenant_id] = (time.time(), jwks)
         return jwks
@@ -376,7 +434,9 @@ Add `import asyncio` to the imports. Keep `global` statements out: the dicts are
 Two consequences of the code above:
 
 - When a fetch fails and the cached keys are less than `JWKS_MAX_STALE` old, `_get_jwks` returns them instead of raising. That is intended: an outage at Microsoft must not lock out users whose keys are cached. Past a day, a revoked key must not keep working, so validation fails until a fetch succeeds.
-- A `TokenValidationError` raised from `_fetch_jwks` falls into the generic `except Exception` as well. That is fine, because both record the failure.
+- Every fetch failure without usable keys raises `Signing keys unavailable`, on the first failure as well as during the backoff, so clients see one message for one condition. The underlying error is chained (`from e`) for the logs.
+- Once the TTL has passed but the keys are younger than `JWKS_MAX_STALE`, callers get the cached keys immediately and one background task refreshes them (stale-while-revalidate). A slow or failing Microsoft endpoint never delays a validation that has usable keys. Several tasks may be created before the first takes the lock; the re-check under the lock makes the later ones return without fetching.
+- `_refresh_jwks_quietly` swallows the exception, so a failing background task does not log "Task exception was never retrieved"; the failure is recorded in `_jwks_failed_at`.
 
 - [ ] **Step 5: Implement the unknown-kid branch**
 

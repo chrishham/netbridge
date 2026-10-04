@@ -130,6 +130,13 @@ bound fetches toward Microsoft regardless of request rate:
      expired one, they use it; otherwise they raise `TokenValidationError("Signing keys unavailable")`.
    - An expired-but-present cache keeps being used through a backoff, so a
      Microsoft outage does not lock out users whose keys are cached.
+   - Expired keys younger than `JWKS_MAX_STALE` are returned at once while
+     one background task refreshes them (stale-while-revalidate), so a slow
+     or hanging Microsoft endpoint never delays a validation that has usable
+     keys. Only a missing or too-old cache, or a forced refresh, waits on the
+     fetch.
+   - Every fetch failure without usable keys raises
+     `Signing keys unavailable`, the first one included.
    - Stale keys are served for at most `JWKS_MAX_STALE = 86400` seconds
      after their fetch. Past that, a failed fetch (or a backoff) raises
      `Signing keys unavailable`, so a key Microsoft revoked cannot keep
