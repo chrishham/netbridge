@@ -20,6 +20,8 @@ def nb(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     before = list(logging.getLogger().handlers)
     a = NetBridgeApp(console=True)
+    # headless logic: off win32 nothing opens a modal dialog; Windows tests opt in explicitly
+    monkeypatch.setattr(sys, "platform", "linux")
     yield a
     for h in list(logging.getLogger().handlers):
         if h not in before:
