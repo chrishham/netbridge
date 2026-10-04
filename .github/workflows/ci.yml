@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release workflows call this so nothing is published without the full suite
+  workflow_call:
 
 concurrency:
   # PRs share a group per ref so a new push supersedes the old run; pushes to main get a

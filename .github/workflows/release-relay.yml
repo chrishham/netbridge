@@ -14,10 +14,18 @@ on:
       - ".github/workflows/release-relay.yml"
 
 permissions:
+  contents: read
   packages: write
 
 jobs:
+  # tag pushes run the full CI first; pull requests already get it from ci.yml
+  ci:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: ci
+    if: ${{ !cancelled() && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
     runs-on: ubuntu-latest
 
     steps:
