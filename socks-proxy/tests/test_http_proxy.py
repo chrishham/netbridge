@@ -231,6 +231,12 @@ class TestConnectFailureStatusMapping:
     ])
     @pytest.mark.parametrize("exc, status", [
         (TunnelConnectError("x"), b"HTTP/1.1 502"),
+        (TunnelConnectError("x", "not_allowed"), b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"),
+        (TunnelConnectError("x", "no_agent"), b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"),
+        (TunnelConnectError("x", "invalid_request"), b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"),
+        (TunnelConnectError("x", "timeout"), b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n"),
+        (TunnelConnectError("x", "refused"), b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"),
+        (ConnectionError("x"), b"HTTP/1.1 502"),
         (asyncio.TimeoutError(), b"HTTP/1.1 504"),
     ])
     @pytest.mark.asyncio

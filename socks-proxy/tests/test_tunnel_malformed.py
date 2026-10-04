@@ -161,3 +161,30 @@ async def test_cancel_while_sending_the_connect_request_frees_the_slot():
     assert tm.streams == {}
     assert tm._stream_semaphore._value == free_before
     assert sent[-1] == {"type": "tcp_close", "stream_id": sent[0]["stream_id"], "reason": "client_closed"}
+
+
+@pytest.mark.parametrize("sent, expected", [
+    ({"error_code": "refused"}, "refused"),
+    ({"error_code": "future_code"}, "future_code"),
+    ({"error_code": 5}, None),
+    ({"error_code": "BAD"}, None),
+    ({}, None),
+])
+@pytest.mark.asyncio
+async def test_connect_error_code_attached_only_when_well_formed(sent, expected):
+    tm = _tm()
+    task = asyncio.create_task(tm.connect("10.0.0.1", 80, timeout=2))
+    for _ in range(100):
+        if tm.streams:
+            break
+        await asyncio.sleep(0)
+    assert tm.streams, "connect() never registered a stream"
+    (sid,) = tm.streams
+    await tm._handle_message({
+        "type": "tcp_connect_result", "stream_id": sid,
+        "success": False, "error": "nope", **sent,
+    })
+    with pytest.raises(TunnelConnectError) as exc_info:
+        await task
+    assert exc_info.value.error_code == expected
+    assert isinstance(exc_info.value, ConnectionError)

@@ -11,6 +11,10 @@ import socket
 import struct
 from typing import TYPE_CHECKING
 
+from shared_auth.connect_errors import socks5_reply_for
+
+from .tunnel import TunnelConnectError
+
 if TYPE_CHECKING:
     from .tunnel import TunnelManager
 
@@ -90,6 +94,10 @@ async def handle_socks5_client(
             stream_id = await tunnel.connect(host, port)
         except asyncio.TimeoutError:
             await _send_reply(writer, REPLY_TTL_EXPIRED)
+            return
+        except TunnelConnectError as e:
+            logger.warning(f"SOCKS5 connection failed [{e.error_code}]: {e}")
+            await _send_reply(writer, socks5_reply_for(e.error_code))
             return
         except ConnectionError as e:
             logger.warning(f"SOCKS5 connection failed: {e}")

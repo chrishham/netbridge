@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from shared_auth import get_int_env
+from shared_auth.connect_errors import http_status_for
+
+from .tunnel import TunnelConnectError
 
 if TYPE_CHECKING:
     from .tunnel import TunnelManager
@@ -32,6 +35,19 @@ HTTP_407_PROXY_AUTH = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Auth
 HTTP_413_PAYLOAD_TOO_LARGE = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n"
 HTTP_502_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
 HTTP_504_TIMEOUT = b"HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+
+_HTTP_REASONS = {
+    400: "Bad Request",
+    403: "Forbidden",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
+}
+
+
+def _status_response(status: int) -> bytes:
+    """Empty-bodied response for a relay/agent-reported connect failure."""
+    return f"HTTP/1.1 {status} {_HTTP_REASONS[status]}\r\nContent-Length: 0\r\n\r\n".encode()
 
 # Regex to parse HTTP request line
 REQUEST_LINE_RE = re.compile(rb"^([A-Z]+)\s+(\S+)\s+HTTP/(\d\.\d)\r?\n", re.IGNORECASE)
@@ -292,6 +308,11 @@ async def _handle_connect(
         writer.write(HTTP_504_TIMEOUT)
         await writer.drain()
         return None
+    except TunnelConnectError as e:
+        logger.warning(f"HTTP connection failed [{e.error_code}]: {e}")
+        writer.write(_status_response(http_status_for(e.error_code)))
+        await writer.drain()
+        return None
     except ConnectionError as e:
         logger.warning(f"HTTP connection failed: {e}")
         writer.write(HTTP_502_BAD_GATEWAY)
@@ -355,6 +376,11 @@ async def _handle_http_request(
         stream_id = await tunnel.connect(host, port)
     except asyncio.TimeoutError:
         writer.write(HTTP_504_TIMEOUT)
+        await writer.drain()
+        return None
+    except TunnelConnectError as e:
+        logger.warning(f"HTTP connection failed [{e.error_code}]: {e}")
+        writer.write(_status_response(http_status_for(e.error_code)))
         await writer.drain()
         return None
     except ConnectionError as e:

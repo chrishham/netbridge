@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 import aiohttp
 from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType
+from shared_auth.connect_errors import valid_error_code
 
 # Use orjson for faster JSON serialization if available
 try:
@@ -110,8 +111,13 @@ class TunnelConnectError(ConnectionError):
 
     Distinct from local failures (socket closed, no relay connection) so that
     health checks only draw conclusions from answers that actually came back
-    through the tunnel.
+    through the tunnel. error_code is the machine-readable reason when the
+    peer sent a well-formed one, else None.
     """
+
+    def __init__(self, message, error_code=None):
+        super().__init__(message)
+        self.error_code = error_code
 
 
 def _accepted_kwargs(callback: Callable) -> Optional[set[str]]:
@@ -764,7 +770,10 @@ class TunnelManager:
                 # usable target for future probes.
                 self._probe_target = (host, port)
                 self._set_agent_available(evidence, reason=error)
-            raise TunnelConnectError(error)
+            error_code = result.get("error_code")
+            if not valid_error_code(error_code):
+                error_code = None
+            raise TunnelConnectError(error, error_code)
 
         # A completed connect means the agent handled it end to end
         self._set_agent_available(True)
