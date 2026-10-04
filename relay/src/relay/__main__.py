@@ -154,6 +154,11 @@ MAX_MESSAGE_SIZE = _get_int_env("RELAY_MAX_MESSAGE_SIZE", 1 * 1024 * 1024)
 # Per-IP connection rate limiting (pre-auth, before user identity is known)
 RATE_LIMIT_IP_PER_MIN = _get_int_env("RELAY_RATE_IP_CONNECTIONS_PER_MIN", 30)
 
+# Client IP behind reverse proxies (opt-in). Only enable when the proxy chain
+# cannot be bypassed: a client reaching the relay directly could forge the header.
+CLIENT_IP_HEADER = os.environ.get("RELAY_CLIENT_IP_HEADER", "").strip() or "X-Forwarded-For"
+_TRUSTED_PROXIES: tuple = ()  # parsed from RELAY_TRUSTED_PROXIES in main()
+
 # Global bandwidth limiter (0 = disabled)
 GLOBAL_BANDWIDTH_LIMIT_MBPS = _get_int_env("RELAY_GLOBAL_BANDWIDTH_LIMIT_MBPS", 0)
 
@@ -340,6 +345,50 @@ class _TimedLimiter:
 
 
 _ip_limiters: dict[str, _TimedLimiter] = {}
+
+
+def _parse_trusted_proxies(raw: str) -> tuple:
+    """Comma-separated CIDRs (bare IPs allowed); ValueError on an invalid entry."""
+    return tuple(ipaddress.ip_network(part.strip(), strict=False) for part in raw.split(",") if part.strip())
+
+
+def _parse_ip(value: str):
+    """An IP from a forwarded-header entry, tolerating a port (1.2.3.4:80, [v6]:80); None if unusable."""
+    value = value.strip()
+    if value.startswith("[") and "]" in value:
+        value = value[1:value.index("]")]
+    elif value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
+
+
+def _is_trusted(ip) -> bool:
+    return any(ip in net for net in _TRUSTED_PROXIES)
+
+
+def _client_ip(request: web.Request) -> str:
+    """The peer address, or the client address from CLIENT_IP_HEADER when the peer is a trusted proxy."""
+    remote = request.remote or "unknown"
+    if not _TRUSTED_PROXIES:
+        return remote
+    peer = _parse_ip(remote)
+    if peer is None or not _is_trusted(peer):
+        return remote
+    values = request.headers.getall(CLIENT_IP_HEADER, [])
+    if CLIENT_IP_HEADER.lower() == "x-forwarded-for":
+        # Repeated fields are one list in order (RFC 9110); .get() would return the client's own first field
+        for entry in reversed(",".join(values).split(",")):
+            ip = _parse_ip(entry)
+            if ip is not None and not _is_trusted(ip):
+                return str(ip)
+        return remote
+    if len(values) != 1:
+        return remote  # a proxy that overwrites leaves exactly one field
+    ip = _parse_ip(values[0])
+    return str(ip) if ip is not None else remote
 
 
 def _get_ip_limiter(ip: str) -> _TimedLimiter:
@@ -1099,7 +1148,7 @@ def create_app() -> web.Application:
 
 def main():
     """Entry point for the relay server."""
-    global REQUIRE_AUTH
+    global REQUIRE_AUTH, _TRUSTED_PROXIES
 
     import argparse
 
@@ -1162,6 +1211,14 @@ def main():
             logger.error(f"Configuration error: {e}")
             logger.error("Set NETBRIDGE_ALLOWED_TENANTS to a comma-separated list of Azure AD tenant IDs")
             sys.exit(1)
+
+    try:
+        _TRUSTED_PROXIES = _parse_trusted_proxies(os.environ.get("RELAY_TRUSTED_PROXIES", ""))
+    except ValueError as e:
+        logger.error(f"Configuration error: RELAY_TRUSTED_PROXIES: {e}")
+        sys.exit(1)
+    if _TRUSTED_PROXIES:
+        logger.info(f"Client IP: {CLIENT_IP_HEADER} from {len(_TRUSTED_PROXIES)} trusted proxy range(s)")
 
     logger.info("Routing: all traffic via bridge agent")
 
