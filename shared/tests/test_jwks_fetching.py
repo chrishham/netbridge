@@ -217,7 +217,7 @@ async def test_expired_usable_cache_does_not_wait_for_slow_fetch(key):
         ms.gate.set()
         await _drain_refreshes()
         assert ms.calls == 2
-        assert mod._jwks_cache[VALID_TENANT][0] > time.time() - 5  # refreshed
+        assert mod._jwks_cache[VALID_TENANT][0] > time.monotonic() - 5  # refreshed
 
 
 @pytest.mark.asyncio

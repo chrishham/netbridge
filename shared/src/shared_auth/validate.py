@@ -99,7 +99,7 @@ def _get_valid_issuers(tenant_id: str) -> tuple[str, str]:
 # ARM resource identifier (audience check)
 ARM_AUDIENCE = "https://management.azure.com"
 
-# Cache for JWKS (public keys) - keyed by tenant ID
+# Cache for JWKS (public keys) - keyed by tenant ID: (monotonic fetch time, jwks); a wall-clock step must not age or refresh it
 _jwks_cache: dict[str, tuple[float, dict]] = {}
 JWKS_CACHE_TTL = 3600  # 1 hour
 
@@ -154,7 +154,7 @@ async def _get_jwks(tenant_id: str, force: bool = False) -> dict:
     """
     cached = _jwks_cache.get(tenant_id)
     if not force and cached is not None:
-        age = time.time() - cached[0]
+        age = time.monotonic() - cached[0]
         if age < JWKS_CACHE_TTL:
             return cached[1]  # fast path: a fetch in flight must not stall validations served from cache
         if age < JWKS_MAX_STALE:
@@ -180,10 +180,10 @@ async def _refresh_jwks(tenant_id: str, force: bool = False) -> dict:
     lock = _jwks_locks.setdefault(tenant_id, asyncio.Lock())
     async with lock:
         cached = _jwks_cache.get(tenant_id)
-        fresh = cached is not None and (time.time() - cached[0]) < JWKS_CACHE_TTL
+        fresh = cached is not None and (time.monotonic() - cached[0]) < JWKS_CACHE_TTL
         if fresh and not force:
             return cached[1]
-        usable = cached is not None and (time.time() - cached[0]) < JWKS_MAX_STALE
+        usable = cached is not None and (time.monotonic() - cached[0]) < JWKS_MAX_STALE
         failed_at = _jwks_failed_at.get(tenant_id)
         if failed_at is not None and time.monotonic() - failed_at < JWKS_FETCH_BACKOFF:
             if usable:
@@ -197,7 +197,7 @@ async def _refresh_jwks(tenant_id: str, force: bool = False) -> dict:
                 return cached[1]  # keep serving the previous keys
             raise TokenValidationError("Signing keys unavailable") from e
         _jwks_failed_at.pop(tenant_id, None)
-        _jwks_cache[tenant_id] = (time.time(), jwks)
+        _jwks_cache[tenant_id] = (time.monotonic(), jwks)
         return jwks
 
 
