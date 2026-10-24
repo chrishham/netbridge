@@ -48,7 +48,8 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
   - Agent hang 2026-10-24 13:59:51→19:01:42 (v1.9.0): καμία γραμμή log για 5h (ούτε ωριαίο token refresh), proxy έβλεπε no_agent· VDI session disconnect 18:06 local (TerminalServices 59/23/39/40/24), reconnect 19:01 και restart από χρήστη. Μοναδικό τέτοιο κενό στα 3 ημερολόγια. Αίτιο άγνωστο (event loop κολλημένο; VDI frozen;). Ιδέα: watchdog thread που γράφει log αν ο loop δεν απαντήσει σε 60s.
   - Agent τρέχει v1.9.0 ενώ βγαίνει "Update available: v1.10.1": by design, το update εφαρμόζεται μόνο χειροκίνητα από το tray (notification + "Check for Updates"). Εκκρεμότητα χρήστη: να το κάνει, ή ιδέα: auto-apply σε idle.
   - Θόρυβος: εκατοντάδες "Proxy authentication required" για Firefox telemetry (corporate proxy 407 + Connection: close → skip SSPI). Αξίζει rate-limited/debug log.
-  - Βήμα 0 (diagnostics): log close_code/reason/διάρκεια στο τέλος κάθε WS σε relay, proxy, agent· relay να κάνει log register/disconnect agent & tunnel. Μετά απόδοση των drops (Cloudflare / home ISP / relay / HOL).
+  - [x] Βήμα 0 (diagnostics, υλοποιήθηκε 2026-10-24, branch ws-close-diagnostics): log close_code/reason/διάρκεια στο τέλος κάθε WS σε relay, proxy, agent· relay να κάνει log register/disconnect agent & tunnel. Μετά απόδοση των drops (Cloudflare / home ISP / relay / HOL).
+    - Πώς διαβάζεται: grep `close_code=` στα logs των τριών (relay, proxy, agent) και `Event loop unresponsive` στο agent log.
   - Αν Cloudflare: επιλογή grey-cloud DNS για το relay hostname (Traefik + Let's Encrypt) ή stream resumption στο πρωτόκολλο.
 - [ ] Αντικατάσταση των ~53 πραγματικών sleeps στα tests.
 - [ ] Normalisation 6to4/Teredo στο client-IP.
@@ -75,3 +76,4 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 - 2026-10-04: PR #29 (agent tests στα Windows) και #30 (relay backpressure)· releases relay 1.0.7, agent 1.10.1, socks 1.7.0.
 - 2026-10-24: ROADMAP δημιουργήθηκε από ανασκόπηση repo/memory
 - 2026-10-24: αρχιτεκτονική ανασκόπηση (relay-less επιλογές, HOL blocking, binary frames, dead weight)· ιδέες στο ROADMAP.
+- 2026-10-24: Βήμα 0 diagnostics υλοποιήθηκε (branch ws-close-diagnostics): close_code/duration/reason logs σε relay, proxy, agent + event-loop watchdog στον agent.
