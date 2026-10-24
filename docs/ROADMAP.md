@@ -39,6 +39,7 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 - [ ] Απόφαση infra hardening στο kantoliana-infra: Cloudflare-only 80/443, κλείσιμο 6443, NetworkPolicy.
 - [ ] Απόφαση για real e2e με staging relay + πραγματικό Entra μέσω GitHub OIDC: επιτρέπεται Entra federation; γίνεται staging namespace στο cluster;
 - [ ] Προμήθεια code signing certificate για production builds (TODO στα `netbridge-agent/*.spec`).
+- [ ] Relay-on-laptop (Cloudflare Tunnel): προϋπόθεση να επιτρέπεται το cloudflared στα εταιρικά laptops (EDR το σημαίνει ως tunneling tool). Μέχρι να απαντηθεί, το hosted relay μένει και βελτιώνεται (HOL blocking, versioning, binary frames, dead weight).
 
 ## Εκκρεμότητες Claude
 
