@@ -16,7 +16,12 @@ _POLL = 0.1  # granularity for noticing stop() / a closed loop while waiting
 
 
 class LoopWatchdog:
-    """Daemon thread that pings the event loop and reports when it does not answer in time."""
+    """Daemon thread that pings the event loop and reports when it does not answer in time.
+
+    Reports are mirrored to logging from at most one helper thread at a time, so a wedged
+    handler can block at most one helper; reports arriving meanwhile are counted and noted
+    in the next mirrored report (the file write is never skipped).
+    """
 
     def __init__(self, loop: asyncio.AbstractEventLoop, loop_thread_id: int,
                  interval: float = 30.0, stall_threshold: float = 60.0,
@@ -27,6 +32,8 @@ class LoopWatchdog:
         self._stall_threshold = stall_threshold
         self._report_path = report_path
         self._stop_event = threading.Event()
+        self._mirror_thread: threading.Thread | None = None
+        self._mirror_skipped = 0
         self._thread = threading.Thread(
             target=self._run, name="netbridge-loop-watchdog", daemon=True
         )
@@ -78,13 +85,22 @@ class LoopWatchdog:
                     os.close(fd)
             except OSError:
                 pass
+        if self._mirror_thread is not None and self._mirror_thread.is_alive():
+            self._mirror_skipped += 1
+            return
+        if self._mirror_skipped:
+            text = (f"[{self._mirror_skipped} earlier watchdog reports were not mirrored "
+                    f"to this log; see watchdog.log] {text}")
         try:
-            threading.Thread(
+            thread = threading.Thread(
                 target=logger.log, args=(level, text), daemon=True,
                 name="netbridge-loop-watchdog-log",
-            ).start()
+            )
+            thread.start()
         except RuntimeError:
-            pass
+            return
+        self._mirror_thread = thread
+        self._mirror_skipped = 0
 
     def _run(self) -> None:
         while not self._stop_event.wait(self._interval):

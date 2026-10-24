@@ -137,6 +137,62 @@ def test_watchdog_reports_even_when_logging_handler_is_wedged(tmp_path):
         handler.close()
 
 
+def test_mirror_helper_is_bounded_when_logging_is_wedged(tmp_path):
+    release = threading.Event()
+
+    class WedgedHandler(logging.Handler):
+        def emit(self, record):
+            release.wait()
+
+    wlogger = logging.getLogger("netbridge_agent.watchdog")
+    handler = WedgedHandler()
+    wlogger.addHandler(handler)
+    old_level = wlogger.level
+    wlogger.setLevel(logging.INFO)
+    report = tmp_path / "watchdog.log"
+    loop, t, ident = _loop_in_thread()
+    try:
+        wd = LoopWatchdog(loop, ident, interval=0.05, stall_threshold=0.1, report_path=report)
+        wd.start()
+        loop.call_soon_threadsafe(time.sleep, 0.6)
+        time.sleep(0.5)
+        alive = [th for th in threading.enumerate()
+                 if th.name == "netbridge-loop-watchdog-log" and th.is_alive()]
+        assert len(alive) <= 1
+        time.sleep(0.5)
+        wd.stop()
+        assert report.read_text().count("Event loop unresponsive") >= 3
+        assert wd._mirror_skipped >= 2
+        alive = [th for th in threading.enumerate()
+                 if th.name == "netbridge-loop-watchdog-log" and th.is_alive()]
+        assert len(alive) <= 1
+    finally:
+        release.set()
+        wlogger.removeHandler(handler)
+        wlogger.setLevel(old_level)
+        _stop(loop, t)
+        for th in threading.enumerate():
+            if th.name == "netbridge-loop-watchdog-log":
+                th.join(timeout=2.0)
+        handler.close()
+
+
+def test_skipped_mirrors_are_noted_in_next_mirror(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="netbridge_agent.watchdog")
+    loop, t, ident = _loop_in_thread()
+    try:
+        wd = LoopWatchdog(loop, ident, report_path=tmp_path / "watchdog.log")
+        wd._mirror_skipped = 3
+        wd._mirror_thread = None
+        wd._report("probe", logging.WARNING)
+        assert _wait_for(lambda: any("probe" in r.getMessage() for r in caplog.records))
+        msg = next(r.getMessage() for r in caplog.records if "probe" in r.getMessage())
+        assert "3 earlier watchdog reports were not mirrored" in msg
+        assert wd._mirror_skipped == 0
+    finally:
+        _stop(loop, t)
+
+
 def test_report_file_errors_are_swallowed(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger="netbridge_agent.watchdog")
     loop, t, ident = _loop_in_thread()
