@@ -626,3 +626,22 @@ async def test_request_check_update_schedules_do_update(nb):
     nb.request_check_update()
     await asyncio.sleep(0.01)
     nb._do_update.assert_awaited_once()
+
+
+def test_run_async_loop_survives_watchdog_start_failure(nb, monkeypatch, caplog):
+    ran = []
+
+    async def fake_main():
+        ran.append(True)
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(app_mod.LoopWatchdog, "start", boom)
+    monkeypatch.setattr(nb, "_async_main", fake_main)
+    with caplog.at_level(logging.WARNING):
+        nb._run_async_loop()
+    assert ran == [True]
+    assert nb._async_loop.is_closed()
+    assert any("watchdog" in r.getMessage().lower() for r in caplog.records)
+    assert nb._watchdog is None

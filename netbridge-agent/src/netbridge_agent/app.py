@@ -795,15 +795,21 @@ class NetBridgeApp:
         self._async_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._async_loop)
 
-        self._watchdog = LoopWatchdog(
-            self._async_loop, threading.get_ident(), report_path=get_log_dir() / "watchdog.log"
-        )
-        self._watchdog.start()
-
         try:
+            try:
+                self._watchdog = LoopWatchdog(
+                    self._async_loop,
+                    threading.get_ident(),
+                    report_path=get_log_dir() / "watchdog.log",
+                )
+                self._watchdog.start()
+            except Exception:
+                logger.warning("Loop watchdog could not be started", exc_info=True)
+                self._watchdog = None
             self._async_loop.run_until_complete(self._async_main())
         finally:
-            self._watchdog.stop()
+            if self._watchdog is not None:
+                self._watchdog.stop()
             self._async_loop.close()
 
     # --- Main entry point ---
