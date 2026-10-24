@@ -39,6 +39,7 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 - [ ] Απόφαση infra hardening στο kantoliana-infra: Cloudflare-only 80/443, κλείσιμο 6443, NetworkPolicy.
 - [ ] Απόφαση για real e2e με staging relay + πραγματικό Entra μέσω GitHub OIDC: επιτρέπεται Entra federation; γίνεται staging namespace στο cluster;
 - [ ] Προμήθεια code signing certificate για production builds (TODO στα `netbridge-agent/*.spec`).
+- [ ] QA pipeline: το `pipelines/net-bridge.yaml` (repo chamaletsos) κάνει clone το `main` HEAD· pin σε tag `relay-v*` ώστε οι QA images να ταιριάζουν με τα δοκιμασμένα releases — δική σου απόφαση (docs/superpowers/specs/2026-10-04-topology-e2e-design.md).
 - [ ] Relay-on-laptop (Cloudflare Tunnel): προϋπόθεση να επιτρέπεται το cloudflared στα εταιρικά laptops (EDR το σημαίνει ως tunneling tool). Μέχρι να απαντηθεί, το hosted relay μένει και βελτιώνεται (HOL blocking, versioning, binary frames, dead weight).
 
 ## Εκκρεμότητες Claude
@@ -74,7 +75,8 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
   - Prod auth: `NETBRIDGE_ALLOWED_USERS`/`GROUPS` δεν είναι ορισμένα (όλοι οι χρήστες 2 tenants)· ARM token ως bearer = κάθε cached ARM token δίνει πρόσβαση στο VDI του χρήστη. Επιλογή: app registration με δικό του scope.
   - Prometheus `/metrics` στο relay (streams, bytes, error codes, reconnects) → Grafana.
   - k8s: pinned image tag αντί `:latest` + pullPolicy Always.
-  - Code signing: Azure Trusted Signing ως φθηνή απάντηση στο pending todo.
+  - Plugin `uninstall`: laptop-side cleanup (χρειάζεται convention για το τι αφαιρείται) (docs/superpowers/specs/2026-05-21-plugin-install-ux-design.md).
+- Code signing: Azure Trusted Signing ως φθηνή απάντηση στο pending todo.
 
 ## Ιστορικό
 
@@ -85,3 +87,4 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 - 2026-10-24: αρχιτεκτονική ανασκόπηση (relay-less επιλογές, HOL blocking, binary frames, dead weight)· ιδέες στο ROADMAP.
 - 2026-10-24: Βήμα 0 diagnostics υλοποιήθηκε (branch ws-close-diagnostics): close_code/duration/reason logs σε relay, proxy, agent + event-loop watchdog στον agent.
 - 2026-10-24: Βήμα 0 merged στο main (7e144a2) μετά από codex-review-loop (3 Medium διορθώθηκαν). Εκκρεμεί deploy/release των τριών components.
+- 2026-10-24: tidy — προστέθηκαν QA pipeline pinning (εκκρεμότητα χρήστη) και plugin uninstall cleanup (ιδέα) από τα specs· τίποτα για τικάρισμα.
