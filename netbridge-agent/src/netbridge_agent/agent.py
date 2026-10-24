@@ -1016,7 +1016,10 @@ async def connect_and_run(
                     except asyncio.TimeoutError:
                         idle_time = time.monotonic() - liveness_tracker["last_message_time"]
                         if idle_time > CONNECTION_LIVENESS_TIMEOUT:
-                            logger.warning(f"No messages for {int(idle_time)}s, assuming dead")
+                            logger.warning(
+                                f"No messages for {int(idle_time)}s, assuming dead "
+                                f"(duration={int(time.monotonic() - connected_at)}s)"
+                            )
                             break
                         continue
 
@@ -1031,10 +1034,22 @@ async def connect_and_run(
                             pass
                         await handle_message(state, ws, msg.data)
                     elif msg.type == aiohttp.WSMsgType.ERROR:
-                        logger.error(f"WebSocket error: {ws.exception()}")
+                        logger.error(
+                            f"WebSocket error: {ws.exception()} "
+                            f"(close_code={ws.close_code} duration={int(time.monotonic() - connected_at)}s)"
+                        )
                         break
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
-                        logger.info("Connection closed by server")
+                    elif msg.type == aiohttp.WSMsgType.CLOSE:
+                        logger.warning(
+                            f"Connection closed by server: close_code={msg.data} "
+                            f"reason={msg.extra!r} duration={int(time.monotonic() - connected_at)}s"
+                        )
+                        break
+                    elif msg.type == aiohttp.WSMsgType.CLOSED:
+                        logger.warning(
+                            f"Connection closed by server: close_code={ws.close_code} "
+                            f"reason='' duration={int(time.monotonic() - connected_at)}s"
+                        )
                         break
 
                 return stop_event.is_set(), time.monotonic() - connected_at
