@@ -333,3 +333,4 @@ async def test_tunnel_disconnect_logs_summary_and_stream_count(client, caplog):
     assert any(m.startswith(f"Tunnel connected: {USER}:") for m in msgs)
     disc = next(m for m in msgs if m.startswith("Tunnel disconnected:"))
     assert "close_code=1000" in disc and "streams_closed=1" in disc
+    assert "exc=" not in disc

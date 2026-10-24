@@ -336,6 +336,22 @@ class TestCloseSummaryLogging:
         assert "close_code=1001" in line and "reason='going away'" in line and "duration=" in line
 
     @pytest.mark.asyncio
+    async def test_close_frame_with_empty_reason(self, caplog):
+        caplog.set_level(logging.WARNING)
+        stop = asyncio.Event()
+        state = AgentState()
+        messages = [
+            MagicMock(type=aiohttp.WSMsgType.TEXT, data='{"type": "registered"}'),
+            MagicMock(type=aiohttp.WSMsgType.CLOSE, data=1005, extra=""),
+        ]
+        fake = _make_fake_websocket(messages)
+        with patch("netbridge_agent.agent.aiohttp.ClientSession", return_value=fake), \
+             patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock):
+            await connect_and_run(state, "ws://relay.com", None, None, "token", stop, None, None)
+        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed by server:"))
+        assert "close_code=1005" in line and "reason=''" in line
+
+    @pytest.mark.asyncio
     async def test_closed_without_frame_logs_ws_close_code(self, caplog):
         caplog.set_level(logging.WARNING)
         stop = asyncio.Event()
