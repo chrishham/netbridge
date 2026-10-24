@@ -37,6 +37,7 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 ## Εκκρεμότητες χρήστη
 
 - [ ] Prod smoke test με πραγματικούς clients μετά τα releases της 2026-10-04.
+- [ ] Agent update σε v1.11.1 από το tray του VDI (Check for Updates), για να τρέξουν τα close-code logs και ο watchdog.
 - [ ] Απόφαση infra hardening στο kantoliana-infra: Cloudflare-only 80/443, κλείσιμο 6443, NetworkPolicy.
 - [ ] Απόφαση για real e2e με staging relay + πραγματικό Entra μέσω GitHub OIDC: επιτρέπεται Entra federation; γίνεται staging namespace στο cluster;
 - [ ] Προμήθεια code signing certificate για production builds (TODO στα `netbridge-agent/*.spec`).
@@ -55,7 +56,8 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
     - Merged στο main 2026-10-24 (7e144a2). Review: Sonnet 3 γύροι + gpt-6.1-sol 4 γύροι (3 Medium βρέθηκαν και διορθώθηκαν: watchdog μπλόκαρε στο logging lock που διαγιγνώσκει → OS-level writes στο `watchdog.log`· απεριόριστα helper threads → ένα· αποτυχία `Thread.start()` του watchdog σταματούσε τον agent → log & ignore). Το τελευταίο fix δεν ξανα-ελέγχθηκε από reviewer (εξαντλήθηκε το budget γύρων), καλύπτεται από fault-injection test.
     - Αρχείο watchdog: `%LOCALAPPDATA%\NetBridge\logs\watchdog.log` (γράφεται και όταν το logging είναι κολλημένο).
     - Release 2026-10-24: πρώτο tagging (relay-v1.0.8, agent-v1.11.0, socks-v1.7.1, socks-exe-v0.5.1) έδωσε 0 workflow runs γιατί τα 4 tags μπήκαν σε ένα push (GitHub: >3 tags σε ένα push = κανένα push event). Κανόνας: ένα tag ανά push. relay-v1.0.8 μπλοκαρίστηκε από Trivy (aiohttp 3.14.3 HIGH×3, certifi 2026.1.4 CRITICAL emSign) → bump aiohttp 3.14.5 + certifi 2026.10.23 σε όλα τα lockfiles (eddff06) και re-tag relay-v1.0.9, agent-v1.11.1, socks-v1.7.2, socks-exe-v0.5.2.
-    - [ ] Deploy/release ώστε να τρέξουν τα diagnostics: relay image στο k3s, agent exe μέσω e2e gate (ο χρήστης το εφαρμόζει από το tray), socks μέσω brew. Μετά 2–3 μέρες: απόδοση των drops ανά σκέλος από τα `close_code=`.
+    - [x] Deploy/release 2026-10-24: relay v1.0.9 στο k3s (rollout restart 21:48 local, pod netbridge-relay-754fddc857-9dw95, ήδη γράφει `Agent/Tunnel connected/disconnected`)· socks 1.7.2 στο laptop (brew upgrade, τρέχει με nohup `--relay <host> --no-tray`, όχι brew services· χωρίς `--no-tray` η 1.7.2 σκάει με "Namespace Gtk not available")· agent-v1.11.1 δημοσιευμένο (netbridge.exe), εκκρεμεί εφαρμογή από το tray του VDI.
+    - [ ] Μετά 2–3 μέρες logs (από 2026-10-27): απόδοση των drops ανά σκέλος από τα `close_code=` σε relay/proxy/agent και έλεγχος `watchdog.log` στο VDI.
     - Canary (idle wss laptop→Cloudflare→relay, heartbeat 45s): 2026-10-24 18:33→19:50 χωρίς drop. Idle σύνδεση με pings δεν πέφτει από Cloudflare· τα drops του proxy δεν είναι idle timeout.
   - Αν Cloudflare: επιλογή grey-cloud DNS για το relay hostname (Traefik + Let's Encrypt) ή stream resumption στο πρωτόκολλο.
 - [ ] Αντικατάσταση των ~53 πραγματικών sleeps στα tests.
@@ -88,5 +90,6 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 - 2026-10-24: αρχιτεκτονική ανασκόπηση (relay-less επιλογές, HOL blocking, binary frames, dead weight)· ιδέες στο ROADMAP.
 - 2026-10-24: Βήμα 0 diagnostics υλοποιήθηκε (branch ws-close-diagnostics): close_code/duration/reason logs σε relay, proxy, agent + event-loop watchdog στον agent.
 - 2026-10-24: Βήμα 0 merged στο main (7e144a2) μετά από codex-review-loop (3 Medium διορθώθηκαν). Εκκρεμεί deploy/release των τριών components.
+- 2026-10-24: Releases relay-v1.0.9, agent-v1.11.1, socks-v1.7.2, socks-exe-v0.5.2 (μαζί με bump aiohttp/certifi λόγω Trivy). Relay deployed, laptop socks 1.7.2 ενεργό, agent update εκκρεμεί από χρήστη. Δεύτερος χρήστης στο relay: REPPAS.NIKOLAOS.
 - 2026-10-24: tidy — προστέθηκαν QA pipeline pinning (εκκρεμότητα χρήστη) και plugin uninstall cleanup (ιδέα) από τα specs· τίποτα για τικάρισμα.
 - 2026-10-24: tidy — φάση 2 έκλεισε με ημερομηνία/shas (αντί εκτίμησης)· προστέθηκε φάση 8 για το plan ws-close-diagnostics (merged 7e144a2)· τα «Επόμενα» έγιναν φάση 9.
