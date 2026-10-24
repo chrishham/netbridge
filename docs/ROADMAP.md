@@ -50,6 +50,15 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 ## Ιδέες / μελλοντικά
 
 - Staging relay e2e (βλ. εκκρεμότητες χρήστη).
+- Αρχιτεκτονική ανασκόπηση 2026-10-24 (απόφαση χρήστη εκκρεμεί):
+  - Relay στο laptop μέσω Cloudflare Tunnel (cloudflared, kantoliana.gr): ο agent συνδέεται στο hostname του laptop, το WS server μπαίνει μέσα στο socks-proxy. Καταργεί relay package, k3s/OCI/Traefik deploy, GHCR image, release-relay, infra hardening todo. Εναλλακτικά Tailscale Funnel.
+  - Head-of-line blocking στον agent: `handle_tcp_data` κάνει `await writer.drain()` μέσα στο receive loop του WS· ένας αργός προορισμός παγώνει όλα τα streams. Per-stream bounded queue + task ή credit-based flow control.
+  - Binary frames αντί JSON+base64 (−25% bandwidth, λιγότερο CPU στο relay/exe). Προαπαιτούμενο: protocol version negotiation στο handshake (`registered`), δεν υπάρχει σήμερα.
+  - Dead weight: `legacy.py` (866 γρ.) + test_legacy, `azure-storage-blob` στο agent (δηλωμένο, δεν γίνεται import), `pyyaml` στο relay, 3 αντίγραφα tray/dialogs/installer/updater/config (agent, socks-proxy, socks-proxy-win) → κοινό package.
+  - Prod auth: `NETBRIDGE_ALLOWED_USERS`/`GROUPS` δεν είναι ορισμένα (όλοι οι χρήστες 2 tenants)· ARM token ως bearer = κάθε cached ARM token δίνει πρόσβαση στο VDI του χρήστη. Επιλογή: app registration με δικό του scope.
+  - Prometheus `/metrics` στο relay (streams, bytes, error codes, reconnects) → Grafana.
+  - k8s: pinned image tag αντί `:latest` + pullPolicy Always.
+  - Code signing: Azure Trusted Signing ως φθηνή απάντηση στο pending todo.
 
 ## Ιστορικό
 
@@ -57,3 +66,4 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 - 2026-10-04: PR #25/#26 (release gates, connect error codes), #27 (relay auth-first limits), topology e2e.
 - 2026-10-04: PR #29 (agent tests στα Windows) και #30 (relay backpressure)· releases relay 1.0.7, agent 1.10.1, socks 1.7.0.
 - 2026-10-24: ROADMAP δημιουργήθηκε από ανασκόπηση repo/memory
+- 2026-10-24: αρχιτεκτονική ανασκόπηση (relay-less επιλογές, HOL blocking, binary frames, dead weight)· ιδέες στο ROADMAP.
