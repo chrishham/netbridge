@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -294,3 +295,41 @@ async def test_message_rate_limit_delays_instead_of_dropping(client, monkeypatch
     assert len(throttled) == 1  # one warning per throttling episode, not one per message
     await tunnel.close()
     await agent.close()
+
+
+async def _wait_for_log(caplog, prefix, timeout=WAIT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(r.getMessage().startswith(prefix) for r in caplog.records):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"no log line starting with {prefix!r}")
+
+
+@pytest.mark.asyncio
+async def test_agent_connect_and_disconnect_are_logged(client, caplog):
+    caplog.set_level(logging.INFO, logger=mod.logger.name)
+    agent = Peer(await client.ws_connect("/ws"))
+    await agent.expect("registered")
+    await agent.ws.close(code=1001, message=b"going away")
+    await _wait_for_log(caplog, "Agent disconnected:")
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith(f"Agent connected: {USER} from ") for m in msgs)
+    disc = next(m for m in msgs if m.startswith("Agent disconnected:"))
+    assert f"Agent disconnected: {USER} close_code=1001 duration=" in disc
+    assert "exc=" not in disc
+
+
+@pytest.mark.asyncio
+async def test_tunnel_disconnect_logs_summary_and_stream_count(client, caplog):
+    caplog.set_level(logging.INFO, logger=mod.logger.name)
+    agent = Peer(await client.ws_connect("/ws"))
+    await agent.expect("registered")
+    tunnel = Peer(await client.ws_connect("/tunnel"))
+    await open_stream(tunnel, agent, "s1")
+    await tunnel.ws.close(code=1000)
+    await _wait_for_log(caplog, "Tunnel disconnected:")
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith(f"Tunnel connected: {USER}:") for m in msgs)
+    disc = next(m for m in msgs if m.startswith("Tunnel disconnected:"))
+    assert "close_code=1000" in disc and "streams_closed=1" in disc

@@ -707,6 +707,8 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
     if not ws.can_prepare(request):
         return web.Response(status=400, text="WebSocket upgrade required")
     await ws.prepare(request)
+    client_ip = _client_ip(request)
+    connected_at = time.monotonic()
 
     # Check if user already has an agent connected (under lock)
     async with _state_lock:
@@ -717,6 +719,8 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
                 await old_ws.close()
 
         bridge_agents[user_email] = ws
+
+    logger.info(f"Agent connected: {user_email} from {client_ip}")
 
     # Send registration confirmation so agent knows it's fully registered
     await safe_ws_send(ws, json.dumps({"type": "registered", "user": user_email}))
@@ -804,9 +808,19 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
             elif msg.type == WSMsgType.ERROR:
                 logger.error(f"WebSocket error from {user_email}: {ws.exception()}")
     finally:
+        logger.info(f"Agent disconnected: {user_email} {_ws_close_summary(ws, connected_at)}")
         await _cleanup_agent(ws, user_email)
 
     return ws
+
+
+def _ws_close_summary(ws: web.WebSocketResponse, connected_at: float) -> str:
+    """One-line description of how a WebSocket ended, for grepping in logs."""
+    summary = f"close_code={ws.close_code} duration={int(time.monotonic() - connected_at)}s"
+    exc = ws.exception()
+    if exc is not None:
+        summary += f" exc={type(exc).__name__}: {exc}"
+    return summary
 
 
 def _agent_alive(stream: StreamInfo) -> bool:
@@ -1054,6 +1068,8 @@ async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
     if not ws.can_prepare(request):
         return web.Response(status=400, text="WebSocket upgrade required")
     await ws.prepare(request)
+    client_ip = _client_ip(request)
+    connected_at = time.monotonic()
 
     # Check if this specific session already has a tunnel client connected (under lock)
     async with _state_lock:
@@ -1064,6 +1080,8 @@ async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
                 await old_ws.close()
 
         tunnel_clients[tunnel_key] = ws
+
+    logger.info(f"Tunnel connected: {tunnel_key} from {client_ip}")
 
     # Get rate limiters for this user
     message_limiter = _get_message_limiter(user_email)
@@ -1128,6 +1146,11 @@ async def handle_tunnel(request: web.Request) -> web.WebSocketResponse:
             # Only remove if this is still the current tunnel client for this session
             if tunnel_clients.get(tunnel_key) is ws:
                 del tunnel_clients[tunnel_key]
+
+        logger.info(
+            f"Tunnel disconnected: {tunnel_key} {_ws_close_summary(ws, connected_at)} "
+            f"streams_closed={len(streams_to_remove)}"
+        )
 
         # Notify agents about closed streams (outside lock)
         for sid, agent_ws in streams_to_notify:
