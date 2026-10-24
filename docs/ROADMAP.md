@@ -52,10 +52,13 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
     - Πώς διαβάζεται: grep `close_code=` στα logs των τριών (relay, proxy, agent) και `Event loop unresponsive` στο agent log.
     - Merged στο main 2026-10-24 (7e144a2). Review: Sonnet 3 γύροι + gpt-6.1-sol 4 γύροι (3 Medium βρέθηκαν και διορθώθηκαν: watchdog μπλόκαρε στο logging lock που διαγιγνώσκει → OS-level writes στο `watchdog.log`· απεριόριστα helper threads → ένα· αποτυχία `Thread.start()` του watchdog σταματούσε τον agent → log & ignore). Το τελευταίο fix δεν ξανα-ελέγχθηκε από reviewer (εξαντλήθηκε το budget γύρων), καλύπτεται από fault-injection test.
     - Αρχείο watchdog: `%LOCALAPPDATA%\NetBridge\logs\watchdog.log` (γράφεται και όταν το logging είναι κολλημένο).
+    - Release 2026-10-24: πρώτο tagging (relay-v1.0.8, agent-v1.11.0, socks-v1.7.1, socks-exe-v0.5.1) έδωσε 0 workflow runs γιατί τα 4 tags μπήκαν σε ένα push (GitHub: >3 tags σε ένα push = κανένα push event). Κανόνας: ένα tag ανά push. relay-v1.0.8 μπλοκαρίστηκε από Trivy (aiohttp 3.14.3 HIGH×3, certifi 2026.1.4 CRITICAL emSign) → bump aiohttp 3.14.5 + certifi 2026.10.23 σε όλα τα lockfiles (eddff06) και re-tag relay-v1.0.9, agent-v1.11.1, socks-v1.7.2, socks-exe-v0.5.2.
     - [ ] Deploy/release ώστε να τρέξουν τα diagnostics: relay image στο k3s, agent exe μέσω e2e gate (ο χρήστης το εφαρμόζει από το tray), socks μέσω brew. Μετά 2–3 μέρες: απόδοση των drops ανά σκέλος από τα `close_code=`.
     - Canary (idle wss laptop→Cloudflare→relay, heartbeat 45s): 2026-10-24 18:33→19:50 χωρίς drop. Idle σύνδεση με pings δεν πέφτει από Cloudflare· τα drops του proxy δεν είναι idle timeout.
   - Αν Cloudflare: επιλογή grey-cloud DNS για το relay hostname (Traefik + Let's Encrypt) ή stream resumption στο πρωτόκολλο.
 - [ ] Αντικατάσταση των ~53 πραγματικών sleeps στα tests.
+- [ ] Flaky tests (2026-10-24): `socks-proxy-win tests/test_edgeproxy.py::test_oversized_head_answers_400` απέτυχε στο Windows e2e gate με WinError 10054 (ο server κλείνει με αδιάβαστα bytes → RST πριν ο client διαβάσει το 400· πιθανή διόρθωση: drain πριν το close). Το relay suite έδωσε 1 failure σε παράλληλο φορτίο, 0/4 μετά.
+- [ ] `release-relay.yml` αποτυγχάνει σε κάθε dependabot PR από 2026-10-20 (Trivy στο PR build· τώρα που έγινε το bump πρέπει να ξαναπρασινίσει, να ελεγχθεί).
 - [ ] Normalisation 6to4/Teredo στο client-IP.
 - [ ] Μετάβαση του `classify_connect_error` σε codes.
 - [ ] Ο modern agent αποτυγχάνει σε ονόματα που δεν λύνονται τοπικά ακόμη και με passthrough proxy (γνωστή παλιά συμπεριφορά).
