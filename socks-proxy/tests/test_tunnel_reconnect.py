@@ -1,6 +1,8 @@
 """Tests for tunnel reconnection, stream teardown, and pending connect handling."""
 
 import asyncio
+import logging
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -333,3 +335,38 @@ async def test_reconnect_after_failed_handshakes():
         max_delay = base * 1.3
         assert base <= delay <= max_delay, \
             f"Delay {i}: {delay} not in range [{base}, {max_delay}]"
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_logs_close_code_and_duration(caplog):
+    caplog.set_level(logging.WARNING, logger="socks_proxy.tunnel")
+    with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+        tm = TunnelManager("relay.com")
+    tm._connected.set()
+    tm._connected_at = time.monotonic() - 12
+    fake_ws = AsyncMock()
+    fake_ws.closed = False
+    fake_ws.close_code = 1006
+    fake_ws.__aiter__ = lambda self: self
+    fake_ws.__anext__ = AsyncMock(side_effect=StopAsyncIteration())
+    tm.ws = fake_ws
+
+    await tm._receive_loop()
+
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(m.startswith("Relay connection ended: close_code=1006 duration=1") for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_duration_is_zero_without_connect_timestamp(caplog):
+    caplog.set_level(logging.WARNING, logger="socks_proxy.tunnel")
+    with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+        tm = TunnelManager("relay.com")
+    fake_ws = AsyncMock()
+    fake_ws.closed = False
+    fake_ws.close_code = 1000
+    fake_ws.__aiter__ = lambda self: self
+    fake_ws.__anext__ = AsyncMock(side_effect=StopAsyncIteration())
+    tm.ws = fake_ws
+    await tm._receive_loop()
+    assert any("close_code=1000 duration=0s" in r.getMessage() for r in caplog.records)

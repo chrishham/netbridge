@@ -11,6 +11,7 @@ import inspect
 import logging
 import random
 import secrets
+import time
 from typing import Callable, Optional
 
 import aiohttp
@@ -218,6 +219,7 @@ class TunnelManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._token_refresh_task: Optional[asyncio.Task] = None
         self._connected = asyncio.Event()
+        self._connected_at = 0.0  # monotonic time of the last successful connect
         self._stopping = False
         self._auth_failure_count = 0
         self._permanent_failure = False  # Set when we should stop retrying
@@ -363,6 +365,7 @@ class TunnelManager:
                 heartbeat=CLIENT_HEARTBEAT_INTERVAL,
             )
             self._connected.set()
+            self._connected_at = time.monotonic()
             self._auth_failure_count = 0  # Reset on successful connection
             logger.info(f"Connected to relay (session: {self.session_id})")
         except aiohttp.WSServerHandshakeError as e:
@@ -880,6 +883,10 @@ class TunnelManager:
             return_exceptions=True,
         )
 
+    def _connection_duration(self) -> int:
+        """Seconds since the current relay connection was established (0 if unknown)."""
+        return int(time.monotonic() - self._connected_at) if self._connected_at else 0
+
     async def _receive_loop(self) -> None:
         """Process incoming WebSocket messages."""
         if self.ws is None:
@@ -897,11 +904,19 @@ class TunnelManager:
                         continue
                     await self._handle_message(data)
                 elif msg.type == WSMsgType.ERROR:
-                    logger.error(f"WebSocket error: {self.ws.exception()}")
+                    logger.error(
+                        f"WebSocket error: {self.ws.exception()} "
+                        f"(close_code={self.ws.close_code} duration={self._connection_duration()}s)"
+                    )
                     break
                 elif msg.type == WSMsgType.CLOSED:
                     logger.warning("Connection lost")
                     break
+            else:
+                logger.warning(
+                    f"Relay connection ended: close_code={self.ws.close_code} "
+                    f"duration={self._connection_duration()}s"
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:
