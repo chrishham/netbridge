@@ -43,6 +43,9 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 
 ## Εκκρεμότητες Claude
 
+- [ ] Αποσυνδέσεις (έρευνα 2026-10-24): ~30 reconnects του laptop proxy σε 4 μέρες, 24/7, ανεξάρτητα από traffic. 2/3 είναι CLOSE από την πλευρά server χωρίς λόγο πουθενά (relay δεν κάνει log κανονικά connect/disconnect, proxy δεν κάνει log το close_code), 1/3 "No PONG" (σπασμένο path). Relay υγιές (19d uptime, 1m CPU). 3× "Replacing existing agent" σε 48h = ο agent επανασυνδέθηκε ενώ το relay έβλεπε την παλιά του σύνδεση ζωντανή (πιθανό HOL blocking ή σιωπηλό drop από το corporate proxy). Canary: `scratchpad/ws_canary.py` (laptop → Cloudflare → relay) καταγράφει close codes.
+  - Βήμα 0 (diagnostics): log close_code/reason/διάρκεια στο τέλος κάθε WS σε relay, proxy, agent· relay να κάνει log register/disconnect agent & tunnel. Μετά απόδοση των drops (Cloudflare / home ISP / relay / HOL).
+  - Αν Cloudflare: επιλογή grey-cloud DNS για το relay hostname (Traefik + Let's Encrypt) ή stream resumption στο πρωτόκολλο.
 - [ ] Αντικατάσταση των ~53 πραγματικών sleeps στα tests.
 - [ ] Normalisation 6to4/Teredo στο client-IP.
 - [ ] Μετάβαση του `classify_connect_error` σε codes.
