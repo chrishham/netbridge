@@ -1041,14 +1041,14 @@ async def connect_and_run(
                         break
                     elif msg.type == aiohttp.WSMsgType.CLOSE:
                         logger.warning(
-                            f"Connection closed by server: close_code={msg.data} "
+                            f"Connection closed: close_code={msg.data} "
                             f"reason={msg.extra!r} duration={int(time.monotonic() - connected_at)}s"
                         )
                         break
                     elif msg.type == aiohttp.WSMsgType.CLOSED:
                         logger.warning(
-                            f"Connection closed by server: close_code={ws.close_code} "
-                            f"reason='' duration={int(time.monotonic() - connected_at)}s"
+                            f"Connection closed: close_code={ws.close_code} "
+                            f"exc={ws.exception()!r} duration={int(time.monotonic() - connected_at)}s"
                         )
                         break
 

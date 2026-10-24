@@ -332,7 +332,7 @@ class TestCloseSummaryLogging:
              patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock):
             intentional, _ = await connect_and_run(state, "ws://relay.com", None, None, "token", stop, None, None)
         assert intentional is False
-        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed by server:"))
+        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed:"))
         assert "close_code=1001" in line and "reason='going away'" in line and "duration=" in line
 
     @pytest.mark.asyncio
@@ -348,7 +348,7 @@ class TestCloseSummaryLogging:
         with patch("netbridge_agent.agent.aiohttp.ClientSession", return_value=fake), \
              patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock):
             await connect_and_run(state, "ws://relay.com", None, None, "token", stop, None, None)
-        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed by server:"))
+        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed:"))
         assert "close_code=1005" in line and "reason=''" in line
 
     @pytest.mark.asyncio
@@ -361,9 +361,12 @@ class TestCloseSummaryLogging:
             MagicMock(type=aiohttp.WSMsgType.CLOSED, data=None, extra=None),
         ]
         fake = _make_fake_websocket(messages)
-        fake.ws_connect.return_value.__aenter__.return_value.close_code = 1006
+        fake_ws = fake.ws_connect.return_value.__aenter__.return_value
+        fake_ws.close_code = 1006
+        fake_ws.exception = MagicMock(return_value=aiohttp.ServerTimeoutError("pong"))
         with patch("netbridge_agent.agent.aiohttp.ClientSession", return_value=fake), \
              patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock):
             await connect_and_run(state, "ws://relay.com", None, None, "token", stop, None, None)
-        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed by server:"))
-        assert "close_code=1006" in line and "reason=''" in line
+        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed:"))
+        assert "close_code=1006" in line and "exc=" in line and "ServerTimeoutError" in line
+        assert "reason=" not in line

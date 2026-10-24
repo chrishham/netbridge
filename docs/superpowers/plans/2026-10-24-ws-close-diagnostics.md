@@ -197,9 +197,9 @@ git commit -m "Log close code and session duration when the relay connection end
 - Replace the three loop-exit log lines in `connect_and_run` (keep the `break`s and return values unchanged). With `d = int(time.monotonic() - connected_at)`:
   - liveness: WARNING `No messages for {int(idle_time)}s, assuming dead (duration={d}s)` — the existing test asserts `"assuming dead"` is still present.
   - `WSMsgType.ERROR`: ERROR `WebSocket error: {ws.exception()} (close_code={ws.close_code} duration={d}s)`
-  - `WSMsgType.CLOSE`: WARNING `Connection closed by server: close_code={msg.data} reason={msg.extra!r} duration={d}s`
-  - `WSMsgType.CLOSED`: WARNING `Connection closed by server: close_code={ws.close_code} reason='' duration={d}s`
-  Both close variants start with `Connection closed by server: close_code=`.
+  - `WSMsgType.CLOSE`: WARNING `Connection closed: close_code={msg.data} reason={msg.extra!r} duration={d}s`
+  - `WSMsgType.CLOSED`: WARNING `Connection closed: close_code={ws.close_code} exc={ws.exception()!r} duration={d}s`
+  Both close variants start with `Connection closed: close_code=`.
 
 - [ ] **Step 1: Write the failing tests** (new class in `test_agent_reconnect.py`, using the existing `_make_fake_websocket`; the fake `ws` is a `MagicMock`, so set `fake_client_session.ws_connect.return_value.__aenter__.return_value.close_code = 1006` where needed)
 
@@ -218,7 +218,7 @@ class TestCloseSummaryLogging:
              patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock):
             intentional, _ = await connect_and_run(state, "ws://relay.com", None, None, "token", stop, None, None)
         assert intentional is False
-        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed by server:"))
+        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed:"))
         assert "close_code=1001" in line and "reason='going away'" in line and "duration=" in line
 
     @pytest.mark.asyncio
@@ -234,7 +234,7 @@ class TestCloseSummaryLogging:
         with patch("netbridge_agent.agent.aiohttp.ClientSession", return_value=fake), \
              patch("netbridge_agent.agent.close_all_streams", new_callable=AsyncMock):
             await connect_and_run(state, "ws://relay.com", None, None, "token", stop, None, None)
-        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed by server:"))
+        line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Connection closed:"))
         assert "close_code=1006" in line and "reason=''" in line
 ```
 Add `import logging` at the top of the test module.
