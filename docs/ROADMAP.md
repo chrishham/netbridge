@@ -9,13 +9,14 @@ Tunnel laptop ↔ VDI: relay (k3s), Windows agent, socks-proxy (+ exe), plugin s
 | Φάση | Τι | Κατάσταση |
 |---|---|---|
 | 1 | Plugin system + install UX (agent-v1.7.0, socks-v1.2.0) | ✅ 2026-05-21 |
-| 2 | Agent auto-update, connection stability | ✅ (εκτίμηση, plans 2026-08/09) |
+| 2 | Agent auto-update, connection stability | ✅ 2026-09-21 (auto-update 1025a82/feb153b, stability merge 9510891, updater fixes 7400699/6631d20) |
 | 3 | E2E gate: release-binary, auth, fault/reconnect, coverage gate, error-path gapfill (PR #16, #20–#24) | ✅ |
 | 4 | Release gates (#25), structured connect error codes (#26) | ✅ 2026-10-04 |
 | 5 | Relay auth-first limits, JWKS bounds, trusted-proxy client IP (#27) | ✅ |
 | 6 | Topology e2e πίσω από TLS edge, CI + Windows exe `--edge` (9ad0665) | ✅ |
 | 7 | Windows unit tests στο CI (#29), relay message backpressure (#30), timeouts σε όλα τα jobs | ✅ 2026-10-04 |
-| 8 | Επόμενα: βλ. Εκκρεμότητες | ⏳ |
+| 8 | WS close diagnostics + event-loop watchdog (plan 2026-10-24-ws-close-diagnostics, 7e144a2)· το deploy/release εκκρεμεί (βλ. Εκκρεμότητες Claude) | ✅ 2026-10-24 |
+| 9 | Επόμενα: βλ. Εκκρεμότητες | ⏳ |
 
 Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (το agent-v1.10.0 είναι tag χωρίς release).
 
@@ -88,3 +89,4 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 - 2026-10-24: Βήμα 0 diagnostics υλοποιήθηκε (branch ws-close-diagnostics): close_code/duration/reason logs σε relay, proxy, agent + event-loop watchdog στον agent.
 - 2026-10-24: Βήμα 0 merged στο main (7e144a2) μετά από codex-review-loop (3 Medium διορθώθηκαν). Εκκρεμεί deploy/release των τριών components.
 - 2026-10-24: tidy — προστέθηκαν QA pipeline pinning (εκκρεμότητα χρήστη) και plugin uninstall cleanup (ιδέα) από τα specs· τίποτα για τικάρισμα.
+- 2026-10-24: tidy — φάση 2 έκλεισε με ημερομηνία/shas (αντί εκτίμησης)· προστέθηκε φάση 8 για το plan ws-close-diagnostics (merged 7e144a2)· τα «Επόμενα» έγιναν φάση 9.
