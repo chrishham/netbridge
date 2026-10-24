@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 from .config import Config, ensure_app_dirs, get_log_path, get_log_dir, get_app_dir, APP_NAME, APP_VERSION
 from .tray import TrayIcon, Status, TRAY_AVAILABLE
 from .remote_exec import PLUGIN_RELOAD_CALLBACK, REMOTE_EXEC_ENABLED, create_app as create_exec_app
+from .watchdog import LoopWatchdog
 
 REMOTE_EXEC_TIMEOUT = 3600  # 1 hour auto-disable
 
@@ -118,6 +119,7 @@ class NetBridgeApp:
 
         # Threading coordination
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._watchdog: Optional[LoopWatchdog] = None
         self._async_thread: Optional[threading.Thread] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._shutdown_event: Optional[asyncio.Event] = None
@@ -793,9 +795,13 @@ class NetBridgeApp:
         self._async_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._async_loop)
 
+        self._watchdog = LoopWatchdog(self._async_loop, threading.get_ident())
+        self._watchdog.start()
+
         try:
             self._async_loop.run_until_complete(self._async_main())
         finally:
+            self._watchdog.stop()
             self._async_loop.close()
 
     # --- Main entry point ---
