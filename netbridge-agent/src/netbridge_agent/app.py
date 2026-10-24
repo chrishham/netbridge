@@ -795,7 +795,9 @@ class NetBridgeApp:
         self._async_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._async_loop)
 
-        self._watchdog = LoopWatchdog(self._async_loop, threading.get_ident())
+        self._watchdog = LoopWatchdog(
+            self._async_loop, threading.get_ident(), report_path=get_log_dir() / "watchdog.log"
+        )
         self._watchdog.start()
 
         try:
