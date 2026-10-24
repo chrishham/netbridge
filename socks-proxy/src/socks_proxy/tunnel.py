@@ -415,6 +415,7 @@ class TunnelManager:
             if self.ws and not self.ws.closed:
                 await self.ws.close()
             self.ws = None
+            self._connected_at = 0.0
 
             jitter = random.uniform(0, current_delay * 0.3)  # nosec B311
             sleep_time = current_delay + jitter
@@ -646,6 +647,7 @@ class TunnelManager:
             except (asyncio.TimeoutError, Exception):
                 pass
             self.ws = None
+            self._connected_at = 0.0
 
         # Cancel background tasks with timeout
         tasks_to_cancel = [
@@ -889,10 +891,11 @@ class TunnelManager:
 
     async def _receive_loop(self) -> None:
         """Process incoming WebSocket messages."""
-        if self.ws is None:
+        ws = self.ws
+        if ws is None:
             return
         try:
-            async for msg in self.ws:
+            async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
                     try:
                         data = _json_loads(msg.data)
@@ -905,18 +908,19 @@ class TunnelManager:
                     await self._handle_message(data)
                 elif msg.type == WSMsgType.ERROR:
                     logger.error(
-                        f"WebSocket error: {self.ws.exception()} "
-                        f"(close_code={self.ws.close_code} duration={self._connection_duration()}s)"
+                        f"WebSocket error: {ws.exception()} "
+                        f"(close_code={ws.close_code} duration={self._connection_duration()}s)"
                     )
                     break
                 elif msg.type == WSMsgType.CLOSED:
                     logger.warning("Connection lost")
                     break
             else:
-                logger.warning(
-                    f"Relay connection ended: close_code={self.ws.close_code} "
-                    f"duration={self._connection_duration()}s"
-                )
+                if not self._stopping:
+                    logger.warning(
+                        f"Relay connection ended: close_code={ws.close_code} "
+                        f"duration={self._connection_duration()}s"
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as e:

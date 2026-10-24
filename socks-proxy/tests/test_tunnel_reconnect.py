@@ -370,3 +370,78 @@ async def test_receive_loop_duration_is_zero_without_connect_timestamp(caplog):
     tm.ws = fake_ws
     await tm._receive_loop()
     assert any("close_code=1000 duration=0s" in r.getMessage() for r in caplog.records)
+
+
+def _make_tm_with_ended_ws(close_code=1006):
+    with patch("socks_proxy.tunnel.get_session_id", return_value="sid"):
+        tm = TunnelManager("relay.com")
+    tm._connected.set()
+    fake_ws = AsyncMock()
+    fake_ws.closed = False
+    fake_ws.close_code = close_code
+    fake_ws.__aiter__ = lambda self: self
+    fake_ws.__anext__ = AsyncMock(side_effect=StopAsyncIteration())
+    tm.ws = fake_ws
+    return tm, fake_ws
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_end_after_stop_cleared_ws_logs_no_error(caplog):
+    """stop() sets self.ws = None before the loop resumes; no ERROR on shutdown."""
+    caplog.set_level(logging.DEBUG, logger="socks_proxy.tunnel")
+    tm, fake_ws = _make_tm_with_ended_ws()
+
+    async def anext_then_clear(_self=None):
+        tm.ws = None
+        raise StopAsyncIteration
+
+    fake_ws.__anext__ = anext_then_clear
+    await tm._receive_loop()
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_error_frame_after_stop_cleared_ws_logs_no_attribute_error(caplog):
+    caplog.set_level(logging.DEBUG, logger="socks_proxy.tunnel")
+    tm, fake_ws = _make_tm_with_ended_ws()
+    msg = MagicMock(type=aiohttp.WSMsgType.ERROR)
+
+    async def anext_then_clear(_self=None):
+        tm.ws = None
+        return msg
+
+    fake_ws.__anext__ = anext_then_clear
+    fake_ws.exception = MagicMock(return_value=RuntimeError("boom"))
+    await tm._receive_loop()
+
+    assert not [r for r in caplog.records if "Receive loop error" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_end_while_stopping_logs_no_warning(caplog):
+    caplog.set_level(logging.DEBUG, logger="socks_proxy.tunnel")
+    tm, _ = _make_tm_with_ended_ws()
+    tm._stopping = True
+    await tm._receive_loop()
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_end_when_not_stopping_still_warns(caplog):
+    caplog.set_level(logging.WARNING, logger="socks_proxy.tunnel")
+    tm, _ = _make_tm_with_ended_ws()
+    await tm._receive_loop()
+
+    assert any(r.getMessage().startswith("Relay connection ended") for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stop_resets_connected_at():
+    tm, fake_ws = _make_tm_with_ended_ws()
+    tm._connected_at = time.monotonic() - 50
+    await tm.stop()
+
+    assert tm._connected_at == 0.0
+    assert tm._connection_duration() == 0
