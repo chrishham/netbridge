@@ -50,6 +50,10 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
   - Θόρυβος: εκατοντάδες "Proxy authentication required" για Firefox telemetry (corporate proxy 407 + Connection: close → skip SSPI). Αξίζει rate-limited/debug log.
   - [x] Βήμα 0 (diagnostics, υλοποιήθηκε 2026-10-24, branch ws-close-diagnostics): log close_code/reason/διάρκεια στο τέλος κάθε WS σε relay, proxy, agent· relay να κάνει log register/disconnect agent & tunnel. Μετά απόδοση των drops (Cloudflare / home ISP / relay / HOL).
     - Πώς διαβάζεται: grep `close_code=` στα logs των τριών (relay, proxy, agent) και `Event loop unresponsive` στο agent log.
+    - Merged στο main 2026-10-24 (7e144a2). Review: Sonnet 3 γύροι + gpt-6.1-sol 4 γύροι (3 Medium βρέθηκαν και διορθώθηκαν: watchdog μπλόκαρε στο logging lock που διαγιγνώσκει → OS-level writes στο `watchdog.log`· απεριόριστα helper threads → ένα· αποτυχία `Thread.start()` του watchdog σταματούσε τον agent → log & ignore). Το τελευταίο fix δεν ξανα-ελέγχθηκε από reviewer (εξαντλήθηκε το budget γύρων), καλύπτεται από fault-injection test.
+    - Αρχείο watchdog: `%LOCALAPPDATA%\NetBridge\logs\watchdog.log` (γράφεται και όταν το logging είναι κολλημένο).
+    - [ ] Deploy/release ώστε να τρέξουν τα diagnostics: relay image στο k3s, agent exe μέσω e2e gate (ο χρήστης το εφαρμόζει από το tray), socks μέσω brew. Μετά 2–3 μέρες: απόδοση των drops ανά σκέλος από τα `close_code=`.
+    - Canary (idle wss laptop→Cloudflare→relay, heartbeat 45s): 2026-10-24 18:33→19:50 χωρίς drop. Idle σύνδεση με pings δεν πέφτει από Cloudflare· τα drops του proxy δεν είναι idle timeout.
   - Αν Cloudflare: επιλογή grey-cloud DNS για το relay hostname (Traefik + Let's Encrypt) ή stream resumption στο πρωτόκολλο.
 - [ ] Αντικατάσταση των ~53 πραγματικών sleeps στα tests.
 - [ ] Normalisation 6to4/Teredo στο client-IP.
@@ -77,3 +81,4 @@ Releases 2026-10-04: relay 1.0.7, agent 1.10.1, socks 1.7.0, socks-exe 0.5.0 (τ
 - 2026-10-24: ROADMAP δημιουργήθηκε από ανασκόπηση repo/memory
 - 2026-10-24: αρχιτεκτονική ανασκόπηση (relay-less επιλογές, HOL blocking, binary frames, dead weight)· ιδέες στο ROADMAP.
 - 2026-10-24: Βήμα 0 diagnostics υλοποιήθηκε (branch ws-close-diagnostics): close_code/duration/reason logs σε relay, proxy, agent + event-loop watchdog στον agent.
+- 2026-10-24: Βήμα 0 merged στο main (7e144a2) μετά από codex-review-loop (3 Medium διορθώθηκαν). Εκκρεμεί deploy/release των τριών components.
